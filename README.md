@@ -14,7 +14,7 @@
 
 ---
 
-## ⚙️ 一键使用方法
+## 🚀 食用方法
 
 ### 🖥️ 在旧服务器执行：
 ```bash
@@ -27,7 +27,7 @@ http://192.168.1.88:8080/AbCdEf1234.tar.gz
 
 ⸻
 
-💻 在新服务器执行：
+### 💻 在新服务器执行：
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/auto_restore.sh)
 ```
