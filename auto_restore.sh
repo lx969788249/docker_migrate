@@ -17,7 +17,7 @@ pm_install(){
   case "$pm" in
     apt)
       asudo apt-get update -y
-      asudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
       ;;
     dnf)    asudo dnf install -y "$@" ;;
     yum)    asudo yum install -y "$@" ;;
@@ -41,7 +41,7 @@ ensure_docker_running(){
     asudo service docker start || true
   fi
   if ! docker info >/dev/null 2>&1; then
-    echo "[WARN] 尝试直接拉起 dockerd（临时前台/后台）"
+    echo "[WARN] 尝试直接拉起 dockerd（后台）"
     if command -v dockerd >/dev/null 2>&1; then
       (asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &); sleep 2
     fi
@@ -55,7 +55,6 @@ if [[ "$PKGMGR" == "none" ]]; then
   exit 1
 fi
 
-# 依赖项
 case "$PKGMGR" in
   apt)
     need_bin curl curl
