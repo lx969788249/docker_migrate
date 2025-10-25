@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # docker_migrate_perfect.sh — compose-first, images.tar, split volumes/binds,
-# port auto-pick, advertise public/LAN URL, http cleanup, + single-file bundle RID.tar.gz
-# + Auto-deps install (docker jq python3 tar gzip curl)
-# + Progress indicators for long-running steps
-# + Safe cleanup on normal/abnormal exit (AUTO_CLEAN / AUTO_CLEAN_ALL)
+# single-file bundle, auto-deps, progress bars, auto-clean, post-HTTP auto-restart
 set -euo pipefail
 
 # ---------- Auto install deps ----------
@@ -61,21 +58,12 @@ YEL(){ echo -e "\033[1;33m$*\033[0m"; }
 RED(){ echo -e "\033[1;31m$*\033[0m"; }
 OK(){  echo -e "\033[1;32m$*\033[0m"; }
 
-# --- 进度工具 ---
-progress_file_growth(){ local file="$1" label="${2:-进度}" pid="$3" last=""
-  printf "%s " "$label"
-  while kill -0 "$pid" 2>/dev/null; do
-    if [[ -f "$file" ]]; then
-      size="$(du -h "$file" 2>/dev/null | awk '{print $1}')"
-      [[ "$size" != "$last" ]] && printf "\r%s 已写入：%s" "$label" "${size:-0B}"
-      last="$size"
-    else
-      printf "\r%s 正在开始..." "$label"
-    fi
-    sleep 1
-  done
-  if [[ -f "$file" ]]; then size="$(du -h "$file" 2>/dev/null | awk '{print $1}')"; printf "\r%s 完成：%s\n" "$label" "${size:-0B}"; else printf "\r%s 完成\n" "$label"; fi
+human(){ # bytes -> human
+  local b=$1; local u=(B KB MB GB TB PB); local i=0
+  while (( b>=1024 && i<${#u[@]}-1 )); do b=$((b/1024)); i=$((i+1)); done
+  echo "${b}${u[$i]}"
 }
+
 spinner_run(){ local msg="$1"; shift; local spin='-\|/' i=0
   printf "%s " "$msg"
   ( "$@" ) & local cmd_pid=$!
@@ -83,7 +71,37 @@ spinner_run(){ local msg="$1"; shift; local spin='-\|/' i=0
   wait "$cmd_pid"; printf "\r%s 完成\n" "$msg"
 }
 
-# --- IP 选择工具 ---
+# --- images.tar 进度（pv优先，其次stat轮询） ---
+progress_docker_save(){
+  local outfile="$1"; shift
+  if command -v pv >/dev/null 2>&1; then
+    "$@" | pv -b > "$outfile"
+  else
+    "$@" > "$outfile" &
+    local pid=$!
+    local last=0 cur=0
+    printf "[进度] images.tar "
+    while kill -0 "$pid" 2>/dev/null; do
+      if [[ -f "$outfile" ]]; then
+        cur=$(stat -c %s "$outfile" 2>/dev/null || echo 0)
+        if (( cur!=last )); then
+          printf "\r[进度] images.tar 已写入：%s" "$(human "$cur")"
+          last=$cur
+        else
+          printf "\r[进度] images.tar 写入中 ..."
+        fi
+      else
+        printf "\r[进度] images.tar 准备中 ..."
+      fi
+      sleep 1
+    done
+    wait "$pid" || true
+    cur=$(stat -c %s "$outfile" 2>/dev/null || echo 0)
+    printf "\r[进度] images.tar 完成：%s\n" "$(human "$cur")"
+  fi
+}
+
+# --- IP / URL（只输出一个最终URL，公网优先） ---
 is_private_ipv4(){ local ip="$1"
   [[ "$ip" =~ ^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|^127\.|^169\.254\. ]] && return 0 || return 1; }
 get_public_ip_external(){ local ip
@@ -91,15 +109,20 @@ get_public_ip_external(){ local ip
     ip="$(curl -fsS --max-time 2 "$svc" 2>/dev/null | tr -d '\r\n' || true)"
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
   done; return 1; }
-pick_advertise_host(){
-  [[ -n "${ADVERTISE_HOST:-}" ]] && { echo "$ADVERTISE_HOST"; return; }
-  local via_route; via_route="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-  if [[ -n "$via_route" ]] && ! is_private_ipv4 "$via_route"; then echo "$via_route"; return; fi
-  local ip; while read -r ip; do if ! is_private_ipv4 "$ip"; then echo "$ip"; return; fi; done < <(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-  ip="$(get_public_ip_external || true)"; [[ -n "$ip" ]] && { echo "$ip"; return; }
-  ip="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1)"
-  echo "${ip:-127.0.0.1}"
+pick_advertise_url(){
+  local port="$1" rid="$2" host=""
+  if [[ -n "${ADVERTISE_HOST:-}" ]]; then host="$ADVERTISE_HOST"
+  else
+    local via_route; via_route="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    if [[ -n "$via_route" ]] && ! is_private_ipv4 "$via_route"; then host="$via_route"; fi
+    [[ -z "$host" ]] && host="$(get_public_ip_external || true)"
+    [[ -z "$host" ]] && host="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1)"
+    : "${host:=127.0.0.1}"
+  fi
+  echo "http://${host}:${port}/${rid}.tar.gz"
 }
+
+pick_free_port(){ local p="${1:-8080}"; for _ in $(seq 0 50); do ss -lnt 2>/dev/null|awk '{print $4}'|grep -q ":$p$"||{ echo "$p"; return; }; p=$((p+1)); done; echo "$1"; }
 
 # ---------- Args ----------
 NO_STOP="0"; INCLUDE_LIST=""
@@ -114,17 +137,14 @@ cat <<'HLP'
   bash docker_migrate_perfect.sh [--no-stop] [--include=name1,name2]
 环境变量:
   PORT=8080            # HTTP 端口（默认 8080；被占用会自动递增）
-  ADVERTISE_HOST=IP    # 显示给用户的“公网/域名”（覆盖自动探测）
-  AUTO_CLEAN=1         # 结束后自动清理 bundle/<RID>/（保留 <RID>.tar.gz）
-  AUTO_CLEAN_ALL=1     # 结束后连 <RID>.tar.gz 一并删除
-  AUTO_RESTART=1       # 若本次停机备份，备份后自动重启这些容器
+  ADVERTISE_HOST=IP    # 用于生成下载链接（优先级最高）
+  AUTO_CLEAN_ALL=1     # 退出时删除工作目录+单文件包
+  AUTO_KEEP=1          # 退出时不做任何清理
+  # 默认行为：自动删除工作目录，保留 <RID>.tar.gz
 HLP
       exit 0;;
   esac
 done
-
-# ---------- helpers ----------
-pick_free_port(){ local p="${1:-8080}"; for _ in $(seq 0 50); do ss -lnt 2>/dev/null|awk '{print $4}'|grep -q ":$p$"||{ echo "$p"; return; }; p=$((p+1)); done; echo "$1"; }
 
 # ---------- dirs & ids ----------
 PORT="$(pick_free_port "${PORT:-8080}")"
@@ -186,7 +206,16 @@ if [[ "$NO_STOP" == "1" ]]; then
 else
   read -rp "是否现在停机以确保一致性备份？[Y/n] " STOPNOW; STOPNOW=${STOPNOW:-Y}
   if [[ "$STOPNOW" =~ ^[Yy]$ ]]; then
-    for id in "${IDS[@]}"; do n="${CONTAINER_NAME[$id]}"; BLUE "[INFO] 停止 $n ..."; docker stop "$n" >/dev/null && STOPPED_ON_BACKUP+=("$n"); done
+    total=${#IDS[@]}; idx=0
+    for id in "${IDS[@]}"; do
+      idx=$((idx+1)); n="${CONTAINER_NAME[$id]}"
+      printf "[停机] (%d/%d) %s ..." "$idx" "$total" "$n"
+      if docker stop "$n" >/dev/null 2>&1; then
+        STOPPED_ON_BACKUP+=("$n"); printf " ok\n"
+      else
+        printf " fail\n"
+      fi
+    done
   else
     YEL "[WARN] 你选择了不停机备份"
   fi
@@ -195,19 +224,31 @@ fi
 # ---------- pack volumes & binds ----------
 BLUE "[INFO] 备份卷与绑定目录 ..."
 declare -a MAN_VOL=() MAN_BIND=()
+# 预统计总数
+vol_count=0; bind_count=0
+for id in "${IDS[@]}"; do
+  n="${CONTAINER_NAME[$id]}"; j="$(cat "${BUNDLE}/meta/${n}.inspect.json")"
+  vol_count=$((vol_count + $(jq -r '.[0].Mounts[]? | select(.Type=="volume") | 1' <<<"$j" | wc -l || echo 0)))
+  bind_count=$((bind_count + $(jq -r '.[0].Mounts[]? | select(.Type=="bind")   | 1' <<<"$j" | wc -l || echo 0)))
+done
+v_idx=0; b_idx=0
+
 for id in "${IDS[@]}"; do
   n="${CONTAINER_NAME[$id]}"; j="$(cat "${BUNDLE}/meta/${n}.inspect.json")"
   while IFS= read -r m; do [[ -z "$m" ]] && continue
     t=$(jq -r '.Type' <<<"$m"); dest=$(jq -r '.Destination' <<<"$m")
     case "$t" in
       volume)
-        vname=$(jq -r '.Name' <<<"$m"); BLUE "  [VOL] $n :: $vname -> $dest"
+        v_idx=$((v_idx+1))
+        vname=$(jq -r '.Name' <<<"$m"); printf "  [VOL] (%d/%d) %s :: %s -> %s\n" "$v_idx" "$vol_count" "$n" "$vname" "$dest"
         out="${BUNDLE}/volumes/vol_${vname}.tgz"
         docker run --rm -v "${vname}:/from:ro" -v "${BUNDLE}/volumes:/to" alpine:3.20 sh -c "cd /from && tar -czf /to/$(basename "$out") ."
         MAN_VOL+=("{\"name\":\"${vname}\",\"dest\":\"${dest}\"}") ;;
       bind)
+        b_idx=$((b_idx+1))
         src=$(jq -r '.Source' <<<"$m"); esc=$(echo "$src"|sed 's#/#_#g'|sed 's/^_//'); out="${BUNDLE}/binds/bind_${esc}.tgz"
-        BLUE "  [BIND] $n :: $src -> $dest"; mkdir -p "$(dirname "$out")"
+        printf "  [BIND] (%d/%d) %s :: %s -> %s\n" "$b_idx" "$bind_count" "$n" "$src" "$dest"
+        mkdir -p "$(dirname "$out")"
         tar -C / -czf "$out" "${src#/}" 2>/dev/null || { YEL "    跳过不可读路径：$src"; continue; }
         MAN_BIND+=("{\"host\":\"${src}\",\"dest\":\"${dest}\",\"file\":\"$(basename "$out")\"}") ;;
       *) YEL "  [SKIP] mount=$t dest=$dest" ;;
@@ -215,13 +256,12 @@ for id in "${IDS[@]}"; do
   done < <(jq -c '.[0].Mounts[]?' <<<"$j")
 done
 
-# -------- save images（带进度） --------
-BLUE "[INFO] 保存镜像 images.tar ...（数据量大时可能较久，请耐心等待）"
+# -------- save images（带实时进度） --------
+BLUE "[INFO] 保存镜像 images.tar ..."
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | sort -u)
 if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
-  ( docker image save -o "${OUT_IMG}" "${IMAGES[@]}" ) & save_pid=$!
-  progress_file_growth "${OUT_IMG}" "[进度] images.tar" "${save_pid}"; wait "${save_pid}"
+  progress_docker_save "${OUT_IMG}" docker image save "${IMAGES[@]}"
   OK "[OK] images.tar 已生成，大小：$(du -h "${OUT_IMG}" | awk '{print $1}')"
 else
   YEL "[WARN] 未收集到镜像名？"
@@ -229,9 +269,11 @@ fi
 
 # -------- pack compose ----------
 BLUE "[INFO] 处理 Compose 项目 ..."
+c_total=${#COMPOSE_GROUP[@]}; c_idx=0
 for key in "${!COMPOSE_GROUP[@]}"; do
+  c_idx=$((c_idx+1))
   proj="${key%%|*}"; wdir="${key#*|}"; target="${BUNDLE}/compose/${proj}"; mkdir -p "$target"
-  BLUE "  [COMPOSE] $proj @ $wdir"
+  printf "  [COMPOSE] (%d/%d) %s @ %s\n" "$c_idx" "$c_total" "$proj" "$wdir"
   cfgs="${COMPOSE_CFGS[$key]:-}"
   if [[ -n "$cfgs" ]]; then
     IFS=',' read -r -a files <<<"$cfgs"
@@ -278,13 +320,17 @@ gen_run_from_inspect(){ local f="$1"
   echo "${image}"
 }
 declare -a RUNS=()
+nr_total=0; for id in "${IDS[@]}"; do [[ "${CONTAINER_IS_COMPOSE[$id]:-0}" -eq 1 ]] || nr_total=$((nr_total+1)); done
+nr_idx=0
 for id in "${IDS[@]}"; do
-  [[ "${CONTAINER_IS_COMPOSE[$id]}" -eq 1 ]] && continue
+  if [[ "${CONTAINER_IS_COMPOSE[$id]}" -eq 1 ]]; then continue; fi
+  nr_idx=$((nr_idx+1))
   name="${CONTAINER_NAME[$id]}"; out="${BUNDLE}/runs/${name}.sh"
+  printf "  [RUNLIKE] (%d/%d) %s\n" "$nr_idx" "$nr_total" "$name"
   gen_run_from_inspect "${BUNDLE}/meta/${name}.inspect.json" > "$out"; chmod +x "$out"; RUNS+=("runs/${name}.sh")
 done
 
-# -------- 生成 manifest.json 与 restore.sh：改为函数 + spinner_run 无 bash -c --------
+# -------- 生成 manifest.json 与 restore.sh --------
 generate_manifest_and_restore(){
   mapfile -t NETLIST < <(printf "%s\n" "${!NETWORKS[@]}" | sort -u)
   declare -a MAN_PROJECTS=()
@@ -311,7 +357,6 @@ generate_manifest_and_restore(){
     echo "}"
   } > "${BUNDLE}/manifest.json"
 
-  # 安全 heredoc（不做变量展开）
   cat > "${BUNDLE}/restore.sh" <<'REST_SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -338,7 +383,7 @@ if jq -e ".volumes|length>0" manifest.json >/dev/null; then
   done < <(jq -c ".volumes[]" manifest.json)
 fi
 
-say "[D] 回灌绑定目录"
+say "[D] 回灌绑定目录]"
 if jq -e ".binds|length>0" manifest.json >/dev/null; then
   mkdir -p binds
   while IFS= read -r row; do
@@ -382,25 +427,6 @@ REST_SH
 }
 spinner_run "[INFO] 生成 manifest.json 与 restore.sh ..." generate_manifest_and_restore
 
-# ---------- 备份完成后可选自动重启 ----------
-if ((${#STOPPED_ON_BACKUP[@]})); then
-  if [[ "${AUTO_RESTART:-0}" == "1" ]]; then
-    BLUE "[INFO] 备份完成，自动重启本次停机的容器 ..."
-    for n in "${STOPPED_ON_BACKUP[@]}"; do docker start "$n" >/dev/null || true; done
-    OK "[OK] 已重启：${#STOPPED_ON_BACKUP[@]} 个容器"
-  elif [[ -t 0 ]]; then
-    read -rp $'\n备份完成，是否重启刚才停机的容器？[Y/n] ' RST; RST=${RST:-Y}
-    if [[ "$RST" =~ ^[Yy]$ ]]; then
-      for n in "${STOPPED_ON_BACKUP[@]}"; do docker start "$n" >/dev/null || true; done
-      OK "[OK] 已重启：${#STOPPED_ON_BACKUP[@]} 个容器"
-    else
-      YEL "[SKIP] 你选择暂不重启"
-    fi
-  else
-    YEL "[INFO] 非交互模式且未设置 AUTO_RESTART=1：跳过自动重启"
-  fi
-fi
-
 # ---------- README ----------
 cat > "${BUNDLE}/README.txt" <<EOF
 新服务器操作：
@@ -410,57 +436,71 @@ EOF
 
 # ---------- single-file bundle (RID.tar.gz) ----------
 BUNDLE_BASENAME="$(basename "${BUNDLE}")"
-( cd "$(dirname "${BUNDLE}")" && tar -czf "${BUNDLE_BASENAME}.tar.gz" "${BUNDLE_BASENAME}" )
+spinner_run "[INFO] 生成单文件包 ${BUNDLE_BASENAME}.tar.gz ..." bash -c "(cd \"$(dirname "${BUNDLE}")\" && tar -czf \"${BUNDLE_BASENAME}.tar.gz\" \"${BUNDLE_BASENAME}\")"
 SINGLE_TAR_PATH="$(dirname "${BUNDLE}")/${BUNDLE_BASENAME}.tar.gz"
 
-# ---------- HTTP serve + graceful cleanup ----------
+# ---------- HTTP serve + post-restart + auto-clean ----------
 OK  "[OK] 生成完成：${BUNDLE}"
 ( cd "${BUNDLE}" && ls -lah )
+
+PORT="${PORT:-8080}"; PORT="$(pick_free_port "$PORT")"
+URL="$(pick_advertise_url "$PORT" "$RID")"
 
 BLUE "[INFO] 启动 HTTP 服务（python3 -m http.server ${PORT}）"
 SHPID=""
 cleanup_http(){ [[ -n "${SHPID:-}" ]] && kill "${SHPID}" 2>/dev/null || true; }
+
+# 自动清理策略：AUTO_CLEAN_ALL=1 -> 删目录+tar.gz；AUTO_KEEP=1 -> 不删；默认 -> 删目录保留tar.gz
 cleanup_bundle(){
   if [[ "${AUTO_CLEAN_ALL:-0}" == "1" ]]; then
     rm -rf "$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz" "${BUNDLE}" || true
-    OK "[OK] 已自动删除：${BUNDLE} 及对应 .tar.gz"
-  elif [[ "${AUTO_CLEAN:-0}" == "1" ]]; then
-    rm -rf "${BUNDLE}" || true
-    OK "[OK] 已自动删除：${BUNDLE}（保留 .tar.gz）"
+    OK "[OK] 已删除：工作目录与单文件包"
+  elif [[ "${AUTO_KEEP:-0}" == "1" ]]; then
+    YEL "[INFO] 已按要求保留：工作目录与单文件包"
   else
-    if [[ -t 0 ]]; then
-      read -rp $'\n是否清理工作目录（保留 .tar.gz）？[y/N] ' ans
-      if [[ "$ans" =~ ^[Yy]$ ]]; then rm -rf "${BUNDLE}" || true; OK "[OK] 已删除：${BUNDLE}"; else YEL "[SKIP] 保留工作目录：${BUNDLE}"; fi
-      read -rp "是否连同 .tar.gz 一并删除？[y/N] " ans2
-      if [[ "$ans2" =~ ^[Yy]$ ]]; then rm -f "$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz" || true; OK "[OK] 已删除：$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz"; else YEL "[SKIP] 保留压缩包"; fi
-    else
-      YEL "[INFO] 非交互模式：未设置 AUTO_CLEAN/AUTO_CLEAN_ALL，跳过清理"
-    fi
+    rm -rf "${BUNDLE}" || true
+    OK "[OK] 已删除：工作目录（已保留单文件包）"
   fi
 }
-graceful_exit(){ echo; YEL "[INFO] 即将退出，正在清理 ..."; cleanup_http; cleanup_bundle; exit 0; }
+
+# 退出时序：关HTTP → 重启容器（逐个）→ 自动清理
+graceful_exit(){
+  echo
+  YEL "[INFO] 即将退出，先关闭 HTTP 服务 ..."
+  cleanup_http
+
+  if ((${#STOPPED_ON_BACKUP[@]})); then
+    BLUE "[INFO] 重启本次停机的容器（共 ${#STOPPED_ON_BACKUP[@]} 个） ..."
+    local ok=0 fail=0
+    for n in "${STOPPED_ON_BACKUP[@]}"; do
+      printf "  - starting: %s ... " "$n"
+      if docker start "$n" >/dev/null 2>&1; then
+        printf "ok\n"; ok=$((ok+1))
+      else
+        printf "fail\n"; fail=$((fail+1))
+      fi
+    done
+    OK "[OK] 重启完成：成功 ${ok} / 失败 ${fail}"
+  else
+    YEL "[INFO] 本次未停任何容器，无需重启"
+  fi
+
+  YEL "[INFO] 自动清理打包产物 ..."
+  cleanup_bundle
+  exit 0
+}
 trap graceful_exit INT TERM
 
-( cd "${WORKDIR}/bundle" && python3 -m http.server "${PORT}" >/dev/null 2>&1 & )
+( cd "$(dirname "${BUNDLE}")" && python3 -m http.server "${PORT}" >/dev/null 2>&1 & )
 SHPID=$!; sleep 1
 
-LAN_IP="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1)"; : "${LAN_IP:=127.0.0.1}"
-PUB_IP="$(pick_advertise_host)"
+# 只输出一个下载链接（公网优先，探测不到则回退内网/127.0.0.1）
+OK  "[OK] 下载链接： ${URL}"
+YEL "[WARN] HTTP 未鉴权，仅限可信网络使用。完成后关闭此窗口。"
 
-OK  "[OK] 内网链接：  http://${LAN_IP}:${PORT}/${RID}.tar.gz"
-if ! is_private_ipv4 "$PUB_IP"; then
-  OK  "[OK] 公网候选： http://${PUB_IP}:${PORT}/${RID}.tar.gz"
-else
-  YEL "[WARN] 未探测到公网 IP（或机器在内网/NAT 后）。如需公网访问："
-  echo "      1) 在路由/安全组开放端口 ${PORT} 并映射到本机"
-  echo "      2) 重新运行时指定： ADVERTISE_HOST=my.public.ip bash docker_migrate_perfect.sh"
-fi
-echo; YEL "[TIP] 目录浏览（LAN）： http://${LAN_IP}:${PORT}/${RID}/"
-YEL "[WARN] HTTP 未鉴权，仅限可信网络使用。下载完成后请关闭此窗口。"
-
-# 交互等待；回车 -> 清理
+# 交互等待；回车 -> 关 HTTP → 重启 → 自动清理
 if [[ -t 0 ]]; then
-  read -rp $'\n按回车键停止 HTTP 并退出 ... '
+  read -rp $'\n按回车键停止 HTTP 并退出（将自动重启停机容器并清理产物）... '
   graceful_exit
 else
   graceful_exit
