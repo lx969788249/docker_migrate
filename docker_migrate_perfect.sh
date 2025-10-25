@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# docker_migrate_perfect.sh — final with: compose-first, images.tar, split volumes/binds,
+# docker_migrate_perfect.sh — compose-first, images.tar, split volumes/binds,
 # port auto-pick, primary IP detect, http cleanup, + single-file bundle RID.tar.gz
 # + Auto-deps install (docker jq python3 tar gzip curl)
 set -euo pipefail
@@ -19,7 +19,7 @@ pm_install(){
   case "$pm" in
     apt)
       asudo apt-get update -y
-      asudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
       ;;
     dnf)    asudo dnf install -y "$@" ;;
     yum)    asudo yum install -y "$@" ;;
@@ -43,7 +43,7 @@ ensure_docker_running(){
     asudo service docker start || true
   fi
   if ! docker info >/dev/null 2>&1; then
-    echo "[WARN] 尝试直接拉起 dockerd（临时前台/后台）"
+    echo "[WARN] 尝试直接拉起 dockerd（后台）"
     if command -v dockerd >/dev/null 2>&1; then
       (asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &); sleep 2
     fi
@@ -57,7 +57,6 @@ if [[ "$PKGMGR" == "none" ]]; then
   exit 1
 fi
 
-# 依赖映射（各发行版可能略有出入，尽量通用）
 case "$PKGMGR" in
   apt)
     need_bin curl curl
@@ -73,7 +72,6 @@ case "$PKGMGR" in
     need_bin python3 python3
     need_bin tar tar
     need_bin gzip gzip
-    # RHEL/Fedora/CentOS：包名常为 docker 或 docker-ce（这里优先 docker）
     if ! command -v docker >/dev/null 2>&1; then
       pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true
     fi
@@ -408,6 +406,7 @@ OK  "[OK] 生成完成：${BUNDLE}"
 BLUE "[INFO] 启动 HTTP 服务（python3 -m http.server ${PORT}）"
 cleanup_http(){ kill "${SHPID}" 2>/dev/null || true; }
 trap cleanup_http EXIT
+
 ( cd "${WORKDIR}/bundle" && python3 -m http.server "${PORT}" >/dev/null 2>&1 & )
 SHPID=$!; sleep 1
 
