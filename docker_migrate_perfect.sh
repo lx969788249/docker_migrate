@@ -251,7 +251,7 @@ done
 if [[ "$NO_STOP" == "1" ]]; then
   YEL "[WARN] --no-stop：不停机备份，可能不一致（数据库尤需注意）"
 else
-  read -rp "是否现在停机以确保一致性备份？[Y/n] " STOPNOW; STOPNOW=${STOPNOW:-Y}
+  read -rp "是否现在停机以确保一致性备份？(也可以不停)[Y/n] " STOPNOW; STOPNOW=${STOPNOW:-Y}
   if [[ "$STOPNOW" =~ ^[Yy]$ ]]; then
     for id in "${IDS[@]}"; do n="${CONTAINER_NAME[$id]}"; BLUE "[INFO] 停止 $n ..."; docker stop "$n" >/dev/null; done
   else
