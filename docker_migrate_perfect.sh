@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # docker_migrate_perfect.sh — compose-first, images.tar, split volumes/binds,
-# port auto-pick, primary IP detect, http cleanup, + single-file bundle RID.tar.gz
+# port auto-pick, advertise public/LAN URL, http cleanup, + single-file bundle RID.tar.gz
 # + Auto-deps install (docker jq python3 tar gzip curl)
 # + Progress indicators for long-running steps
 set -euo pipefail
@@ -29,25 +29,16 @@ pm_install(){
     *) echo "[ERR] 无法识别包管理器，手动安装：$*"; exit 1;;
   esac
 }
-need_bin(){
-  local b="$1" p="$2"
-  command -v "$b" >/dev/null 2>&1 || { echo "[INFO] 安装依赖：$b"; pm_install "$PKGMGR" $p; }
-}
+need_bin(){ local b="$1" p="$2"; command -v "$b" >/dev/null 2>&1 || { echo "[INFO] 安装依赖：$b"; pm_install "$PKGMGR" $p; }; }
 ensure_docker_running(){
   if ! command -v docker >/dev/null 2>&1; then return; fi
   if docker info >/dev/null 2>&1; then return; fi
   echo "[INFO] 启动 Docker 服务..."
-  if command -v systemctl >/dev/null 2>&1; then
-    asudo systemctl enable --now docker || true
-  fi
-  if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
-    asudo service docker start || true
-  fi
+  if command -v systemctl >/dev/null 2>&1; then asudo systemctl enable --now docker || true; fi
+  if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then asudo service docker start || true; fi
   if ! docker info >/dev/null 2>&1; then
     echo "[WARN] 尝试直接拉起 dockerd（后台）"
-    if command -v dockerd >/dev/null 2>&1; then
-      (asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &); sleep 2
-    fi
+    if command -v dockerd >/dev/null 2>&1; then (asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &); sleep 2; fi
   fi
   docker info >/dev/null 2>&1 || { echo "[ERR] Docker 未成功启动，请手动检查"; exit 1; }
 }
@@ -73,9 +64,7 @@ case "$PKGMGR" in
     need_bin python3 python3
     need_bin tar tar
     need_bin gzip gzip
-    if ! command -v docker >/dev/null 2>&1; then
-      pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true
-    fi
+    if ! command -v docker >/dev/null 2>&1; then pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true; fi
     ;;
   zypper)
     need_bin curl curl
@@ -104,7 +93,7 @@ RED(){ echo -e "\033[1;31m$*\033[0m"; }
 OK(){ echo -e "\033[1;32m$*\033[0m"; }
 
 # --- 进度工具 ---
-# 文件增长进度：在后台命令将内容写入 $1 时，实时显示 du -h 大小；$2 为提示文本
+# 文件增长进度（后台命令写入 $1 文件时，显示大小增长）
 progress_file_growth() {
   local file="$1"; local label="${2:-进度}"; local pid="$3"
   local last=""
@@ -126,15 +115,12 @@ progress_file_growth() {
     printf "\r%s 完成\n" "$label"
   fi
 }
-
-# 旋转指示器：在某段命令执行期间显示转动光标；$1 为提示文本
+# 旋转指示器（包裹一条耗时命令）
 spinner_run() {
   local msg="$1"; shift
   local spin='-\|/' i=0
   printf "%s " "$msg"
-  (
-    "$@"
-  ) &
+  ( "$@" ) &
   local cmd_pid=$!
   while kill -0 "$cmd_pid" 2>/dev/null; do
     i=$(( (i+1) %4 ))
@@ -143,6 +129,39 @@ spinner_run() {
   done
   wait "$cmd_pid"
   printf "\r%s 完成\n" "$msg"
+}
+
+# --- IP 选择工具 ---
+is_private_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^10\. ]] && return 0
+  [[ "$ip" =~ ^192\.168\. ]] && return 0
+  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
+  [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] && return 0 # CGNAT
+  [[ "$ip" =~ ^127\. ]] && return 0
+  [[ "$ip" =~ ^169\.254\. ]] && return 0
+  return 1
+}
+get_public_ip_external() {
+  local ip
+  for svc in "https://api.ipify.org" "https://ipv4.icanhazip.com" "https://ifconfig.me"; do
+    ip="$(curl -fsS --max-time 2 "$svc" 2>/dev/null | tr -d '\r\n' || true)"
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+  done
+  return 1
+}
+pick_advertise_host() {
+  if [[ -n "${ADVERTISE_HOST:-}" ]]; then echo "$ADVERTISE_HOST"; return; fi
+  local via_route
+  via_route="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  if [[ -n "$via_route" ]] && ! is_private_ipv4 "$via_route"; then echo "$via_route"; return; fi
+  local ip
+  while read -r ip; do
+    if ! is_private_ipv4 "$ip"; then echo "$ip"; return; fi
+  done < <(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  if command -v curl >/dev/null 2>&1; then ip="$(get_public_ip_external || true)"; [[ -n "$ip" ]] && { echo "$ip"; return; }; fi
+  ip="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1)"
+  echo "${ip:-127.0.0.1}"
 }
 
 # ---------- Args ----------
@@ -158,7 +177,8 @@ for arg in "$@"; do
 用法:
   bash docker_migrate_perfect.sh [--no-stop] [--include=name1,name2]
 环境变量:
-  PORT=8080  # HTTP 端口（默认 8080；被占用会自动递增）
+  PORT=8080           # HTTP 端口（默认 8080；被占用会自动递增）
+  ADVERTISE_HOST=IP   # 显示给用户的“公网/域名”（覆盖自动探测）
 HLP
       exit 0;;
   esac
@@ -166,7 +186,6 @@ done
 
 # ---------- helpers ----------
 pick_free_port(){ local p="${1:-8080}"; for _ in $(seq 0 50); do ss -lnt 2>/dev/null|awk '{print $4}'|grep -q ":$p$"||{ echo "$p"; return; }; p=$((p+1)); done; echo "$1"; }
-pick_primary_ip(){ ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1; }
 
 # ---------- dirs & ids ----------
 PORT="$(pick_free_port "${PORT:-8080}")"
@@ -293,7 +312,7 @@ for key in "${!COMPOSE_GROUP[@]}"; do
   BLUE "  [COMPOSE] $proj @ $wdir"
   cfgs="${COMPOSE_CFGS[$key]:-}"
   if [[ -n "$cfgs" ]]; then
-    IFS=',' read -r -a files <<<"$cfgs"; ( cd "$wdir" && tar -czf "${target}/compose_${proj}.tgz" "${files[@]}" 2>/dev/null || true )
+    IFS=',' read -r -a files <<<"$cfgs"; ( cd "$wdir" && tar -czf "${target}/compose_${proj}.tgz" "${files@"@"}" 2>/dev/null || true )
   else
     for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env docker-compose.override.yml compose.override.yaml; do
       [[ -f "${wdir}/${f}" ]] && cp -a "${wdir}/${f}" "${target}/" || true
@@ -463,13 +482,26 @@ trap cleanup_http EXIT
 ( cd "${WORKDIR}/bundle" && python3 -m http.server "${PORT}" >/dev/null 2>&1 & )
 SHPID=$!; sleep 1
 
-IP_CAND="$(pick_primary_ip)"; : "${IP_CAND:=127.0.0.1}"
-OK  "[OK] 目录浏览： http://${IP_CAND}:${PORT}/${RID}/"
-OK  "[OK] 一键包下载： http://${IP_CAND}:${PORT}/${RID}.tar.gz"
+# 打印公网候选 + 内网地址
+LAN_IP="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1)"
+: "${LAN_IP:=127.0.0.1}"
+PUB_IP="$(pick_advertise_host)"
+
+OK  "[OK] 内网链接：  http://${LAN_IP}:${PORT}/${RID}.tar.gz"
+if ! is_private_ipv4 "$PUB_IP"; then
+  OK  "[OK] 公网候选： http://${PUB_IP}:${PORT}/${RID}.tar.gz"
+else
+  YEL "[WARN] 未探测到公网 IP（或机器在内网/NAT 后）。如需公网访问："
+  echo "      1) 在路由/安全组开放端口 ${PORT} 并映射到本机"
+  echo "      2) 重新运行时指定： ADVERTISE_HOST=my.public.ip bash docker_migrate_perfect.sh"
+fi
+
+echo
+YEL "[TIP] 目录浏览（LAN）： http://${LAN_IP}:${PORT}/${RID}/"
 YEL "[WARN] HTTP 未鉴权，仅限可信网络使用。下载完成后请关闭此窗口。"
 
 # 非交互运行：直接退出（留给外部进程管理 http）
-if [[ -n "$INCLUDE_LIST" || "$NO_STOP" == "1" ]]; then
+if [[ -n "${INCLUDE_LIST}" || "$NO_STOP" == "1" ]]; then
   sleep 2; exit 0
 fi
 
