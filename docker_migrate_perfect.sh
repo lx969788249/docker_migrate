@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # docker_migrate_perfect.sh — compose-first, images.tar, split volumes/binds,
-# single-file bundle, auto-deps, progress bars, auto-clean, post-HTTP auto-restart
+# single-file bundle, auto-deps, progress bars, post-HTTP auto-restart
+# ✅ 结束后无条件删除工作目录与<RID>.tar.gz（不做判定）
 set -euo pipefail
 
 # ---------- Auto install deps ----------
@@ -138,9 +139,6 @@ cat <<'HLP'
 环境变量:
   PORT=8080            # HTTP 端口（默认 8080；被占用会自动递增）
   ADVERTISE_HOST=IP    # 用于生成下载链接（优先级最高）
-  AUTO_CLEAN_ALL=1     # 退出时删除工作目录+单文件包
-  AUTO_KEEP=1          # 退出时不做任何清理
-  # 默认行为：自动删除工作目录，保留 <RID>.tar.gz
 HLP
       exit 0;;
   esac
@@ -447,7 +445,7 @@ BUNDLE_BASENAME="$(basename "${BUNDLE}")"
 spinner_run "[INFO] 生成单文件包 ${BUNDLE_BASENAME}.tar.gz ..." bash -c "(cd \"$(dirname "${BUNDLE}")\" && tar -czf \"${BUNDLE_BASENAME}.tar.gz\" \"${BUNDLE_BASENAME}\")"
 SINGLE_TAR_PATH="$(dirname "${BUNDLE}")/${BUNDLE_BASENAME}.tar.gz"
 
-# ---------- HTTP serve + post-restart + auto-clean ----------
+# ---------- HTTP serve + post-restart + hard clean ----------
 OK  "[OK] 生成完成：${BUNDLE}"
 ( cd "${BUNDLE}" && ls -lah )
 
@@ -458,20 +456,14 @@ BLUE "[INFO] 启动 HTTP 服务（python3 -m http.server ${PORT}）"
 SHPID=""
 cleanup_http(){ [[ -n "${SHPID:-}" ]] && kill "${SHPID}" 2>/dev/null || true; }
 
-# 自动清理策略：AUTO_CLEAN_ALL=1 -> 删目录+tar.gz；AUTO_KEEP=1 -> 不删；默认 -> 删目录保留tar.gz
-cleanup_bundle(){
-  if [[ "${AUTO_CLEAN_ALL:-0}" == "1" ]]; then
-    rm -rf "$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz" "${BUNDLE}" || true
-    OK "[OK] 已删除：工作目录与单文件包"
-  elif [[ "${AUTO_KEEP:-0}" == "1" ]]; then
-    YEL "[INFO] 已按要求保留：工作目录与单文件包"
-  else
-    rm -rf "${BUNDLE}" || true
-    OK "[OK] 已删除：工作目录（已保留单文件包）"
-  fi
+# 无条件删除：关 HTTP → 重启容器 → 删除 bundle/<RID>/ 与 <RID>.tar.gz
+hard_clean(){
+  rm -rf "${BUNDLE}" 2>/dev/null || true
+  rm -f  "$(dirname "${BUNDLE}")/$(basename "${BUNDLE}").tar.gz" 2>/dev/null || true
+  OK "[OK] 已清理：工作目录与单文件包"
 }
 
-# 退出时序：关HTTP → 重启容器（逐个）→ 自动清理
+# 退出时序：关HTTP → 重启容器（逐个）→ 无条件清理
 graceful_exit(){
   echo
   YEL "[INFO] 即将退出，先关闭 HTTP 服务 ..."
@@ -493,8 +485,8 @@ graceful_exit(){
     YEL "[INFO] 本次未停任何容器，无需重启"
   fi
 
-  YEL "[INFO] 自动清理打包产物 ..."
-  cleanup_bundle
+  YEL "[INFO] 清理打包产物 ..."
+  hard_clean
   exit 0
 }
 trap graceful_exit INT TERM
@@ -506,7 +498,7 @@ SHPID=$!; sleep 1
 OK  "[OK] 下载链接： ${URL}"
 YEL "[WARN] HTTP 未鉴权，仅限可信网络使用。完成后关闭此窗口。"
 
-# 交互等待；回车 -> 关 HTTP → 重启 → 自动清理
+# 交互等待；回车 -> 关 HTTP → 重启 → 无条件清理
 if [[ -t 0 ]]; then
   read -rp $'\n按回车键停止 HTTP 并退出（将自动重启停机容器并清理产物）... '
   graceful_exit
