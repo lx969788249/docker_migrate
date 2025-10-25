@@ -35,12 +35,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/m
 
 ⸻
 
-
-⸻
-
 🧑‍💻 作者
 
 MIT License © lx969788249
-
-⸻
 
