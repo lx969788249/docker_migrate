@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# docker_migrate_perfect.sh — compose-first, images.tar, split volumes/binds,
-# single-file bundle, auto-deps, progress bars, post-HTTP auto-restart
-# ✅ 结束后无条件删除工作目录与<RID>.tar.gz（不做判定）
+# docker_migrate_perfect.sh — 处理 Docker 容器备份与恢复的脚本
 set -euo pipefail
 
 # ---------- Auto install deps ----------
@@ -231,6 +229,7 @@ for id in "${IDS[@]}"; do
 done
 v_idx=0; b_idx=0
 
+# ---------- 处理卷与绑定目录 ----------
 for id in "${IDS[@]}"; do
   n="${CONTAINER_NAME[$id]}"; j="$(cat "${BUNDLE}/meta/${n}.inspect.json")"
   while IFS= read -r m; do [[ -z "$m" ]] && continue
@@ -264,69 +263,6 @@ if ((${#IMAGES[@]})); then
 else
   YEL "[WARN] 未收集到镜像名？"
 fi
-
-# -------- pack compose ----------
-BLUE "[INFO] 处理 Compose 项目 ..."
-c_total=${#COMPOSE_GROUP[@]}; c_idx=0
-for key in "${!COMPOSE_GROUP[@]}"; do
-  c_idx=$((c_idx+1))
-  proj="${key%%|*}"; wdir="${key#*|}"; target="${BUNDLE}/compose/${proj}"; mkdir -p "$target"
-  printf "  [COMPOSE] (%d/%d) %s @ %s\n" "$c_idx" "$c_total" "$proj" "$wdir"
-  cfgs="${COMPOSE_CFGS[$key]:-}"
-  if [[ -n "$cfgs" ]]; then
-    IFS=',' read -r -a files <<<"$cfgs"
-    if ((${#files[@]})); then ( cd "$wdir" && tar -czf "${target}/compose_${proj}.tgz" "${files[@]}" 2>/dev/null || true ); else YEL "  [WARN] $proj 的 config_files 为空，跳过打包"; fi
-  else
-    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env docker-compose.override.yml compose.override.yaml; do
-      [[ -f "${wdir}/${f}" ]] && cp -a "${wdir}/${f}" "${target}/" || true
-    done
-    if ! ls -1 "${target}" | grep -q .; then
-      ( cd "$wdir" && tar -czf "${target}/compose_${proj}.tgz" docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env docker-compose.override.yml compose.override.yaml 2>/dev/null || true )
-    fi
-  fi
-done
-
-# -------- gen docker run for non-compose ----------
-BLUE "[INFO] 生成非 Compose 容器的 docker run 脚本 ..."
-gen_run_from_inspect(){ local f="$1"
-  local name image restart netmode priv shm
-  name="$(jq -r '.[0].Name|ltrimstr("/")' "$f")"; image="$(jq -r '.[0].Config.Image' "$f")"
-  restart="$(jq -r '.[0].HostConfig.RestartPolicy.Name // empty' "$f")"; netmode="$(jq -r '.[0].HostConfig.NetworkMode // empty' "$f")"
-  priv="$(jq -r '.[0].HostConfig.Privileged' "$f")"; shm="$(jq -r '.[0].HostConfig.ShmSize // 0' "$f")"
-  echo "#!/usr/bin/env bash"; echo "set -euo pipefail"; echo "docker rm -f ${name} >/dev/null 2>&1 || true"
-  echo -n "docker run -d --name ${name} "; [[ -n "$restart" && "$restart" != "null" ]] && echo -n "--restart ${restart} "
-  [[ "$priv" == "true" ]] && echo -n "--privileged "; [[ -n "$netmode" && "$netmode" != "default" ]] && echo -n "--network ${netmode} "
-  [[ "$shm" != "0" ]] && echo -n "--shm-size ${shm} "
-  jq -r '.[0].HostConfig.CapAdd[]?' "$f" | while read -r cap; do echo -n "--cap-add ${cap} "; done
-  jq -r '.[0].HostConfig.Ulimits[]? | "--ulimit \(.Name)=\(.Soft):\(.Hard)"' "$f" | tr -d '\n' || true; echo -n " "
-  jq -r '.[0].HostConfig.PortBindings // {} | to_entries[]? | select(.value|length>0) | "--publish \(.value[0].HostIp // "0.0.0.0"):\(.value[0].HostPort):\(.key)"' "$f" | xargs -r echo -n; echo -n " "
-  jq -r '.[0].Config.Env[]? | "--env \(.)"' "$f" | xargs -r echo -n; echo -n " "
-  jq -r '.[0].HostConfig.Dns[]? | "--dns \(.)"' "$f" | xargs -r echo -n; echo -n " "
-  jq -r '.[0].HostConfig.DnsSearch[]? | "--dns-search \(.)"' "$f" | xargs -r echo -n; echo -n " "
-  jq -c '.[0].Mounts[]?' "$f" | while read -r m; do
-    t=$(jq -r '.Type' <<<"$m"); src=$(jq -r '.Source//""' <<<"$m"); dest=$(jq -r '.Destination' <<<"$m"); vname=$(jq -r '.Name//""' <<<"$m")
-    case "$t" in bind) echo -n "-v ${src}:${dest} " ;; volume) echo -n "-v ${vname}:${dest} " ;; esac
-  done
-  ldrv=$(jq -r '.[0].HostConfig.LogConfig.Type // empty' "$f"); [[ -n "$ldrv" && "$ldrv" != "json-file" ]] && echo -n "--log-driver ${ldrv} "
-  jq -r '.[0].HostConfig.LogConfig.Config // {} | to_entries[]? | "--log-opt \(.key)=\(.value)"' "$f" | xargs -r echo -n; echo -n " "
-  htest=$(jq -r '.[0].Config.Healthcheck.Test // empty | if .=="" or .==null then "" else join(" ") end' "$f")
-  if [[ -n "$htest" && "$htest" != "NONE" ]]; then
-    hint=$(jq -r '.[0].Config.Healthcheck.Interval // 0' "$f"); htim=$(jq -r '.[0].Config.Healthcheck.Timeout // 0' "$f"); hretries=$(jq -r '.[0].Config.Healthcheck.Retries // 0' "$f")
-    echo -n "--health-cmd '$htest' "; [[ "$hint" != "0" ]] && echo -n "--health-interval ${hint} "; [[ "$htim" != "0" ]] && echo -n "--health-timeout ${htim} "; [[ "$hretries" != "0" ]] && echo -n "--health-retries ${hretries} "
-  fi
-  hn=$(jq -r '.[0].Config.Hostname // empty' "$f"); [[ -n "$hn" ]] && echo -n "--hostname ${hn} "
-  echo "${image}"
-}
-declare -a RUNS=()
-nr_total=0; for id in "${IDS[@]}"; do [[ "${CONTAINER_IS_COMPOSE[$id]:-0}" -eq 1 ]] || nr_total=$((nr_total+1)); done
-nr_idx=0
-for id in "${IDS[@]}"; do
-  if [[ "${CONTAINER_IS_COMPOSE[$id]}" -eq 1 ]]; then continue; fi
-  nr_idx=$((nr_idx+1))
-  name="${CONTAINER_NAME[$id]}"; out="${BUNDLE}/runs/${name}.sh"
-  printf "  [RUNLIKE] (%d/%d) %s\n" "$nr_idx" "$nr_total" "$name"
-  gen_run_from_inspect "${BUNDLE}/meta/${name}.inspect.json" > "$out"; chmod +x "$out"; RUNS+=("runs/${name}.sh")
-done
 
 # -------- 生成 manifest.json 与 restore.sh --------
 generate_manifest_and_restore(){
