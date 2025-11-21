@@ -10,13 +10,23 @@ YEL(){  echo -e "\033[1;33m$*\033[0m"; }
 RED(){  echo -e "\033[1;31m$*\033[0m"; }
 OK(){   echo -e "\033[1;32m$*\033[0m"; }
 
-asudo(){ if [[ $EUID -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
-pm_detect(){ if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
-             if command -v dnf     >/dev/null 2>&1; then echo dnf; return; fi
-             if command -v yum     >/dev/null 2>&1; then echo yum; return; fi
-             if command -v zypper  >/dev/null 2>&1; then echo zypper; return; fi
-             if command -v apk     >/dev/null 2>&1; then echo apk; return; fi
-             echo none; }
+asudo(){
+  if [[ $EUID -ne 0 ]]; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+pm_detect(){
+  if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
+  if command -v dnf     >/dev/null 2>&1; then echo dnf; return; fi
+  if command -v yum     >/devnull 2>&1; then echo yum; return; fi
+  if command -v zypper  >/dev/null 2>&1; then echo zypper; return; fi
+  if command -v apk     >/dev/null 2>&1; then echo apk; return; fi
+  echo none
+}
+
 pm_install(){
   local pm="$1"; shift
   case "$pm" in
@@ -24,10 +34,18 @@ pm_install(){
       asudo apt-get update -y
       asudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
       ;;
-    dnf)    asudo dnf install -y "$@" ;;
-    yum)    asudo yum install -y "$@" ;;
-    zypper) asudo zypper --non-interactive install -y "$@" ;;
-    apk)    asudo apk add --no-cache "$@" ;;
+    dnf)
+      asudo dnf install -y "$@"
+      ;;
+    yum)
+      asudo yum install -y "$@"
+      ;;
+    zypper)
+      asudo zypper --non-interactive install -y "$@"
+      ;;
+    apk)
+      asudo apk add --no-cache "$@"
+      ;;
     *)
       RED "[ERR] 不支持的包管理器：$pm，请手动安装：$*"
       return 1
@@ -38,26 +56,24 @@ pm_install(){
 ensure_deps(){
   local PM; PM="$(pm_detect)"
 
-  # 依赖：curl / tar / jq / docker
+  # 1) 基础依赖：curl / tar / jq / docker
   for bin in curl tar jq docker; do
-    # 已经存在的依赖跳过
+    # 已安装则跳过
     if command -v "$bin" >/dev/null 2>&1; then
       continue
     fi
 
-    # 没有包管理器，没办法自动装
     if [[ "$PM" == "none" ]]; then
       RED "[ERR] 缺少依赖：$bin，请手动安装后再运行本脚本。"
       exit 1
     fi
 
-    # docker 单独特殊处理，不同系统包名不一样
     if [[ "$bin" == "docker" ]]; then
-      YEL "[INFO] 未检测到 docker，尝试使用包管理器自动安装 ..."
+      YEL "[INFO] 未检测到 docker，尝试自动安装 ..."
 
       case "$PM" in
         apt)
-          # Debian / Ubuntu 系：官方源一般提供 docker.io
+          # Debian / Ubuntu：官方源一般提供 docker.io
           if ! pm_install "$PM" docker.io; then
             RED "[ERR] 通过 apt 安装 docker.io 失败，请手动安装 Docker 后重试。"
             exit 1
@@ -96,7 +112,7 @@ ensure_deps(){
     fi
   done
 
-  # 尝试启动 docker
+  # 2) 尝试启动 docker
   if ! docker info >/dev/null 2>&1; then
     YEL "[INFO] 尝试启动 Docker 服务..."
 
@@ -121,6 +137,37 @@ ensure_deps(){
     if ! docker info >/dev/null 2>&1; then
       RED "[ERR] Docker 未能启动，请确认在新服务器上正确安装并配置 Docker。"
       exit 1
+    fi
+  fi
+
+  # 3) 尝试确保 docker compose / docker-compose 可用（最佳努力，不强制失败）
+  if docker compose version >/dev/null 2>&1 || docker-compose version >/dev/null 2>&1; then
+    OK "[OK] 已检测到 Docker Compose：$(docker compose version 2>/dev/null || docker-compose version 2>/dev/null)"
+  else
+    YEL "[INFO] 未检测到 docker compose / docker-compose，尝试自动安装 ..."
+    local PM2; PM2="$PM"
+    case "$PM2" in
+      apt)
+        pm_install "$PM2" docker-compose || YEL "[WARN] apt 安装 docker-compose 失败，请考虑手动安装。"
+        ;;
+      yum|dnf)
+        pm_install "$PM2" docker-compose || YEL "[WARN] $PM2 安装 docker-compose 失败，请考虑手动安装。"
+        ;;
+      zypper)
+        pm_install "$PM2" docker-compose || YEL "[WARN] zypper 安装 docker-compose 失败，请考虑手动安装。"
+        ;;
+      apk)
+        pm_install "$PM2" docker-compose || YEL "[WARN] apk 安装 docker-compose 失败，请考虑手动安装。"
+        ;;
+      *)
+        YEL "[WARN] 当前环境无法自动安装 Docker Compose，请手动安装 docker compose / docker-compose。"
+        ;;
+    esac
+
+    if docker compose version >/dev/null 2>&1 || docker-compose version >/dev/null 2>&1; then
+      OK "[OK] Docker Compose 安装完成：$(docker compose version 2>/dev/null || docker-compose version 2>/dev/null)"
+    else
+      YEL "[WARN] 仍未检测到 docker compose / docker-compose，恢复时将跳过 Compose 项目（但不会影响其他容器恢复）。"
     fi
   fi
 }
@@ -231,7 +278,7 @@ main(){
   if [[ $rc -eq 0 ]]; then
     OK "[OK] 恢复脚本执行成功！当前 Docker 容器："
     docker ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}"
-    # 自动清理（默认：删tgz+解压目录）
+    # 自动清理（默认：删 tgz + 解压目录）
     if [[ "${RESTORE_KEEP:-0}" == "1" ]]; then
       YEL "[INFO] 已按 RESTORE_KEEP=1 保留文件：$TGZ 与 $OUTDIR"
     else
