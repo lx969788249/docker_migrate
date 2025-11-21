@@ -47,8 +47,41 @@ ensure_deps(){
         RED "[ERR] 缺少命令：$bin，请手动在新服务器安装该命令后重试。"
         exit 1
       fi
-      YEL "[INFO] 安装依赖：$bin"
-      pm_install "$PM" "$pkg"
+
+      if [[ "$bin" == "docker" ]]; then
+        YEL "[INFO] 安装依赖：$bin（以及 docker compose）"
+        case "$PM" in
+          apt)
+            # Ubuntu/Debian 上通常是 docker.io 包
+            pm_install "$PM" docker.io
+            ;;
+          dnf|yum|zypper|apk)
+            # 多数发行版上包名为 docker
+            pm_install "$PM" docker
+            ;;
+          *)
+            pm_install "$PM" docker || true
+            ;;
+        esac
+
+        # 尝试安装 docker compose（优先新版 docker compose 插件，其次 docker-compose）
+        if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+          case "$PM" in
+            apt)
+              pm_install "$PM" docker-compose-plugin || pm_install "$PM" docker-compose || true
+              ;;
+            dnf|yum|zypper|apk)
+              pm_install "$PM" docker-compose || true
+              ;;
+            *)
+              pm_install "$PM" docker-compose || true
+              ;;
+          esac
+        fi
+      else
+        YEL "[INFO] 安装依赖：$bin"
+        pm_install "$PM" "$pkg"
+      fi
     fi
   done
 
