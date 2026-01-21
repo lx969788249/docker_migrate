@@ -519,6 +519,157 @@ EOF
 }
 
 #####################################
+#  恢复模式（原 auto_restore 逻辑）
+#####################################
+
+restore_prompt_url() {
+  local u="${1:-}"
+  if [[ -z "$u" ]]; then
+    read -rp "请输入旧服务器“一键包下载链接”（以 .tar.gz 结尾）： " u
+  fi
+  if ! [[ "$u" =~ \.tar\.gz($|\?) ]]; then
+    RED "[ERR] 链接必须以 .tar.gz 结尾。"
+    exit 1
+  fi
+  echo "$u"
+}
+
+restore_find_bundle_dir() {
+  local outdir="$1" rid="$2"
+  if [[ -d "${outdir}/${rid}" && -f "${outdir}/${rid}/restore.sh" ]]; then
+    echo "${outdir}/${rid}"
+    return 0
+  fi
+  local first
+  first="$(find "$outdir" -maxdepth 2 -type f -name restore.sh -print | head -n1 || true)"
+  [[ -n "$first" ]] && dirname "$first"
+}
+
+restore_ensure_deps() {
+  local pm; pm="$(pm_detect)"
+
+  for pair in "curl curl" "tar tar" "jq jq" "docker docker"; do
+    local bin="${pair%% *}" pkg="${pair##* }"
+    if ! command -v "$bin" >/dev/null 2>&1; then
+      if [[ "$pm" == "none" ]]; then
+        RED "[ERR] 缺少命令：$bin，请在新服务器安装该命令后重试。"
+        exit 1
+      fi
+
+      if [[ "$bin" == "docker" ]]; then
+        YEL "[INFO] 安装依赖：$bin（以及 docker compose）"
+        case "$pm" in
+          apt)    pm_install "$pm" docker.io ;;
+          dnf|yum|zypper|apk) pm_install "$pm" docker ;;
+          *)      pm_install "$pm" docker || true ;;
+        esac
+
+        if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+          case "$pm" in
+            apt) pm_install "$pm" docker-compose-plugin || pm_install "$pm" docker-compose || true ;;
+            dnf|yum|zypper|apk) pm_install "$pm" docker-compose || true ;;
+            *) pm_install "$pm" docker-compose || true ;;
+          esac
+        fi
+      else
+        YEL "[INFO] 安装依赖：$bin"
+        pm_install "$pm" "$pkg"
+      fi
+    fi
+  done
+
+  ensure_docker_running
+}
+
+restore_main() {
+  restore_ensure_deps
+
+  local URL; URL="$(restore_prompt_url "${1:-}")"
+  local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
+  mkdir -p "$BASE"
+
+  local RID
+  RID="$(basename "$URL" | sed 's/\\.tar\\.gz.*$//' | tr -dc 'A-Za-z0-9_-')"
+  [[ -n "$RID" ]] || RID="$(date +%s)"
+
+  local TGZ="${BASE}/bundle.tar.gz"
+  local OUTDIR="${BASE}/${RID}"
+
+  BLUE "[INFO] 下载：$URL"
+  if ! curl -fL --progress-bar "$URL" -o "$TGZ"; then
+    RED "[ERR] 下载失败：$URL"
+    exit 1
+  fi
+  OK "[OK] 保存路径：$TGZ"
+  BLUE "[INFO] 文件大小：$(du -h "$TGZ" | awk '{print $1}')"
+
+  BLUE "[INFO] 解压到：$OUTDIR"
+  mkdir -p "$OUTDIR"
+  BLUE "[INFO] 正在解压压缩包（根据文件大小可能需要一段时间，请不要中断）..."
+  if ! tar -xzf "$TGZ" -C "$OUTDIR"; then
+    RED "[ERR] 解压失败，请检查磁盘空间或确认文件是否完整。"
+    exit 1
+  fi
+
+  local BUNDLE_DIR
+  BUNDLE_DIR="$(restore_find_bundle_dir "$OUTDIR" "$RID" || true)"
+
+  if [[ -z "$BUNDLE_DIR" || ! -f "${BUNDLE_DIR}/restore.sh" ]]; then
+    RED "[ERR] 未找到 restore.sh，解压内容异常：$OUTDIR"
+    exit 1
+  fi
+
+  BLUE "[INFO] 执行恢复脚本：${BUNDLE_DIR}/restore.sh"
+  BLUE "[INFO] 该步骤会加载镜像、回灌卷和绑定目录，并启动容器，可能需要数分钟，请耐心等待..."
+
+  set +e
+  bash "${BUNDLE_DIR}/restore.sh"
+  local rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    OK "[OK] 恢复完成！当前容器："
+    docker ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    if [[ "${RESTORE_KEEP:-0}" == "1" ]]; then
+      YEL "[INFO] 已按 RESTORE_KEEP=1 保留文件：$TGZ 与 $OUTDIR"
+    else
+      rm -rf "$TGZ" "$OUTDIR" 2>/dev/null || true
+      OK "[OK] 已清理下载文件与临时目录"
+    fi
+    exit 0
+  else
+    RED "[ERR] 恢复脚本返回非零：$rc"
+    YEL "[INFO] 为便于排查，默认保留文件：$TGZ 与 $OUTDIR"
+    if [[ "${RESTORE_CLEAN_ALL:-0}" == "1" ]]; then
+      YEL "[WARN] RESTORE_CLEAN_ALL=1：仍将强制删除文件"
+      rm -rf "$TGZ" "$OUTDIR" 2>/dev/null || true
+      OK "[OK] 已清理下载文件与临时目录"
+    fi
+    exit "$rc"
+  fi
+}
+
+#####################################
+#  模式选择：1) 备份并传输 2) 下载并恢复
+#####################################
+
+if [[ -t 0 ]]; then
+  echo "请选择功能："
+  echo "  1) 备份容器并传输"
+  echo "  2) 下载备份并恢复"
+  read -rp "请输入序号 [回车=1]：" MODE_PICK || true
+  MODE_PICK="${MODE_PICK:-1}"
+else
+  MODE_PICK=1
+fi
+
+case "$MODE_PICK" in
+  1) : ;; # 继续走备份流程
+  2) restore_main "$@"; exit 0 ;;
+  *) RED "[ERR] 无效选择：${MODE_PICK}"; exit 1 ;;
+esac
+
+#####################################
 #  依赖检测 / 安装
 #####################################
 
@@ -585,17 +736,18 @@ while [[ $# -gt 0 ]]; do
   bash docker_migrate_perfect.sh [--no-stop] [--include=name1,name2]
 
 环境变量:
-  PORT=8080            # HTTP 端口（默认 8080；被占用会自动递增）
+ PORT=8080            # HTTP 端口（默认 8080；被占用会自动递增）
   ADVERTISE_HOST=IP    # 下载链接中使用的主机名/IP
 
 说明:
-  - 在旧服务器上运行本脚本。
+  - 在旧服务器上运行本脚本并选择【1 备份容器并传输】。
   - 如不指定 --include，将进入交互式菜单：
       * 独立 docker 容器：每个容器一个序号
       * docker compose 容器组：同一个 compose 项目中的所有容器共享一个序号
     选择某个组时，会把该组内所有容器一并迁移。
   - 打包完成后会启动 HTTP 服务并给出下载链接（带安全随机路径）。
-  - 新服务器上请使用 auto_restore.sh 进行恢复。
+  - 在新服务器上运行本脚本并选择【2 下载备份并恢复】即可完成回迁。
+  - 恢复模式支持环境变量：RESTORE_KEEP=1 保留文件；RESTORE_CLEAN_ALL=1 强制删除文件；RESTORE_BASE=/path 自定义恢复目录。
 HLP
       exit 0;;
     *)
@@ -1267,9 +1419,9 @@ created_at: ${STAMP}
 使用方法：
   在新服务器上执行：
 
-    bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/auto_restore.sh)
+    bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/docker_migrate_perfect.sh)
 
-  然后粘贴本机输出的下载链接（以 .tar.gz 结尾）即可。
+  选择【2 下载备份并恢复】，然后粘贴本机输出的下载链接（以 .tar.gz 结尾）即可。
 EOF
 
 BUNDLE_BASENAME="$(basename "${BUNDLE}")"
