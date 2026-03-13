@@ -518,6 +518,304 @@ EOF
   chmod +x "$out"
 }
 
+write_bundle_restore_script() {
+  local out="$1"
+
+  cat > "$out" <<'REST_SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$BUNDLE_DIR"
+
+say(){  echo -e "\033[1;34m$*\033[0m"; }
+warn(){ echo -e "\033[1;33m$*\033[0m"; }
+
+compose_run() {
+  if [[ "${COMPOSE_IMPL:-}" == "plugin" ]]; then
+    docker compose "$@"
+  else
+    docker-compose "$@"
+  fi
+}
+
+compose_networks_from_meta_all() {
+  [[ -d meta ]] || return 0
+  local f proj
+  for f in meta/*.inspect.json; do
+    [[ -f "$f" ]] || continue
+    proj="$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' "$f" 2>/dev/null || true)"
+    [[ -n "$proj" ]] || continue
+    jq -r '.[0].NetworkSettings.Networks | keys[]?' "$f" 2>/dev/null || true
+  done | awk '!/^(bridge|host|none)$/' | sort -u
+}
+
+compose_networks_from_meta_for_project() {
+  local project="$1"
+  [[ -d meta ]] || return 0
+  local f proj
+  for f in meta/*.inspect.json; do
+    [[ -f "$f" ]] || continue
+    proj="$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' "$f" 2>/dev/null || true)"
+    [[ "$proj" == "$project" ]] || continue
+    jq -r '.[0].NetworkSettings.Networks | keys[]?' "$f" 2>/dev/null || true
+  done | awk '!/^(bridge|host|none)$/' | sort -u
+}
+
+compose_cleanup_conflicting_network() {
+  local project="$1" network_name="$2"
+  [[ -n "$network_name" ]] || return 0
+
+  if ! docker network inspect "$network_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local proj_label net_label
+  proj_label="$(docker network inspect -f '{{ index .Labels "com.docker.compose.project" }}' "$network_name" 2>/dev/null || true)"
+  net_label="$(docker network inspect -f '{{ index .Labels "com.docker.compose.network" }}' "$network_name" 2>/dev/null || true)"
+
+  if [[ "$proj_label" != "$project" || -z "$net_label" ]]; then
+    if docker network rm "$network_name" >/dev/null 2>&1; then
+      echo "    · 已删除冲突网络：$network_name"
+    else
+      warn "    · 无法删除冲突网络：$network_name（可能仍被占用）"
+    fi
+  fi
+}
+
+compose_network_records() {
+  local project="$1"
+  local tmp_cfg=""
+
+  if command -v mktemp >/dev/null 2>&1; then
+    tmp_cfg="$(mktemp)"
+  else
+    tmp_cfg="/tmp/decotv_compose_config_$$.json"
+    : > "$tmp_cfg"
+  fi
+
+  if compose_run config --format json >"$tmp_cfg" 2>/dev/null; then
+    jq -r '
+      .name as $project |
+      ((.networks // {"default": {}}) | to_entries[]) |
+      [(.value.name // "\($project)_\(.key)"), ((.value.external // false) | tostring)] | @tsv
+    ' "$tmp_cfg"
+    rm -f "$tmp_cfg" 2>/dev/null || true
+    return 0
+  fi
+
+  rm -f "$tmp_cfg" 2>/dev/null || true
+
+  while IFS= read -r net; do
+    [[ -n "$net" ]] || continue
+    if [[ "$net" == "${project}_"* ]]; then
+      printf '%s\tfalse\n' "$net"
+    else
+      printf '%s\tunknown\n' "$net"
+    fi
+  done < <(compose_networks_from_meta_for_project "$project")
+}
+
+compose_prepare_networks() {
+  local project="$1"
+  local seen=0 net external
+
+  while IFS=$'\t' read -r net external; do
+    [[ -n "$net" ]] || continue
+    seen=1
+    case "$external" in
+      true)
+        if ! docker network inspect "$net" >/dev/null 2>&1; then
+          warn "    · 检测到外部网络缺失，尝试创建：$net"
+          docker network create "$net" >/dev/null 2>&1 || warn "    · 创建外部网络失败：$net"
+        fi
+        ;;
+      false)
+        compose_cleanup_conflicting_network "$project" "$net"
+        ;;
+      *)
+        if [[ "$net" == "${project}_"* ]]; then
+          compose_cleanup_conflicting_network "$project" "$net"
+        fi
+        ;;
+    esac
+  done < <(compose_network_records "$project")
+
+  if (( seen == 0 )); then
+    while IFS= read -r net; do
+      [[ -n "$net" ]] || continue
+      if [[ "$net" == "${project}_"* ]]; then
+        compose_cleanup_conflicting_network "$project" "$net"
+      fi
+    done < <(compose_networks_from_meta_for_project "$project")
+  fi
+}
+
+say "[A] 加载镜像（如 images.tar 存在）"
+if [[ -f images.tar ]]; then
+  docker load -i images.tar
+else
+  warn "images.tar 不存在，将按需在线拉取镜像。"
+fi
+
+say "[B] 回灌命名卷"
+if jq -e ".volumes|length>0" manifest.json >/dev/null 2>&1; then
+  mkdir -p volumes
+  while IFS= read -r row; do
+    vname=$(jq -r ".name" <<<"$row")
+    file="vol_${vname}.tgz"
+    if [[ ! -f "volumes/$file" ]]; then
+      warn "  跳过 $vname（缺少 volumes/$file）"
+      continue
+    fi
+    echo "  - ${vname}"
+    docker volume create "$vname" >/dev/null 2>&1 || true
+    docker run --rm \
+      -v "${vname}:/to" \
+      -v "$PWD/volumes:/from" \
+      alpine:3.20 sh -c "cd /to && tar -xzf /from/${file}"
+  done < <(jq -c ".volumes[]" manifest.json)
+fi
+
+say "[C] 回灌绑定目录"
+if jq -e ".binds|length>0" manifest.json >/dev/null 2>&1; then
+  mkdir -p binds
+  while IFS= read -r row; do
+    host=$(jq -r ".host" <<<"$row")
+    file=$(jq -r ".file" <<<"$row")
+    echo "  - ${host}"
+    parent="$(dirname "$host")"
+    mkdir -p "$parent" || true
+    tar -C / -xzf "binds/${file}"
+  done < <(jq -c ".binds[]" manifest.json)
+fi
+
+say "[D] 恢复 Compose 项目"
+if jq -e ".projects|length>0" manifest.json >/dev/null 2>&1; then
+  mkdir -p compose_restore
+  while IFS= read -r row; do
+    name=$(jq -r ".name" <<<"$row")
+    wdir=$(jq -r ".working_dir // \"\"" <<<"$row")
+
+    echo "  - project: $name"
+    mkdir -p "compose_restore/${name}"
+
+    if compgen -G "compose/${name}/*" >/dev/null 2>&1; then
+      for f in compose/${name}/*; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        cp -a "$f" "compose_restore/${name}/${base}" 2>/dev/null || true
+      done
+    fi
+    if [[ -f "compose/${name}/.env" ]]; then
+      cp -a "compose/${name}/.env" "compose_restore/${name}/.env" 2>/dev/null || true
+    fi
+
+    if [[ -n "$wdir" ]]; then
+      echo "    · 还原 compose 配置到原路径：$wdir"
+      mkdir -p "$wdir" || true
+      if compgen -G "compose/${name}/*" >/dev/null 2>&1; then
+        for f in compose/${name}/*; do
+          [ -f "$f" ] || continue
+          base="$(basename "$f")"
+          if cp -n "$f" "$wdir/$base" 2>/dev/null; then
+            :
+          else
+            cp "$f" "$wdir/$base" 2>/dev/null || true
+          fi
+        done
+      fi
+      if [[ -f "compose/${name}/.env" ]]; then
+        if cp -n "compose/${name}/.env" "$wdir/.env" 2>/dev/null; then
+          :
+        else
+          cp "compose/${name}/.env" "$wdir/.env" 2>/dev/null || true
+        fi
+      fi
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+      (
+        cd "compose_restore/${name}"
+        COMPOSE_IMPL="plugin"
+
+        if [[ -f .env ]]; then
+          set -a
+          . ./.env
+          set +a
+        elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then
+          set -a
+          . "$wdir/.env"
+          set +a
+        fi
+
+        compose_run down || true
+        compose_prepare_networks "$name"
+        compose_run up -d
+      )
+    elif command -v docker-compose >/dev/null 2>&1; then
+      (
+        cd "compose_restore/${name}"
+        COMPOSE_IMPL="legacy"
+
+        if [[ -f .env ]]; then
+          set -a
+          . ./.env
+          set +a
+        elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then
+          set -a
+          . "$wdir/.env"
+          set +a
+        fi
+
+        compose_run down || true
+        compose_prepare_networks "$name"
+        compose_run up -d
+      )
+    else
+      warn "  新机未安装 docker compose/docker-compose，跳过该项目。"
+    fi
+  done < <(jq -c ".projects[]" manifest.json)
+fi
+
+say "[E] 创建独立容器自定义网络（非 Compose）"
+declare -A COMPOSE_NETS=()
+while IFS= read -r n; do
+  [[ -n "$n" ]] || continue
+  COMPOSE_NETS["$n"]=1
+done < <(compose_networks_from_meta_all)
+
+if jq -e ".networks|length>0" manifest.json >/dev/null 2>&1; then
+  while IFS= read -r n; do
+    case "$n" in
+      bridge|host|none|"")
+        continue
+        ;;
+    esac
+    if [[ -n "${COMPOSE_NETS[$n]:-}" ]]; then
+      continue
+    fi
+    docker network inspect "$n" >/dev/null 2>&1 || docker network create "$n" >/dev/null 2>&1 || true
+  done < <(jq -r ".networks[]" manifest.json)
+fi
+
+say "[F] 恢复单容器（非 Compose）"
+if jq -e ".runs|length>0" manifest.json >/dev/null 2>&1; then
+  while IFS= read -r r; do
+    [[ -n "$r" ]] || continue
+    echo "  - $r"
+    bash "$r" || true
+  done < <(jq -r ".runs[]" manifest.json)
+fi
+
+say "[G] 完成，当前容器："
+docker ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}"
+echo "提示：若端口被占用，请编辑 compose 或 runs 脚本后再次执行。"
+REST_SH
+
+  chmod +x "$out"
+}
+
 #####################################
 #  恢复模式（原 auto_restore 逻辑）
 #####################################
@@ -618,6 +916,8 @@ restore_main() {
     RED "[ERR] 未找到 restore.sh，解压内容异常：$OUTDIR"
     exit 1
   fi
+
+  write_bundle_restore_script "${BUNDLE_DIR}/restore.sh"
 
   BLUE "[INFO] 执行恢复脚本：${BUNDLE_DIR}/restore.sh"
   BLUE "[INFO] 该步骤会加载镜像、回灌卷和绑定目录，并启动容器，可能需要数分钟，请耐心等待..."
@@ -957,14 +1257,6 @@ for id in "${IDS[@]}"; do
   CONTAINER_NAME["$id"]="$name"
   IMGSET["$img"]=1
 
-  mapfile -t nets < <(jq -r '.[0].NetworkSettings.Networks | keys[]?' <<<"$j" || true)
-  for n in "${nets[@]}"; do
-    case "$n" in
-      bridge|host|none) : ;;
-      *) NETWORKS["$n"]=1 ;;
-    esac
-  done
-
   proj=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$j")
   wdir=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$j")
   cfgs=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$j")
@@ -979,6 +1271,14 @@ for id in "${IDS[@]}"; do
     PROJECT_KEY_OF["$id"]=""
     CONTAINER_IS_COMPOSE["$id"]=0
     SINGLETONS["$name"]=1
+
+    mapfile -t nets < <(jq -r '.[0].NetworkSettings.Networks | keys[]?' <<<"$j" || true)
+    for n in "${nets[@]}"; do
+      case "$n" in
+        bridge|host|none) : ;;
+        *) NETWORKS["$n"]=1 ;;
+      esac
+    done
   fi
 
   echo "$j" > "${BUNDLE}/meta/${name}.inspect.json"
@@ -1238,170 +1538,7 @@ generate_manifest_and_restore() {
 }
 EOF
 
-  cat > "${BUNDLE}/restore.sh" <<'REST_SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
-BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$BUNDLE_DIR"
-
-say(){  echo -e "\033[1;34m$*\033[0m"; }
-warn(){ echo -e "\033[1;33m$*\033[0m"; }
-
-say "[A] 加载镜像（如 images.tar 存在）"
-if [[ -f images.tar ]]; then
-  docker load -i images.tar
-else
-  warn "images.tar 不存在，将按需在线拉取镜像。"
-fi
-
-say "[B] 创建自定义网络（如有）"
-if jq -e ".networks|length>0" manifest.json >/dev/null 2>&1; then
-  for n in $(jq -r ".networks[]" manifest.json); do
-    case "$n" in
-      bridge|host|none) : ;;
-      *) docker network create "$n" >/dev/null 2>&1 || true ;;
-    esac
-  done
-fi
-
-say "[C] 回灌命名卷"
-if jq -e ".volumes|length>0" manifest.json >/dev/null 2>&1; then
-  mkdir -p volumes
-  while IFS= read -r row; do
-    vname=$(jq -r ".name" <<<"$row")
-    file="vol_${vname}.tgz"
-    if [[ ! -f "volumes/$file" ]]; then
-      warn "  跳过 $vname（缺少 volumes/$file）"
-      continue
-    fi
-    echo "  - ${vname}"
-    docker volume create "$vname" >/dev/null 2>&1 || true
-    docker run --rm \
-      -v "${vname}:/to" \
-      -v "$PWD/volumes:/from" \
-      alpine:3.20 sh -c "cd /to && tar -xzf /from/${file}"
-  done < <(jq -c ".volumes[]" manifest.json)
-fi
-
-say "[D] 回灌绑定目录"
-if jq -e ".binds|length>0" manifest.json >/dev/null 2>&1; then
-  mkdir -p binds
-  while IFS= read -r row; do
-    host=$(jq -r ".host" <<<"$row")
-    file=$(jq -r ".file" <<<"$row")
-    echo "  - ${host}"
-    parent="$(dirname "$host")"
-    mkdir -p "$parent" || true
-    tar -C / -xzf "binds/${file}"
-  done < <(jq -c ".binds[]" manifest.json)
-fi
-
-say "[E] 恢复 Compose 项目"
-if jq -e ".projects|length>0" manifest.json >/dev/null 2>&1; then
-  mkdir -p compose_restore
-  while IFS= read -r row; do
-    name=$(jq -r ".name" <<<"$row")
-    wdir=$(jq -r ".working_dir // \"\"" <<<"$row")
-
-    echo "  - project: $name"
-    mkdir -p "compose_restore/${name}"
-
-    # 1) 把 compose 文件放到 compose_restore/<name> 下，供当前恢复使用
-    if compgen -G "compose/${name}/*" >/dev/null 2>&1; then
-      for f in compose/${name}/*; do
-        [ -f "$f" ] || continue
-        base="$(basename "$f")"
-        cp -a "$f" "compose_restore/${name}/${base}" 2>/dev/null || true
-      done
-    fi
-    # * 不会匹配 .env，这里单独把 .env 带上（如果有）
-    if [[ -f "compose/${name}/.env" ]]; then
-      cp -a "compose/${name}/.env" "compose_restore/${name}/.env" 2>/dev/null || true
-    fi
-
-    # 2) 尝试把配置文件恢复到原 working_dir
-    if [[ -n "$wdir" ]]; then
-      echo "    · 还原 compose 配置到原路径：$wdir"
-      mkdir -p "$wdir" || true
-      if compgen -G "compose/${name}/*" >/dev/null 2>&1; then
-        for f in compose/${name}/*; do
-          [ -f "$f" ] || continue
-          base="$(basename "$f")"
-          if cp -n "$f" "$wdir/$base" 2>/dev/null; then
-            :
-          else
-            cp "$f" "$wdir/$base" 2>/dev/null || true
-          fi
-        done
-      fi
-      # 同样把 .env 还原回原目录（如果有）
-      if [[ -f "compose/${name}/.env" ]]; then
-        if cp -n "compose/${name}/.env" "$wdir/.env" 2>/dev/null; then
-          :
-        else
-          cp "compose/${name}/.env" "$wdir/.env" 2>/dev/null || true
-        fi
-      fi
-    fi
-    NET="${name}_default"
-    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-      (
-        cd "compose_restore/${name}"
-
-        # 优先加载 compose_restore/<name> 里的 .env，其次尝试原 working_dir 的 .env
-        if [[ -f .env ]]; then
-          set -a
-          . ./.env
-          set +a
-        elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then
-          set -a
-          . "$wdir/.env"
-          set +a
-        fi
-
-        docker compose down || true
-        docker network rm "$NET" >/dev/null 2>&1 || true
-        docker compose up -d
-      )
-    elif command -v docker-compose >/dev/null 2>&1; then
-      (
-        cd "compose_restore/${name}"
-
-        if [[ -f .env ]]; then
-          set -a
-          . ./.env
-          set +a
-        elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then
-          set -a
-          . "$wdir/.env"
-          set +a
-        fi
-
-        docker-compose down || true
-        docker network rm "$NET" >/dev/null 2>&1 || true
-        docker-compose up -d
-      )
-    else
-      warn "  新机未安装 docker compose/docker-compose，跳过该项目。"
-    fi
-  done < <(jq -c ".projects[]" manifest.json)
-fi
-
-say "[F] 恢复单容器（非 Compose）"
-if jq -e ".runs|length>0" manifest.json >/dev/null 2>&1; then
-  for r in $(jq -r ".runs[]" manifest.json); do
-    echo "  - $r"
-    bash "$r" || true
-  done
-fi
-
-say "[G] 完成，当前容器："
-docker ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}"
-echo "提示：若端口被占用，请编辑 compose 或 runs 脚本后再次执行。"
-REST_SH
-
-  chmod +x "${BUNDLE}/restore.sh"
+  write_bundle_restore_script "${BUNDLE}/restore.sh"
 }
 
 spinner_run "[INFO] 生成 manifest.json 与 restore.sh ..." generate_manifest_and_restore
@@ -1475,6 +1612,7 @@ hard_clean() {
 }
 
 graceful_exit() {
+  local rc="${1:-0}"
   echo
   YEL "[INFO] 即将退出，先关闭 HTTP 服务 ..."
   cleanup_http
@@ -1498,14 +1636,16 @@ graceful_exit() {
 
   YEL "[INFO] 清理打包产物 ..."
   hard_clean
-  exit 0
+  exit "$rc"
 }
 
-trap graceful_exit INT TERM
+trap 'graceful_exit 130' INT TERM
+
+HTTP_LOG="${BUNDLE_ROOT}/http_server_${RID}.log"
 
 # 启动自定义 Python HTTP 服务：仅允许访问 /<SECRET_TOKEN>/<BUNDLE_BASENAME>.tar.gz
 cd "${BUNDLE_ROOT}" || exit 1
-python3 - "$PORT" "$SECRET_TOKEN" "$BUNDLE_BASENAME" >/dev/null 2>&1 <<'PY' &
+python3 - "$PORT" "$SECRET_TOKEN" "$BUNDLE_BASENAME" >"${HTTP_LOG}" 2>&1 <<'PY' &
 import http.server
 import socketserver
 import sys
@@ -1553,12 +1693,24 @@ SHPID=$!
 cd "$WORKDIR"
 sleep 1
 
+if ! kill -0 "$SHPID" 2>/dev/null; then
+  RED "[ERR] HTTP 服务启动失败，请检查端口 ${PORT}、防火墙或运行日志：${HTTP_LOG}"
+  if [[ -f "${HTTP_LOG}" ]]; then
+    tail -n 20 "${HTTP_LOG}" || true
+  fi
+  graceful_exit 1
+fi
+
 OK  "[OK] 一键迁移包下载链接：${FINAL_URL}"
 YEL "[WARN] HTTP 为明文传输，请仅在可信网络使用。"
+YEL "[INFO] HTTP 服务日志：${HTTP_LOG}"
 
 if [[ -t 0 ]]; then
-  read -rp $'\n按回车键停止 HTTP 并退出（将自动重启停机容器并清理产物）...' _
-  graceful_exit
+  read -rp $'
+按回车键停止 HTTP 并退出（将自动重启停机容器并清理产物）...' _
+  graceful_exit 0
 else
-  graceful_exit
+  YEL "[INFO] 当前为非交互模式，HTTP 服务将保持运行；请在下载完成后手动结束本脚本。"
+  wait "$SHPID" || true
+  graceful_exit 0
 fi
