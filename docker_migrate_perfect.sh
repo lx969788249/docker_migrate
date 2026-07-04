@@ -981,9 +981,12 @@ if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
     echo " - $r"
-    if ! bash "$r"; then
+    if ! bash "$r" 2>&1; then
       warn " 容器恢复脚本失败：$r"
-      FAILED_CONTAINERS+=("$r")
+      # 从 run 脚本中提取容器名以便诊断
+      local cname_from_script="${r#runs/}"
+      cname_from_script="${cname_from_script%.sh}"
+      FAILED_CONTAINERS+=("$cname_from_script")
     fi
   done < <(jq -r '.runs[]' manifest.json)
 fi
@@ -1004,6 +1007,21 @@ if [[ ${#FAILED_VOLUMES[@]} -gt 0 || ${#FAILED_PROJECTS[@]} -gt 0 || ${#FAILED_C
   fi
   if [[ ${#FAILED_CONTAINERS[@]} -gt 0 ]]; then
     warn "  · 独立容器失败: ${FAILED_CONTAINERS[*]}"
+    warn ""
+    warn "  可能原因："
+    for cn in "${FAILED_CONTAINERS[@]}"; do
+      warn "    - 容器 $cn：端口冲突或镜像/网络问题"
+      # 提示检查失败的容器想要绑定的端口
+      local scr="runs/${cn}.sh"
+      if [[ -f "$scr" ]]; then
+        local pts="$(grep -oP -- '-p\s+\S+' "$scr" 2>/dev/null | tr '\n' ' ' || true)"
+        if [[ -n "$pts" ]]; then
+          warn "      期望端口：$pts"
+        fi
+      fi
+    done
+    warn "    排查命令：sudo ss -lntp | grep -E ':(80|443|8080)'"
+    warn "    释放端口后重新执行 restore.sh 即可"
   fi
   warn "============================================"
 fi
