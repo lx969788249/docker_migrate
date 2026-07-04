@@ -586,7 +586,33 @@ if ((${#cmd_args[@]})); then
   args+=("${cmd_args[@]}")
 fi
 
+set +e
 "${args[@]}"
+run_rc=$?
+set -e
+
+# 端口冲突检测：宿主机端口已被占用时给出明确提示
+if [[ $run_rc -ne 0 ]]; then
+  # 回显 docker run 的所有 -p 参数便于排查
+  local -a failed_ports=()
+  for a in "${args[@]}"; do
+    [[ "$a" == -p ]] && continue
+    [[ "$a" == -* ]] && { last_opt="$a"; continue; }
+    if [[ -n "${last_opt:-}" ]]; then last_opt=""; fi
+    if [[ "$a" == *:* ]]; then
+      failed_ports+=("$a")
+    fi
+  done
+  if ((${#failed_ports[@]})); then
+    echo "[WARN] 容器启动失败，可能是端口冲突。" >&2
+    echo "[WARN] 尝试绑定的端口：" >&2
+    for p in "${failed_ports[@]}"; do
+      echo "[WARN]   - $p" >&2
+    done
+    echo "[WARN] 请检查占用端口的进程并释放：sudo ss -lntp | grep <PORT>" >&2
+  fi
+  exit $run_rc
+fi
 
 # 连接额外网络。
 if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" != container:* ]]; then
