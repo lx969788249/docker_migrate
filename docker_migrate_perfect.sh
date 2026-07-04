@@ -1289,7 +1289,7 @@ else
     wdir=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$j")
 
     # 面板管理容器检测：btpanel/baota/1Panel 自身 — 标记警告
-    local panel_warn="" img_name
+    panel_warn="" img_name
     img_name="$(jq -r '.[0].Config.Image // ""' <<<"$j")"
     case "$img_name" in
       *btpanel*|*baota*|*1panel*|*1Panel*)
@@ -1298,7 +1298,7 @@ else
         ;;
     esac
     # 也检测挂载了面板关键路径的容器
-    local mounts_json
+    mounts_json
     mounts_json="$(jq -r '.[0].Mounts[]?.Source // empty' <<<"$j" 2>/dev/null || true)"
     case "$mounts_json" in
       *"/www/server/panel/"*|*"/opt/1panel/"*)
@@ -1370,7 +1370,7 @@ else
       idx=$((idx + 1))
       id="${STANDALONE_IDS[$i]}"
       name="${STANDALONE_NAMES[$i]}"
-      local pw="${PANEL_WARN_OF[$id]:-}"
+      pw="${PANEL_WARN_OF[$id]:-}"
       printf " %2d) %s%s\n" "$idx" "$name" "$pw"
       MENU_KIND[$idx]="single"
       MENU_VAL[$idx]="$id"
