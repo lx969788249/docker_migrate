@@ -1298,7 +1298,6 @@ else
         ;;
     esac
     # 也检测挂载了面板关键路径的容器
-    mounts_json
     mounts_json="$(jq -r '.[0].Mounts[]?.Source // empty' <<<"$j" 2>/dev/null || true)"
     case "$mounts_json" in
       *"/www/server/panel/"*|*"/opt/1panel/"*)
