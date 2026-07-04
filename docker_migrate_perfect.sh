@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # docker_migrate_perfect.sh — Docker 容器一键迁移（源服务器使用）
 #
+# 依赖：bash >= 4.0（需要关联数组 declare -A 和 mapfile）
+# macOS 用户请用 Homebrew bash: brew install bash && /usr/local/bin/bash docker_migrate_perfect.sh
+#
 # 功能概要：
 # 1. 自动检测并安装依赖（docker / jq / python3 / tar / gzip / curl）
 # 2. 按“独立容器 / docker compose 容器组”展示并选择要迁移的容器
@@ -24,6 +27,13 @@
 # 参数：
 # --no-stop             不停机备份（可能不一致，数据库慎用）
 # --include=name1,name2 按容器名称精确匹配，只迁移指定容器（不使用分组菜单）
+
+# bash 版本检测：需要 4.0+（关联数组 / mapfile）
+if [[ -z "${BASH_VERSINFO[0]:-}" ]] || (( BASH_VERSINFO[0] < 4 )); then
+  echo "[ERR] 本脚本需要 bash >= 4.0，当前版本：${BASH_VERSION:-unknown}" >&2
+  echo "[ERR] macOS 用户请用 Homebrew bash: brew install bash && /usr/local/bin/bash docker_migrate_perfect.sh" >&2
+  exit 1
+fi
 
 set -euo pipefail
 
@@ -361,6 +371,98 @@ jq -e '.[0].HostConfig.Privileged == true' "$META" >/dev/null 2>&1 && args+=(--p
 jq -e '.[0].HostConfig.ReadonlyRootfs == true' "$META" >/dev/null 2>&1 && args+=(--read-only)
 jq -e '.[0].HostConfig.Init == true' "$META" >/dev/null 2>&1 && args+=(--init)
 
+# --- 设备映射: --device ---
+mapfile -t devices < <(jq -r '.[0].HostConfig.Devices[]? | "\(.PathOnHost):\(.PathInContainer)\(if .CgroupPermissions then ":\(.CgroupPermissions)" else "" end)"' "$META")
+for d in "${devices[@]}"; do args+=(--device "$d"); done
+
+# --- 资源限制: --memory, --cpus, --shm-size ---
+shm_size="$(jq -r '.[0].HostConfig.ShmSize // 0' "$META")"
+if [[ "$shm_size" != "0" && "$shm_size" != "null" ]]; then args+=(--shm-size "${shm_size}b"); fi
+
+mem="$(jq -r '.[0].HostConfig.Memory // 0' "$META")"
+if [[ "$mem" != "0" && "$mem" != "null" ]]; then args+=(--memory "$mem"); fi
+
+mem_swap="$(jq -r '.[0].HostConfig.MemorySwap // 0' "$META")"
+if [[ "$mem_swap" != "0" && "$mem_swap" != "null" ]]; then args+=(--memory-swap "$mem_swap"); fi
+
+mem_res="$(jq -r '.[0].HostConfig.MemoryReservation // 0' "$META")"
+if [[ "$mem_res" != "0" && "$mem_res" != "null" ]]; then args+=(--memory-reservation "$mem_res"); fi
+
+nano_cpus="$(jq -r '.[0].HostConfig.NanoCpus // 0' "$META")"
+if [[ "$nano_cpus" != "0" && "$nano_cpus" != "null" ]]; then args+=(--cpus "$(( nano_cpus / 1000000000 ))"); fi
+
+cpu_shares="$(jq -r '.[0].HostConfig.CpuShares // 0' "$META")"
+if [[ "$cpu_shares" != "0" && "$cpu_shares" != "null" ]]; then args+=(--cpu-shares "$cpu_shares"); fi
+
+cpu_period="$(jq -r '.[0].HostConfig.CpuPeriod // 0' "$META")"
+if [[ "$cpu_period" != "0" && "$cpu_period" != "null" ]]; then args+=(--cpu-period "$cpu_period"); fi
+
+cpu_quota="$(jq -r '.[0].HostConfig.CpuQuota // 0' "$META")"
+if [[ "$cpu_quota" != "0" && "$cpu_quota" != "null" ]]; then args+=(--cpu-quota "$cpu_quota"); fi
+
+cpuset_cpus="$(jq -r '.[0].HostConfig.CpusetCpus // empty' "$META")"
+[[ -n "$cpuset_cpus" ]] && args+=(--cpuset-cpus "$cpuset_cpus")
+
+cpuset_mems="$(jq -r '.[0].HostConfig.CpusetMems // empty' "$META")"
+[[ -n "$cpuset_mems" ]] && args+=(--cpuset-mems "$cpuset_mems")
+
+oom_kill_disable="$(jq -r '.[0].HostConfig.OomKillDisable // false' "$META")"
+[[ "$oom_kill_disable" == "true" ]] && args+=(--oom-kill-disable)
+
+# --- 命名空间模式: --pid, --ipc, --uts ---
+pid_mode="$(jq -r '.[0].HostConfig.PidMode // empty' "$META")"
+if [[ -n "$pid_mode" && "$pid_mode" != "null" ]]; then
+  if [[ "$pid_mode" == container:* ]]; then
+    args+=(--pid "$pid_mode")
+  else
+    args+=(--pid "$pid_mode")
+  fi
+fi
+
+ipc_mode="$(jq -r '.[0].HostConfig.IpcMode // empty' "$META")"
+if [[ -n "$ipc_mode" && "$ipc_mode" != "null" ]]; then
+  if [[ "$ipc_mode" == "shareable" ]]; then
+    args+=(--ipc shareable)
+  else
+    args+=(--ipc "$ipc_mode")
+  fi
+fi
+
+uts_mode="$(jq -r '.[0].HostConfig.UTSMode // empty' "$META")"
+if [[ -n "$uts_mode" && "$uts_mode" != "null" && "$uts_mode" != "default" ]]; then
+  args+=(--uts "$uts_mode")
+fi
+
+# --- 健康检查: --health-* ---
+hc_test="$(jq -r '.[0].Config.Healthcheck.Test[]? | select(. != "NONE")' "$META" 2>/dev/null || true)"
+if [[ -n "$hc_test" ]]; then
+  hc_interval="$(jq -r '.[0].Config.Healthcheck.Interval // 30000000000' "$META")"
+  hc_timeout="$(jq -r '.[0].Config.Healthcheck.Timeout // 30000000000' "$META")"
+  hc_retries="$(jq -r '.[0].Config.Healthcheck.Retries // 3' "$META")"
+  hc_start_period="$(jq -r '.[0].Config.Healthcheck.StartPeriod // 0' "$META")"
+  hc_start_interval="$(jq -r '.[0].Config.Healthcheck.StartInterval // 5000000000' "$META")"
+  args+=(--health-cmd "$hc_test")
+  args+=(--health-interval "${hc_interval}ns")
+  args+=(--health-timeout "${hc_timeout}ns")
+  args+=(--health-retries "$hc_retries")
+  [[ "$hc_start_period" != "0" ]] && args+=(--health-start-period "${hc_start_period}ns")
+  args+=(--health-start-interval "${hc_start_interval}ns")
+fi
+
+# --- runtime: --runtime (例如 nvidia) ---
+runtime="$(jq -r '.[0].HostConfig.Runtime // empty' "$META")"
+if [[ -n "$runtime" && "$runtime" != "null" && "$runtime" != "runc" ]]; then
+  args+=(--runtime "$runtime")
+fi
+
+# --- --group-add ---
+mapfile -t group_add < <(jq -r '.[0].HostConfig.GroupAdd[]?' "$META")
+for g in "${group_add[@]}"; do args+=(--group-add "$g"); done
+
+# --- storage opt: --storage-opt ---
+mapfile -t storage_opts < <(jq -r '.[0].HostConfig.StorageOpt // {} | to_entries[]? | "\(.key)=\(.value)"' "$META")
+for s in "${storage_opts[@]}"; do args+=(--storage-opt "$s"); done
+
 mapfile -t extra_hosts < <(jq -r '.[0].HostConfig.ExtraHosts[]?' "$META")
 for h in "${extra_hosts[@]}"; do args+=(--add-host "$h"); done
 
@@ -405,7 +507,13 @@ for p in "${port_bindings[@]}"; do
   host_port="${rest%%|*}"
   cont_port="${rest#*|}"
 
-  [[ -z "$host_port" || "$host_port" == "null" || -z "$cont_port" ]] && continue
+  # 空 HostPort 是 Docker 随机端口分配（如 -p 80 或 -p 0.0.0.0::80），保留空 HostPort 让 Docker 重新随机分配
+  [[ -z "$cont_port" ]] && continue
+
+  if [[ -z "$host_port" || "$host_port" == "null" ]]; then
+    # 随机端口：格式为 -p [ip::]containerPort[/proto]
+    host_port=""
+  fi
 
   if [[ -n "$host_ip" && "$host_ip" != "0.0.0.0" && "$host_ip" != "::" ]]; then
     if [[ "$host_ip" == *:* ]]; then
@@ -496,7 +604,14 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
     if [[ -n "$aliases_raw" && "$aliases_raw" != "null" ]]; then
       for a in $aliases_raw; do conn_args+=(--alias "$a"); done
     fi
-    docker network connect "${conn_args[@]}" "$net_name" "$name" >/dev/null 2>&1 || echo "[WARN] 连接额外网络失败：$net_name，容器可能缺少网络" >&2
+    docker network connect "${conn_args[@]}" "$net_name" "$name" >/dev/null 2>&1 || {
+      echo "[WARN] 连接额外网络失败：$net_name，容器可能缺少网络" >&2
+      case "$net_name" in
+        macvlan*|ipvlan*|overlay*)
+          echo "[WARN] → 网络 $net_name 需管理员在目标服务器预创建（macvlan/ipvlan/overlay 不自动创建）" >&2
+          ;;
+      esac
+    }
   done
 fi
 RUN_SH
@@ -523,6 +638,11 @@ cd "$BUNDLE_DIR"
 
 say(){ echo -e "\033[1;34m$*\033[0m"; }
 warn(){ echo -e "\033[1;33m$*\033[0m"; }
+
+# Failure tracking
+FAILED_VOLUMES=()
+FAILED_PROJECTS=()
+FAILED_CONTAINERS=()
 
 compose_run() {
   if [[ "${COMPOSE_IMPL:-}" == "plugin" ]]; then
@@ -564,11 +684,13 @@ compose_cleanup_conflicting_network() {
   local proj_label net_label
   proj_label="$(docker network inspect -f '{{ index .Labels "com.docker.compose.project" }}' "$network_name" 2>/dev/null || true)"
   net_label="$(docker network inspect -f '{{ index .Labels "com.docker.compose.network" }}' "$network_name" 2>/dev/null || true)"
-  if [[ "$proj_label" != "$project" || -z "$net_label" ]]; then
+  # 仅当网络属于当前项目（有 project label 且匹配）时才允许删除
+  # 空 proj_label 表示非 compose 网络（手动创建或外部共享），跳过删除
+  if [[ -n "$proj_label" && -n "$net_label" && "$proj_label" == "$project" ]]; then
     if docker network rm "$network_name" >/dev/null 2>&1; then
-      echo " · 已删除冲突网络：$network_name"
+      echo " · 已清理旧网络：$network_name"
     else
-      warn " · 无法删除冲突网络：$network_name（可能仍被占用）"
+      warn " · 无法清理网络：$network_name（可能仍被占用）"
     fi
   fi
 }
@@ -640,7 +762,7 @@ compose_prepare_networks() {
 
 say "[A] 加载镜像（如 images.tar 存在）"
 if [[ -f images.tar ]]; then
-  docker load -i images.tar
+  docker load -i images.tar || warn "部分镜像加载失败，将尝试在线拉取"
 else
   warn "images.tar 不存在，将按需在线拉取镜像。"
 fi
@@ -657,11 +779,22 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       continue
     fi
     echo " - ${vname}"
-    docker volume create "$vname" >/dev/null 2>&1 || true
-    docker run --rm \
+    # 使用备份时记录的 driver 和 options 创建卷
+    v_driver=$(jq -r '.driver // "local"' <<<"$row")
+    v_opts=$(jq -r '.opts // {} | to_entries[]? | "--opt \(.key)=\(.value)"' <<<"$row" 2>/dev/null || true)
+    if [[ "$v_driver" != "local" ]]; then
+      docker volume create "$vname" -d "$v_driver" $v_opts >/dev/null 2>&1 || warn " 卷创建失败（driver=$v_driver）：$vname，尝试默认创建"
+      docker volume create "$vname" >/dev/null 2>&1 || true
+    else
+      docker volume create "$vname" $v_opts >/dev/null 2>&1 || true
+    fi
+    if ! docker run --rm \
       -v "${vname}:/to" \
       -v "$PWD/volumes:/from" \
-      alpine:3.20 sh -c "cd /to && tar -xzf /from/${file}"
+      alpine:3.20 sh -c "cd /to && tar -xzf /from/${file}"; then
+      warn " 恢复卷 ${vname} 失败，跳过"
+      FAILED_VOLUMES+=("$vname")
+    fi
   done < <(jq -c '.volumes[]' manifest.json)
 fi
 
@@ -677,8 +810,8 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     fi
     echo " - ${host}"
     parent="$(dirname "$host")"
-    sudo mkdir -p "$parent" 2>/dev/null || mkdir -p "$parent" 2>/dev/null || true
-    sudo tar -C / -xzf "binds/${file}" 2>/dev/null || tar -C / -xzf "binds/${file}" 2>/dev/null || warn " 无法恢复绑定目录：$host（可能需要 root 权限）"
+    timeout 10 sudo -n mkdir -p "$parent" 2>/dev/null || mkdir -p "$parent" 2>/dev/null || true
+    timeout 30 sudo -n tar -C / -xzf "binds/${file}" 2>/dev/null || tar -C / -xzf "binds/${file}" 2>/dev/null || warn " 无法恢复绑定目录：$host（可能需要 root 权限）"
   done < <(jq -c '.binds[]' manifest.json)
 fi
 
@@ -714,26 +847,86 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       if [[ -f "compose/${name}/.env" ]]; then
         cp -n "compose/${name}/.env" "$wdir/.env" 2>/dev/null || cp "compose/${name}/.env" "$wdir/.env" 2>/dev/null || true
       fi
+      # 如果 wdir 存在且 compose 文件已还原到 wdir，则从 wdir 执行 compose up
+      # 这确保 1Panel / 宝塔等使用相对路径 bind mount 的 compose 项目能正确解析路径
+      USE_WDIR=1
+    fi
+
+    # 构建多文件 -f 参数：从 manifest 的 config_files 提取 basename
+    # 如果没有 config_files，compose 会按默认文件名自动扫描
+    declare -a COMPOSE_FILE_ARGS=()
+    if jq -e '.config_files|length>0' <<<"$row" >/dev/null 2>&1; then
+      while IFS= read -r cf; do
+        [[ -n "$cf" ]] || continue
+        local_fn="compose_restore/${name}/$(basename "$cf")"
+        if [[ -f "$local_fn" ]]; then
+          COMPOSE_FILE_ARGS+=(-f "$(basename "$cf")")
+        fi
+      done < <(jq -r '.config_files[]?' <<<"$row")
     fi
 
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-      (
-        cd "compose_restore/${name}"
-        COMPOSE_IMPL="plugin"
-        if [[ -f .env ]]; then set -a; . ./.env; set +a; elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then set -a; . "$wdir/.env"; set +a; fi
-        compose_run down || true
-        compose_prepare_networks "$name"
-        compose_run up -d
-      )
+      if [[ "${USE_WDIR:-0}" == "1" ]]; then
+        (
+          cd "$wdir"
+          COMPOSE_IMPL="plugin"
+          compose_down_in_dir() { docker compose "$@"; }
+          compose_down_in_dir down || true
+          compose_prepare_networks "$name"
+          docker compose "${COMPOSE_FILE_ARGS[@]}" up -d
+        ) || FAILED_PROJECTS+=("$name")
+      else
+        (
+          cd "compose_restore/${name}"
+          COMPOSE_IMPL="plugin"
+          # 安全注入 .env：逐行读取 KEY=VALUE 并 export，避免 bash source 的变量展开副作用
+          if [[ -f .env ]]; then
+            while IFS= read -r env_line; do
+              [[ -z "$env_line" || "$env_line" == \#* ]] && continue
+              export "$env_line"
+            done < .env
+          elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then
+            while IFS= read -r env_line; do
+              [[ -z "$env_line" || "$env_line" == \#* ]] && continue
+              export "$env_line"
+            done < "$wdir/.env"
+          fi
+          compose_run down || true
+          compose_prepare_networks "$name"
+          compose_run "${COMPOSE_FILE_ARGS[@]}" up -d
+        ) || FAILED_PROJECTS+=("$name")
+      fi
     elif command -v docker-compose >/dev/null 2>&1; then
-      (
-        cd "compose_restore/${name}"
-        COMPOSE_IMPL="legacy"
-        if [[ -f .env ]]; then set -a; . ./.env; set +a; elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then set -a; . "$wdir/.env"; set +a; fi
-        compose_run down || true
-        compose_prepare_networks "$name"
-        compose_run up -d
-      )
+      if [[ "${USE_WDIR:-0}" == "1" ]]; then
+        (
+          cd "$wdir"
+          COMPOSE_IMPL="legacy"
+          compose_down_in_dir() { docker-compose "$@"; }
+          compose_down_in_dir down || true
+          compose_prepare_networks "$name"
+          docker-compose "${COMPOSE_FILE_ARGS[@]}" up -d
+        ) || FAILED_PROJECTS+=("$name")
+      else
+        (
+          cd "compose_restore/${name}"
+          COMPOSE_IMPL="legacy"
+          # 安全注入 .env：逐行读取 KEY=VALUE 并 export，避免 bash source 的变量展开副作用
+          if [[ -f .env ]]; then
+            while IFS= read -r env_line; do
+              [[ -z "$env_line" || "$env_line" == \#* ]] && continue
+              export "$env_line"
+            done < .env
+          elif [[ -n "$wdir" && -f "$wdir/.env" ]]; then
+            while IFS= read -r env_line; do
+              [[ -z "$env_line" || "$env_line" == \#* ]] && continue
+              export "$env_line"
+            done < "$wdir/.env"
+          fi
+          compose_run down || true
+          compose_prepare_networks "$name"
+          compose_run "${COMPOSE_FILE_ARGS[@]}" up -d
+        ) || FAILED_PROJECTS+=("$name")
+      fi
     else
       warn " 新机未安装 docker compose/docker-compose，跳过该项目。"
     fi
@@ -762,13 +955,32 @@ if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
     echo " - $r"
-    bash "$r" || true
+    if ! bash "$r"; then
+      warn " 容器恢复脚本失败：$r"
+      FAILED_CONTAINERS+=("$r")
+    fi
   done < <(jq -r '.runs[]' manifest.json)
 fi
 
 say "[G] 完成，当前容器："
 docker ps --format ' {{.Names}}\t{{.Status}}\t{{.Ports}}'
 echo "提示：若端口被占用，请释放端口后重新执行 restore.sh；本版会在端口绑定不一致时重建同名容器。"
+
+# Failure summary
+if [[ ${#FAILED_VOLUMES[@]} -gt 0 || ${#FAILED_PROJECTS[@]} -gt 0 || ${#FAILED_CONTAINERS[@]} -gt 0 ]]; then
+  warn "============================================"
+  warn "  部分项目恢复失败，请检查以下内容："
+  if [[ ${#FAILED_VOLUMES[@]} -gt 0 ]]; then
+    warn "  · 命名卷失败: ${FAILED_VOLUMES[*]}"
+  fi
+  if [[ ${#FAILED_PROJECTS[@]} -gt 0 ]]; then
+    warn "  · Compose 项目失败: ${FAILED_PROJECTS[*]}"
+  fi
+  if [[ ${#FAILED_CONTAINERS[@]} -gt 0 ]]; then
+    warn "  · 独立容器失败: ${FAILED_CONTAINERS[*]}"
+  fi
+  warn "============================================"
+fi
 REST_SH
   chmod +x "$out"
 }
@@ -847,7 +1059,7 @@ restore_main() {
   local OUTDIR="${BASE}/${RID}"
 
   BLUE "[INFO] 下载：$URL"
-  if ! curl -fL --progress-bar "$URL" -o "$TGZ"; then
+  if ! curl -fL --progress-bar --retry 5 --retry-delay 10 --retry-max-time 300 --connect-timeout 30 "$URL" -o "$TGZ"; then
     RED "[ERR] 下载失败：$URL"
     exit 1
   fi
@@ -924,7 +1136,7 @@ esac
 #####################################
 PKGMGR="$(pm_detect)"
 if [[ "$PKGMGR" == "none" ]]; then
-  RED "[ERR] 未检测到 apt/dnf/yum/zypper/apk，请手动安装：docker jq python3 tar gzip curl"
+  RED "[ERR] 未检测到 apt/dnf/yum/zypper/apk，请手动安装：docker jq tar gzip curl （python3/busybox/nc 至少其一用于提供文件下载）"
   exit 1
 fi
 
@@ -932,7 +1144,7 @@ case "$PKGMGR" in
   apt)
     need_bin curl curl
     need_bin jq jq
-    need_bin python3 python3
+    need_bin python3 python3 || true
     need_bin tar tar
     need_bin gzip gzip
     need_bin docker docker.io
@@ -940,7 +1152,7 @@ case "$PKGMGR" in
   yum|dnf)
     need_bin curl curl
     need_bin jq jq
-    need_bin python3 python3
+    need_bin python3 python3 || true
     need_bin tar tar
     need_bin gzip gzip
     if ! command -v docker >/dev/null 2>&1; then
@@ -950,7 +1162,7 @@ case "$PKGMGR" in
   zypper)
     need_bin curl curl
     need_bin jq jq
-    need_bin python3 python3
+    need_bin python3 python3 || true
     need_bin tar tar
     need_bin gzip gzip
     need_bin docker docker
@@ -958,7 +1170,7 @@ case "$PKGMGR" in
   apk)
     need_bin curl curl
     need_bin jq jq
-    need_bin python3 python3
+    need_bin python3 python3 || true
     need_bin tar tar
     need_bin gzip gzip
     need_bin docker docker
@@ -1016,16 +1228,35 @@ mkdir -p "${BUNDLE}"/{runs,volumes,binds,compose,meta}
 BLUE "[INFO] Bundle 目录：${BUNDLE}"
 
 #####################################
+# 并发锁：防止同机同时运行两个实例互相干扰
+#####################################
+LOCKFILE="${WORKDIR}/.docker_migrate.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200 2>/dev/null; then
+  RED "[ERR] 检测到另一个 docker_migrate 实例正在运行。"
+  RED "[ERR] 如需强制重启，请先删除锁文件：rm -f ${LOCKFILE}"
+  exit 1
+fi
+# 退出时自动释放锁
+trap 'flock -u 200 2>/dev/null; rm -f "${LOCKFILE}" 2>/dev/null' EXIT
+
+#####################################
 # 容器选择（支持 compose 分组）
 #####################################
 if [[ -n "$INCLUDE_LIST" ]]; then
-  mapfile -t ALL_IDS < <(docker ps --format '{{.ID}}')
-  ((${#ALL_IDS[@]})) || { RED "[ERR] 没有运行中的容器"; exit 1; }
+  mapfile -t ALL_IDS < <(docker ps -a --format '{{.ID}}')
+  ((${#ALL_IDS[@]})) || { RED "[ERR] 没有任何容器（运行中或已停止）"; exit 1; }
   IFS=',' read -r -a NAMES <<<"$INCLUDE_LIST"
   for n in "${NAMES[@]}"; do
     n="$(echo "$n" | xargs)"
     [[ -z "$n" ]] && continue
-    id=$(docker ps --filter "name=^${n}$" --format '{{.ID}}' | head -n1 || true)
+    # 精确匹配容器名：Docker --filter name= 是子字符串匹配，即使带 ^$ 也不做正则锚定。
+    # 改用先列出所有容器名，再 grep 做精确字符串匹配，避免误匹配到包含元字符的容器名。
+    id=""
+    while IFS= read -r cid; do
+      id="$cid"
+      break
+    done < <(docker ps -a --format '{{.ID}}\t{{.Names}}' | awk -F'\t' -v name="$n" '$2 == name {print $1}')
     if [[ -n "$id" ]]; then
       IDS+=("$id")
     else
@@ -1034,8 +1265,8 @@ if [[ -n "$INCLUDE_LIST" ]]; then
   done
   ((${#IDS[@]})) || { RED "[ERR] --include 未匹配到任何容器"; exit 1; }
 else
-  mapfile -t PS_LINES < <(docker ps --format '{{.ID}} {{.Names}}')
-  ((${#PS_LINES[@]})) || { RED "[ERR] 没有运行中的容器"; exit 1; }
+  mapfile -t PS_LINES < <(docker ps -a --format '{{.ID}} {{.Names}}')
+  ((${#PS_LINES[@]})) || { RED "[ERR] 没有任何容器（运行中或已停止）"; exit 1; }
 
   declare -a STANDALONE_IDS=()
   declare -a STANDALONE_NAMES=()
@@ -1044,6 +1275,8 @@ else
   declare -A GROUP_LABELS=()
   declare -A GROUP_SEEN=()
   declare -a GROUP_KEYS=()
+  declare -a PANEL_CONTAINERS=()
+  declare -A PANEL_WARN_OF=()
 
   for line in "${PS_LINES[@]}"; do
     id="${line%% *}"
@@ -1054,6 +1287,44 @@ else
     j="$(docker inspect "$id")"
     proj=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$j")
     wdir=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$j")
+
+    # 面板管理容器检测：btpanel/baota/1Panel 自身 — 标记警告
+    local panel_warn="" img_name
+    img_name="$(jq -r '.[0].Config.Image // ""' <<<"$j")"
+    case "$img_name" in
+      *btpanel*|*baota*|*1panel*|*1Panel*)
+        PANEL_CONTAINERS+=("$id")
+        panel_warn=" [⚡ 面板管理容器，迁移可能导致管理界面异常]"
+        ;;
+    esac
+    # 也检测挂载了面板关键路径的容器
+    local mounts_json
+    mounts_json="$(jq -r '.[0].Mounts[]?.Source // empty' <<<"$j" 2>/dev/null || true)"
+    case "$mounts_json" in
+      *"/www/server/panel/"*|*"/opt/1panel/"*)
+        if [[ -z "$panel_warn" ]]; then
+          PANEL_CONTAINERS+=("$id")
+          panel_warn=" [⚡ 挂载了面板关键路径，请确认是否为管理容器]"
+        fi
+        ;;
+    esac
+    PANEL_WARN_OF["$id"]="$panel_warn"
+    # 兼容 docker-compose v1（无 working_dir label）：将 v1 的 project 容器也归入 compose 组。
+    # v1 缺少 working_dir 时，使用 compose config_files 中第一个文件的父目录作为 wdir。
+    if [[ -z "$wdir" && -n "$proj" ]]; then
+      cfgs_raw=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$j")
+      if [[ -n "$cfgs_raw" ]]; then
+        IFS=':' read -r -a cfgs_arr <<<"$cfgs_raw"
+        for cfg in "${cfgs_arr[@]}"; do
+          cfg="${cfg#./}"
+          if [[ -n "$cfg" ]]; then
+            d="$(dirname "$cfg")"
+            if [[ "$cfg" == /* ]]; then wdir="$d"; else wdir="${PWD}/${d}"; fi
+            break
+          fi
+        done
+      fi
+    fi
     if [[ -n "$proj" && -n "$wdir" ]]; then
       key="${proj}|${wdir}"
       if [[ -z "${GROUP_SEEN[$key]:-}" ]]; then
@@ -1099,10 +1370,17 @@ else
       idx=$((idx + 1))
       id="${STANDALONE_IDS[$i]}"
       name="${STANDALONE_NAMES[$i]}"
-      printf " %2d) %s\n" "$idx" "$name"
+      local pw="${PANEL_WARN_OF[$id]:-}"
+      printf " %2d) %s%s\n" "$idx" "$name" "$pw"
       MENU_KIND[$idx]="single"
       MENU_VAL[$idx]="$id"
     done
+    echo ""
+  fi
+
+  if ((${#PANEL_CONTAINERS[@]})); then
+    YEL " ⚡ 提示：检测到面板管理容器（btpanel/1Panel/baota），迁移可能导致面板界面异常。"
+    YEL "    建议仅迁移业务容器，排除面板管理容器。"
     echo ""
   fi
 
@@ -1185,6 +1463,20 @@ for id in "${IDS[@]}"; do
   jtmp="$(docker inspect "$id")"
   projtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$jtmp")
   wdirtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$jtmp")
+  # 兼容 v1：缺少 working_dir 时从 config_files 推断
+  if [[ -z "$wdirtmp" && -n "$projtmp" ]]; then
+    cfgstmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$jtmp")
+    if [[ -n "$cfgstmp" ]]; then
+      IFS=':' read -r -a cfgs_tmp <<<"$cfgstmp"
+      for ct in "${cfgs_tmp[@]}"; do
+        ct="${ct#./}"
+        if [[ -n "$ct" ]]; then
+          if [[ "$ct" == /* ]]; then wdirtmp="$(dirname "$ct")"; else wdirtmp="${PWD}/$(dirname "$ct")"; fi
+          break
+        fi
+      done
+    fi
+  fi
   if [[ -n "$projtmp" && -n "$wdirtmp" ]]; then
     keytmp="${projtmp}|${wdirtmp}"
     SELECTED_COMPOSE_COUNT["$keytmp"]=$(( ${SELECTED_COMPOSE_COUNT["$keytmp"]:-0} + 1 ))
@@ -1201,6 +1493,19 @@ for id in "${IDS[@]}"; do
   proj=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$j")
   wdir=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$j")
   cfgs=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$j")
+  # 兼容 v1：缺少 working_dir 时从 config_files 推断
+  if [[ -z "$wdir" && -n "$proj" ]]; then
+    if [[ -n "$cfgs" ]]; then
+      IFS=':' read -r -a cfgs_arr <<<"$cfgs"
+      for cg in "${cfgs_arr[@]}"; do
+        cg="${cg#./}"
+        if [[ -n "$cg" ]]; then
+          if [[ "$cg" == /* ]]; then wdir="$(dirname "$cg")"; else wdir="${PWD}/$(dirname "$cg")"; fi
+          break
+        fi
+      done
+    fi
+  fi
   key=""
   if [[ -n "$proj" && -n "$wdir" ]]; then
     key="${proj}|${wdir}"
@@ -1211,6 +1516,17 @@ for id in "${IDS[@]}"; do
     [[ -n "$cfgs" ]] && COMPOSE_CFGS["$key"]="$cfgs"
     PROJECT_KEY_OF["$id"]="$key"
     CONTAINER_IS_COMPOSE["$id"]=1
+    # 尝试通过 docker compose config 捕获解析后的环境变量（合并 .env + shell env）
+    # 防止因 shell 环境注入变量未备份导致 compose 恢复后配置不一致
+    if [[ -n "$cfgs" && -n "$wdir" ]]; then
+      local cfg_first=""
+      IFS=':' read -r -a _arr <<<"$cfgs"
+      for _c in "${_arr[@]}"; do _c="${_c#./}"; [[ -n "$_c" ]] && { if [[ "$_c" == /* ]]; then cfg_first="$_c"; else cfg_first="${wdir}/${_c}"; fi; break; }; done
+      if [[ -n "$cfg_first" && -f "$cfg_first" ]]; then
+        local cfg_dir="$(dirname "$cfg_first")"
+        docker compose --project-directory "$cfg_dir" -f "$cfg_first" config --no-path-resolution 2>/dev/null > "${BUNDLE}/compose/${proj}/_resolved_config.yml" 2>/dev/null || true
+      fi
+    fi
   else
     PROJECT_KEY_OF["$id"]=""
     CONTAINER_IS_COMPOSE["$id"]=0
@@ -1257,6 +1573,20 @@ if ((${#COMPOSE_GROUP[@]})); then
       if [[ -n "$wdir" && -f "${wdir}/${f}" ]]; then
         cp -a "${wdir}/${f}" "$dest/" 2>/dev/null || true
       fi
+    done
+
+    # 扫描 compose 配置中 env_file 指令引用的文件并打包
+    for cfg in "$dest"/*.yml "$dest"/*.yaml; do
+      [[ -f "$cfg" ]] || continue
+      while IFS= read -r ef; do
+        ef="${ef#./}"
+        [[ -z "$ef" ]] && continue
+        if [[ "$ef" == /* ]]; then
+          [[ -f "$ef" ]] && cp -a "$ef" "$dest/" 2>/dev/null || true
+        elif [[ -n "$wdir" && -f "${wdir}/${ef}" ]]; then
+          cp -a "${wdir}/${ef}" "$dest/" 2>/dev/null || true
+        fi
+      done < <(grep -oP 'env_file:\s*\K\S+' "$cfg" 2>/dev/null | tr -d '"'"'"'"' || true)
     done
   done
 fi
@@ -1321,6 +1651,9 @@ for id in "${IDS[@]}"; do
       volume)
         v_idx=$((v_idx + 1))
         vname=$(jq -r '.Name' <<<"$m")
+        # 捕获卷的 driver 和 options，用于恢复时精确还原
+        v_driver="$(docker volume inspect "$vname" -f '{{.Driver}}' 2>/dev/null || echo local)"
+        v_opts_json="$(docker volume inspect "$vname" -f '{{json .Options}}' 2>/dev/null || echo '{}')"
         printf " [VOL] (%d/%d) %s :: %s -> %s\n" "$v_idx" "$vol_count" "$n" "$vname" "$dest"
         mkdir -p "${BUNDLE}/volumes"
         out="${BUNDLE}/volumes/vol_${vname}.tgz"
@@ -1331,11 +1664,18 @@ for id in "${IDS[@]}"; do
             YEL " [WARN] 打包卷失败：$vname"
             continue
           }
-        MAN_VOL+=("$(jq -cn --arg name "$vname" --arg dest "$dest" '{name:$name,dest:$dest}')")
+        MAN_VOL+=("$(jq -cn --arg name "$vname" --arg dest "$dest" --arg driver "$v_driver" --argjson opts "$v_opts_json" '{name:$name,dest:$dest,driver:$driver,opts:$opts}')")
         ;;
       bind)
-        b_idx=$((b_idx + 1))
         src=$(jq -r '.Source' <<<"$m")
+        # 过滤 Docker socket 等 Unix socket 文件，防止恢复时覆盖目标服务器 daemon
+        case "$src" in
+          */docker.sock|*/podman.sock|*/containerd.sock)
+            YEL " [SKIP] 跳过 Docker socket bind mount：$src"
+            continue
+            ;;
+        esac
+        b_idx=$((b_idx + 1))
         esc=$(echo "$src" | sed 's#/#_#g' | sed 's/^_//')
         out="${BUNDLE}/binds/bind_${esc}.tgz"
         printf " [BIND] (%d/%d) %s :: %s -> %s\n" "$b_idx" "$bind_count" "$n" "$src" "$dest"
@@ -1395,13 +1735,28 @@ generate_manifest_and_restore() {
     local proj="${key%%|*}"
     local wdir="${key#*|}"
     local files_json="[]"
+    local cfgs_json="[]"
     if [[ -d "${BUNDLE}/compose/${proj}" ]]; then
-      mapfile -t FLS < <(find "${BUNDLE}/compose/${proj}" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || true)
+      mapfile -t FLS < <(find "${BUNDLE}/compose/${proj}" -maxdepth 1 -type f -exec basename {} \; 2>/dev/null | sort || true)
       if ((${#FLS[@]})); then
         files_json="$(json_array_from_lines "${FLS[@]}")"
       fi
     fi
-    MAN_PROJECTS+=("$(jq -cn --arg name "$proj" --arg working_dir "$wdir" --argjson files "$files_json" '{name:$name,working_dir:$working_dir,files:$files}')")
+    # 记录 config_files 顺序，用于恢复时还原 -f 参数
+    local cfs="${COMPOSE_CFGS[$key]:-}"
+    if [[ -n "$cfs" ]]; then
+      IFS=':' read -r -a CFS_ARR <<<"$cfs"
+      declare -a cfgs_abs=()
+      for c in "${CFS_ARR[@]}"; do
+        c="${c#./}"
+        [[ -z "$c" ]] && continue
+        if [[ "$c" == /* ]]; then cfgs_abs+=("$c"); elif [[ -n "$wdir" ]]; then cfgs_abs+=("${wdir}/${c}"); else cfgs_abs+=("$c"); fi
+      done
+      if ((${#cfgs_abs[@]})); then
+        cfgs_json="$(json_array_from_lines "${cfgs_abs[@]}")"
+      fi
+    fi
+    MAN_PROJECTS+=("$(jq -cn --arg name "$proj" --arg working_dir "$wdir" --argjson files "$files_json" --argjson config_files "$cfgs_json" '{name:$name,working_dir:$working_dir,files:$files,config_files:$config_files}')")
   done
 
   local images_json nets_json projects_json vols_json binds_json runs_json
@@ -1489,7 +1844,7 @@ fi
 
 SECRET_TOKEN="$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
 BASE_URL="$(pick_advertise_url "$PORT")"
-FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${BUNDLE_BASENAME}.tar.gz"
+FINAL_URL=""  # will be set below by the chosen HTTP server
 
 BLUE "[INFO] 启动 HTTP 服务（端口 ${PORT}，仅允许路径 /${SECRET_TOKEN}/${BUNDLE_BASENAME}.tar.gz）"
 SHPID=""
@@ -1503,10 +1858,15 @@ cleanup_http() {
 hard_clean() {
   rm -rf "${BUNDLE}" 2>/dev/null || true
   rm -f "${SINGLE_TAR_PATH}" 2>/dev/null || true
+  # 清理 busybox httpd 临时目录和 nc http response 文件
+  rm -rf "${BUNDLE_ROOT}/_bb_http_serve" 2>/dev/null || true
+  rm -f "${BUNDLE_ROOT}/nc_http_response.http" 2>/dev/null || true
   OK "[OK] 已清理 bundle 目录及单文件包"
 }
 
 graceful_exit() {
+  # 禁止二次中断——trap handler 执行期间用户再按 Ctrl+C 不会打断重启和清理
+  trap '' INT TERM
   local rc="${1:-0}"
   echo ""
   YEL "[INFO] 即将退出，先关闭 HTTP 服务 ..."
@@ -1516,11 +1876,11 @@ graceful_exit() {
     local ok=0 fail=0 n
     for n in "${STOPPED_ON_BACKUP[@]}"; do
       printf " - starting: %s ... " "$n"
-      if docker start "$n" >/dev/null 2>&1; then
+      if timeout 60 docker start "$n" >/dev/null 2>&1; then
         printf "ok\n"
         ok=$((ok + 1))
       else
-        printf "fail\n"
+        printf "fail (timeout or error)\n"
         fail=$((fail + 1))
       fi
     done
@@ -1536,10 +1896,19 @@ trap 'graceful_exit 130' INT TERM
 
 HTTP_LOG="${BUNDLE_ROOT}/http_server_${RID}.log"
 cd "${BUNDLE_ROOT}" || exit 1
-python3 - "$PORT" "$SECRET_TOKEN" "$BUNDLE_BASENAME" >"${HTTP_LOG}" 2>&1 <<'PY' &
+
+# start_http_server: multi-fallback — python3 > busybox httpd > netcat
+TGZ_NAME="${BUNDLE_BASENAME}.tar.gz"
+TGZ_PATH="${BUNDLE_ROOT}/${TGZ_NAME}"
+TGZ_SIZE="$(stat -c%s "$TGZ_PATH" 2>/dev/null || stat -f%z "$TGZ_PATH" 2>/dev/null || echo 0)"
+
+if command -v python3 >/dev/null 2>&1; then
+  # --- Fallback 1: Python3 HTTP server (best — supports secret token + proper headers) ---
+  YEL "[INFO] 使用 Python3 HTTP 服务 ..."
+  python3 - "$PORT" "$SECRET_TOKEN" "$BUNDLE_BASENAME" >"${HTTP_LOG}" 2>&1 <<'PY' &
 import http.server
 import os
-import socketserver
+from socketserver import ThreadingTCPServer
 import sys
 
 port = int(sys.argv[1])
@@ -1577,10 +1946,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-with socketserver.TCPServer(("", port), Handler) as httpd:
+from socketserver import ThreadingTCPServer
+
+with ThreadingTCPServer(("", port), Handler) as httpd:
     httpd.serve_forever()
 PY
-SHPID=$!
+  SHPID=$!
+  FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${BUNDLE_BASENAME}.tar.gz"
+
+elif command -v busybox >/dev/null 2>&1; then
+  # --- Fallback 2: Busybox httpd (widespread on minimal/embedded systems) ---
+  # 通过子目录隔离：创建一个符号链接，只暴露 tar.gz 文件而不暴露整个 bundle_root
+  YEL "[INFO] 使用 Busybox HTTP 服务 ..."
+  BUSYBOX_WEB="${BUNDLE_ROOT}/_bb_http_serve"
+  mkdir -p "$BUSYBOX_WEB" 2>/dev/null || true
+  ln -sf "$TGZ_PATH" "$BUSYBOX_WEB/$TGZ_NAME" 2>/dev/null || true
+  busybox httpd -f -p "$PORT" -h "$BUSYBOX_WEB" >"${HTTP_LOG}" 2>&1 &
+  SHPID=$!
+  # busybox httpd: no secret token — URL is http://host:port/<file>
+  FINAL_URL="${BASE_URL}/${TGZ_NAME}"
+
+elif command -v nc >/dev/null 2>&1; then
+  # --- Fallback 3: Netcat one-shot HTTP (virtually universal) ---
+  YEL "[INFO] 使用 Netcat HTTP 服务 ..."
+  # Build a raw HTTP response; serve the same file for any path
+  cat > "${BUNDLE_ROOT}/nc_http_response.http" <<NCEOF
+HTTP/1.1 200 OK
+Content-Type: application/gzip
+Content-Length: ${TGZ_SIZE}
+Connection: close
+
+NCEOF
+  (
+    while true; do
+      # Ncat (modern nmap) uses --send-only; traditional nc uses -N or relies on client closing
+      (cat "${BUNDLE_ROOT}/nc_http_response.http"; cat "$TGZ_PATH") | nc -l -p "$PORT" -q 0 2>/dev/null || \
+      (cat "${BUNDLE_ROOT}/nc_http_response.http"; cat "$TGZ_PATH") | nc -l -p "$PORT" 2>/dev/null || true
+    done
+  ) >"${HTTP_LOG}" 2>&1 &
+  SHPID=$!
+  # nc fallback: no secret token — URL is just http://host:port/<file>
+  FINAL_URL="${BASE_URL}/${TGZ_NAME}"
+
+else
+  RED "[ERR] 未找到可用的 HTTP 服务方式（python3 / busybox httpd / nc），请手动安装其一后重试。"
+  exit 1
+fi
+
 cd "$WORKDIR"
 sleep 1
 
