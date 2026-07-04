@@ -1289,7 +1289,7 @@ else
     wdir=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$j")
 
     # 面板管理容器检测：btpanel/baota/1Panel 自身 — 标记警告
-    panel_warn="" img_name
+    panel_warn=""
     img_name="$(jq -r '.[0].Config.Image // ""' <<<"$j")"
     case "$img_name" in
       *btpanel*|*baota*|*1panel*|*1Panel*)
