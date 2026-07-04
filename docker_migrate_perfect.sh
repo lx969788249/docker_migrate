@@ -1297,8 +1297,7 @@ else
         panel_warn=" [⚡ 面板管理容器，迁移可能导致管理界面异常]"
         ;;
     esac
-    # 也检测挂载了面板关键路径的容器
-    mounts_json
+    # 检测挂载了面板关键路径的容器
     mounts_json="$(jq -r '.[0].Mounts[]?.Source // empty' <<<"$j" 2>/dev/null || true)"
     case "$mounts_json" in
       *"/www/server/panel/"*|*"/opt/1panel/"*)
