@@ -899,7 +899,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
           compose_down_in_dir() { docker compose "$@"; }
           compose_down_in_dir down || true
           compose_prepare_networks "$name"
-          docker compose "${COMPOSE_FILE_ARGS[@]}" up -d
+          docker compose "${COMPOSE_FILE_ARGS[@]}" up -d 2>&1
         ) || FAILED_PROJECTS+=("$name")
       else
         (
@@ -919,7 +919,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
           fi
           compose_run down || true
           compose_prepare_networks "$name"
-          compose_run "${COMPOSE_FILE_ARGS[@]}" up -d
+          compose_run "${COMPOSE_FILE_ARGS[@]}" up -d 2>&1
         ) || FAILED_PROJECTS+=("$name")
       fi
     elif command -v docker-compose >/dev/null 2>&1; then
@@ -930,7 +930,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
           compose_down_in_dir() { docker-compose "$@"; }
           compose_down_in_dir down || true
           compose_prepare_networks "$name"
-          docker-compose "${COMPOSE_FILE_ARGS[@]}" up -d
+          docker-compose "${COMPOSE_FILE_ARGS[@]}" up -d 2>&1
         ) || FAILED_PROJECTS+=("$name")
       else
         (
@@ -950,7 +950,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
           fi
           compose_run down || true
           compose_prepare_networks "$name"
-          compose_run "${COMPOSE_FILE_ARGS[@]}" up -d
+          compose_run "${COMPOSE_FILE_ARGS[@]}" up -d 2>&1
         ) || FAILED_PROJECTS+=("$name")
       fi
     else
