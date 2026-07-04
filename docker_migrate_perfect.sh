@@ -616,7 +616,7 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
 fi
 RUN_SH
   # 安全转义容器名中的 \ / &，防止 sed 替换出错
-  local escaped_name="$name"
+  escaped_name="$name"
   escaped_name="${escaped_name//\\/\\\\}"   # \ → \\
   escaped_name="${escaped_name//\//\\/}"    # / → \/
   escaped_name="${escaped_name//&/\\&}"     # & → \&
@@ -1519,11 +1519,11 @@ for id in "${IDS[@]}"; do
     # 尝试通过 docker compose config 捕获解析后的环境变量（合并 .env + shell env）
     # 防止因 shell 环境注入变量未备份导致 compose 恢复后配置不一致
     if [[ -n "$cfgs" && -n "$wdir" ]]; then
-      local cfg_first=""
+      cfg_first=""
       IFS=':' read -r -a _arr <<<"$cfgs"
       for _c in "${_arr[@]}"; do _c="${_c#./}"; [[ -n "$_c" ]] && { if [[ "$_c" == /* ]]; then cfg_first="$_c"; else cfg_first="${wdir}/${_c}"; fi; break; }; done
       if [[ -n "$cfg_first" && -f "$cfg_first" ]]; then
-        local cfg_dir="$(dirname "$cfg_first")"
+        cfg_dir="$(dirname "$cfg_first")"
         docker compose --project-directory "$cfg_dir" -f "$cfg_first" config --no-path-resolution 2>/dev/null > "${BUNDLE}/compose/${proj}/_resolved_config.yml" 2>/dev/null || true
       fi
     fi
