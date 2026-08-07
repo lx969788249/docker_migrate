@@ -91,7 +91,7 @@ real_docker="$(command -v docker)"
 cat >"${docker_proxy_dir}/docker" <<'SH'
 #!/bin/sh
 case "$*" in
-  *"${SOURCE_ARCHIVE_VOLUME}:/from:ro"*"tar -czf"*)
+  *"${SOURCE_ARCHIVE_VOLUME}:/from:ro"*"tar -C /from -cf - ."*)
     : >"${SOURCE_ARCHIVE_STARTED}"
     while [ ! -e "${SOURCE_ARCHIVE_RELEASE}" ]; do sleep 0.1; done
     ;;
@@ -103,7 +103,7 @@ real_tar="$(command -v tar)"
 cat >"${docker_proxy_dir}/tar" <<'SH'
 #!/bin/sh
 case "$*" in
-  *"/binds/bind_"*".tgz"*)
+  *"-C / -cf - ${SOURCE_BIND_PATH#/}"*)
     : >"${SOURCE_BIND_ARCHIVE_STARTED}"
     while [ ! -e "${SOURCE_BIND_ARCHIVE_RELEASE}" ]; do sleep 0.1; done
     ;;
@@ -120,6 +120,7 @@ chmod +x "${docker_proxy_dir}/tar"
     SOURCE_ARCHIVE_RELEASE="$archive_release" \
     SOURCE_BIND_ARCHIVE_STARTED="$bind_archive_started" \
     SOURCE_BIND_ARCHIVE_RELEASE="$bind_archive_release" \
+    SOURCE_BIND_PATH="$bind_path" \
     PORT=18880 ADVERTISE_HOST=127.0.0.1 \
     STOP_SHARED_MOUNTS=1 \
     DOCKER_MIGRATE_LOCK_BASE="${tmp}/source-locks" \
@@ -250,14 +251,19 @@ fi
 mkdir -p "$http_failure_proxy_dir"
 cat >"${http_failure_proxy_dir}/python3" <<'SH'
 #!/bin/sh
-sleep 2
-exit 42
+if [ "${1:-}" = "-" ]; then
+  sleep 2
+  exit 42
+fi
+exec "$REAL_PYTHON3" "$@"
 SH
 chmod +x "${http_failure_proxy_dir}/python3"
+real_python3="$(command -v python3)"
 http_failure_rc=0
 (
   cd "$source_work"
-  env PATH="${http_failure_proxy_dir}:$PATH" PORT=18881 ADVERTISE_HOST=127.0.0.1 \
+  env PATH="${http_failure_proxy_dir}:$PATH" REAL_PYTHON3="$real_python3" \
+    PORT=18881 ADVERTISE_HOST=127.0.0.1 \
     STOP_SHARED_MOUNTS=1 \
     DOCKER_MIGRATE_LOCK_BASE="${tmp}/source-locks" \
     DOCKER_MIGRATE_IGNORE_CONTAINERS="$ignore_container" \

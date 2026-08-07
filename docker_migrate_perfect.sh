@@ -423,7 +423,7 @@ progress_count() {
 
 progress_watch() {
   local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed timer_pid=""
   [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -433,8 +433,23 @@ progress_watch() {
     interval=10
   fi
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  # watcher 被主流程终止时，也必须立即终止其 sleep 子进程。否则 sleep 会继续
+  # 持有命令替换/进程替换的管道，使已经完成的步骤一直等到 interval 到期。
+  trap '
+    if [[ -n "${timer_pid:-}" ]]; then
+      kill "$timer_pid" 2>/dev/null || true
+      wait "$timer_pid" 2>/dev/null || true
+    fi
+    exit 0
+  ' TERM INT HUP
   while kill -0 "$owner_pid" 2>/dev/null; do
-    sleep "$interval"
+    # timer 不需要任何标准流；显式断开可避免它延长调用方管道的生命周期。
+    # stdin 重定向用于关闭继承的管道，不是供 sleep 读取。
+    # shellcheck disable=SC2217
+    sleep "$interval" </dev/null >/dev/null 2>&1 &
+    timer_pid=$!
+    wait "$timer_pid" 2>/dev/null || true
+    timer_pid=""
     kill -0 "$owner_pid" 2>/dev/null || break
     current=0
     [[ -z "$file" ]] || current="$(progress_file_size "$file")"
@@ -447,6 +462,7 @@ progress_watch() {
       printf '\n' >&2
     fi
   done
+  trap - TERM INT HUP
 }
 
 run_with_progress() {
@@ -641,7 +657,12 @@ collect_shared_running_containers() {
 
   for selected_id in "$@"; do
     selected_ids["$selected_id"]=1
-    inspect="$(docker inspect "$selected_id")" || return 1
+    if declare -p SELECTED_INSPECT_JSON >/dev/null 2>&1 &&
+      [[ -n "${SELECTED_INSPECT_JSON[$selected_id]+cached}" ]]; then
+      inspect="${SELECTED_INSPECT_JSON[$selected_id]}"
+    else
+      inspect="$(docker inspect "$selected_id")" || return 1
+    fi
     selected_full_id="$(jq -r '.[0].Id' <<<"$inspect")"
     selected_ids["$selected_full_id"]=1
     selected_ids["${selected_full_id:0:12}"]=1
@@ -784,6 +805,188 @@ verify_bundle_hmac() {
   [[ "${actual,,}" == "${expected,,}" ]]
 }
 
+bundle_file_digests() {
+  local file="$1" mac_key="$2" iv="$3"
+  local result sha mac extra
+  [[ -f "$file" ]] || return 1
+  valid_hex_length "$mac_key" 64 || return 2
+  valid_hex_length "$iv" 32 || return 2
+
+  # Python 可在一次顺序读取中同时计算来源 SHA 与 encrypt-then-MAC 摘要。
+  # 它是可选加速路径；极简系统仍回退到现有 OpenSSL/SHA 工具，不影响可用性。
+  if command -v python3 >/dev/null 2>&1; then
+    result="$(python3 -c '
+import hashlib
+import hmac
+import sys
+
+path, key_hex, iv, scheme = sys.argv[1:]
+sha = hashlib.sha256()
+mac = hmac.new(bytes.fromhex(key_hex), digestmod=hashlib.sha256)
+mac.update(b"docker-migrate:" + scheme.encode() + b"\0" + iv.lower().encode() + b"\0")
+with open(path, "rb", buffering=0) as source:
+    while True:
+        chunk = source.read(1024 * 1024)
+        if not chunk:
+            break
+        sha.update(chunk)
+        mac.update(chunk)
+print(sha.hexdigest() + "\t" + mac.hexdigest())
+' "$file" "$mac_key" "$iv" "$BUNDLE_ENCRYPTION_SCHEME")" || return 1
+  else
+    sha="$(sha256_file "$file")" || return 1
+    mac="$(bundle_hmac_sha256_file "$file" "$mac_key" "$iv")" || return 1
+    result="${sha}"$'\t'"${mac}"
+  fi
+
+  IFS=$'\t' read -r sha mac extra <<<"$result"
+  [[ -z "$extra" ]] || return 1
+  valid_sha256 "$sha" && valid_sha256 "$mac" || return 1
+  printf '%s\t%s\n' "${sha,,}" "${mac,,}"
+}
+
+verify_bundle_digests() {
+  local file="$1" mac_key="$2" iv="$3" expected_sha="$4" expected_mac="$5"
+  local actual_sha actual_mac extra
+  valid_sha256 "$expected_sha" && valid_sha256 "$expected_mac" || return 2
+  IFS=$'\t' read -r actual_sha actual_mac extra < <(
+    bundle_file_digests "$file" "$mac_key" "$iv"
+  ) || return 1
+  [[ -z "$extra" ]] || return 1
+  [[ "${actual_sha,,}" == "${expected_sha,,}" &&
+    "${actual_mac,,}" == "${expected_mac,,}" ]]
+}
+
+gzip_compress_stream() {
+  local level="${DOCKER_MIGRATE_GZIP_LEVEL:-6}"
+  [[ "$level" =~ ^[1-9]$ ]] || level=6
+  if command -v pigz >/dev/null 2>&1; then
+    pigz "-${level}" -c
+  else
+    gzip "-${level}" -c
+  fi
+}
+
+archive_volume_to_gzip() {
+  local volume="$1" output="$2" rc=0
+  rm -f -- "$output"
+  if docker run --rm -v "${volume}:/from:ro" alpine:3.20 \
+    tar -C /from -cf - . | gzip_compress_stream >"$output"; then
+    return 0
+  else
+    rc=$?
+  fi
+  rm -f -- "$output"
+  return "$rc"
+}
+
+archive_bind_to_gzip() {
+  local source="$1" output="$2" rc=0
+  rm -f -- "$output"
+  if tar -C / -cf - "${source#/}" | gzip_compress_stream >"$output"; then
+    return 0
+  else
+    rc=$?
+  fi
+  rm -f -- "$output"
+  return "$rc"
+}
+
+docker_stop_batch_verified() {
+  local label="$1"
+  shift
+  local name running stop_rc=0 verify_rc=0
+  (($# > 0)) || return 0
+
+  run_with_activity "$label" docker stop "$@" >/dev/null || stop_rc=$?
+  # Docker CLI 的聚合退出码无法指出具体失败项；以 daemon 的最终状态为准，
+  # 同时逐个确认，避免部分停止后误以为已经取得一致性快照。
+  for name in "$@"; do
+    if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)"; then
+      RED "[ERR] 停机后无法确认容器状态：$name"
+      verify_rc=1
+    elif [[ "$running" != "false" ]]; then
+      RED "[ERR] 容器仍在运行：$name"
+      verify_rc=1
+    fi
+  done
+  ((verify_rc == 0)) || return 1
+  if ((stop_rc != 0)); then
+    YEL "[WARN] docker stop 返回异常，但已逐个确认所有目标容器停止。"
+  fi
+  return 0
+}
+
+bundle_pack_encrypt_directory() {
+  local bundle_root="$1" member="$2" output="$3"
+  local encryption_key="$4" mac_key="$5" iv="$6"
+  local result sha mac extra rc=0
+  [[ -d "${bundle_root}/${member}" ]] || return 1
+  valid_hex_length "$encryption_key" 64 || return 2
+  valid_hex_length "$mac_key" 64 || return 2
+  valid_hex_length "$iv" 32 || return 2
+  command -v openssl >/dev/null 2>&1 || return 127
+  rm -f -- "$output"
+
+  if command -v python3 >/dev/null 2>&1; then
+    # 压缩、加密、落盘和两个摘要在同一条流水线完成：不再生成明文 tar.gz，
+    # 密文也无需为了 HMAC/SHA 再从磁盘完整读取一次。
+    if result="$(
+      tar -C "$bundle_root" -cf - "$member" |
+        gzip_compress_stream |
+        openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$iv" |
+        python3 -c '
+import hashlib
+import hmac
+import sys
+
+output, key_hex, iv, scheme = sys.argv[1:]
+sha = hashlib.sha256()
+mac = hmac.new(bytes.fromhex(key_hex), digestmod=hashlib.sha256)
+mac.update(b"docker-migrate:" + scheme.encode() + b"\0" + iv.lower().encode() + b"\0")
+with open(output, "wb", buffering=0) as target:
+    while True:
+        chunk = sys.stdin.buffer.read(1024 * 1024)
+        if not chunk:
+            break
+        target.write(chunk)
+        sha.update(chunk)
+        mac.update(chunk)
+print(sha.hexdigest() + "\t" + mac.hexdigest())
+' "$output" "$mac_key" "$iv" "$BUNDLE_ENCRYPTION_SCHEME"
+    )"; then
+      :
+    else
+      rc=$?
+      rm -f -- "$output"
+      return "$rc"
+    fi
+  else
+    # 无 Python 时仍保留流式压缩加密和格式兼容，只在生成后回退为摘要扫描。
+    if tar -C "$bundle_root" -cf - "$member" |
+      gzip_compress_stream |
+      openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$iv" \
+        -out "$output"; then
+      result="$(bundle_file_digests "$output" "$mac_key" "$iv")" || {
+        rc=$?
+        rm -f -- "$output"
+        return "$rc"
+      }
+    else
+      rc=$?
+      rm -f -- "$output"
+      return "$rc"
+    fi
+  fi
+
+  IFS=$'\t' read -r sha mac extra <<<"$result"
+  if [[ -n "$extra" ]] || ! valid_sha256 "$sha" || ! valid_sha256 "$mac"; then
+    rm -f -- "$output"
+    return 1
+  fi
+  printf '%s\t%s\n' "${sha,,}" "${mac,,}"
+}
+
 bundle_encrypt_file() {
   local input="$1" output="$2" encryption_key="$3" iv="$4"
   local partial="${output}.partial.$$"
@@ -836,6 +1039,7 @@ snapshot_container_image() {
   local -a commit_args=(docker commit)
 
   original_image="$(jq -r '.[0].Config.Image' "$metadata_file")"
+  # 这里必须读取临近 commit 的实时状态；--no-stop 模式下容器可能在元数据采集后启动。
   running="$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || echo false)"
   # 用户选择不停机时不偷偷暂停业务；这种模式本身已明确提示快照可能不一致。
   [[ "$running" != "true" ]] || commit_args+=(--pause=false)
@@ -910,6 +1114,7 @@ verify_bundle_checksums() {
   local bundle_dir="$1"
   local manifest="${bundle_dir}/checksums.sha256"
   local expected rel file actual count=0
+  local -A verified_paths=()
   [[ -f "$manifest" ]] || {
     RED "[ERR] 迁移包缺少 checksums.sha256。"
     return 1
@@ -932,6 +1137,7 @@ verify_bundle_checksums() {
       RED "[ERR] 文件完整性校验失败：$rel"
       return 1
     }
+    verified_paths["$rel"]=1
     count=$((count + 1))
   done <"$manifest"
   ((count > 0)) || {
@@ -941,7 +1147,7 @@ verify_bundle_checksums() {
   while IFS= read -r -d '' file; do
     rel="${file#"${bundle_dir}/"}"
     case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
-    if ! awk -F '\t' -v rel="$rel" '$2 == rel { found=1 } END { exit found ? 0 : 1 }' "$manifest"; then
+    if [[ -z "${verified_paths["$rel"]+present}" ]]; then
       RED "[ERR] 迁移包含未纳入校验清单的文件：$rel"
       return 1
     fi
@@ -990,12 +1196,14 @@ bundle_manifest_is_safe() {
 archive_layout_is_safe() {
   local archive="$1"
   local entry
-  tar -tzf "$archive" >/dev/null 2>&1 || return 1
-  while IFS= read -r entry; do
-    case "$entry" in
-      /* | .. | ../* | */../* | */..) return 1 ;;
-    esac
-  done < <(tar -tzf "$archive")
+  # 在同一次成员列表扫描中同时确认归档可读并校验路径；pipefail 会保留 tar
+  # 解压列表失败的状态，避免为了取得退出码再完整解压一遍 gzip 流。
+  tar -tzf "$archive" 2>/dev/null |
+    while IFS= read -r entry; do
+      case "$entry" in
+        /* | .. | ../* | */../* | */..) exit 1 ;;
+      esac
+    done || return 1
   # 顶层迁移包不需要符号链接或硬链接；拒绝它们可避免解压路径绕过。
   ! tar -tvzf "$archive" | awk 'substr($1,1,1) ~ /^[lh]$/ { bad=1 } END { exit bad ? 0 : 1 }'
 }
@@ -1025,7 +1233,7 @@ dm_format_elapsed() {
 
 dm_progress_watch() {
   local label="$1" started="$2" owner_pid="$3"
-  local interval elapsed
+  local interval elapsed timer_pid=""
   [[ "${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" != "plain" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -1035,8 +1243,20 @@ dm_progress_watch() {
     interval=10
   fi
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  trap '
+    if [[ -n "${timer_pid:-}" ]]; then
+      kill "$timer_pid" 2>/dev/null || true
+      wait "$timer_pid" 2>/dev/null || true
+    fi
+    exit 0
+  ' TERM INT HUP
   while kill -0 "$owner_pid" 2>/dev/null; do
-    sleep "$interval"
+    # 关闭 timer 继承的 stdin 管道。
+    # shellcheck disable=SC2217
+    sleep "$interval" </dev/null >/dev/null 2>&1 &
+    timer_pid=$!
+    wait "$timer_pid" 2>/dev/null || true
+    timer_pid=""
     kill -0 "$owner_pid" 2>/dev/null || break
     elapsed=$((SECONDS - started))
     if [[ -t 2 ]]; then
@@ -1047,6 +1267,7 @@ dm_progress_watch() {
         "$label" "$(dm_format_elapsed "$elapsed")" >&2
     fi
   done
+  trap - TERM INT HUP
 }
 
 dm_run_with_activity() {
@@ -1784,7 +2005,7 @@ restore_load_images() {
 
 dm_progress_watch() {
   local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
-  local interval current elapsed percent message
+  local interval current elapsed percent message timer_pid=""
   [[ "${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" != "plain" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -1794,8 +2015,20 @@ dm_progress_watch() {
     interval=10
   fi
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  trap '
+    if [[ -n "${timer_pid:-}" ]]; then
+      kill "$timer_pid" 2>/dev/null || true
+      wait "$timer_pid" 2>/dev/null || true
+    fi
+    exit 0
+  ' TERM INT HUP
   while kill -0 "$owner_pid" 2>/dev/null; do
-    sleep "$interval"
+    # 关闭 timer 继承的 stdin 管道。
+    # shellcheck disable=SC2217
+    sleep "$interval" </dev/null >/dev/null 2>&1 &
+    timer_pid=$!
+    wait "$timer_pid" 2>/dev/null || true
+    timer_pid=""
     kill -0 "$owner_pid" 2>/dev/null || break
     current=0
     [[ -z "$file" ]] || current="$(dm_file_size "$file")"
@@ -1815,6 +2048,7 @@ dm_progress_watch() {
       printf '%s\n' "$message" >&2
     fi
   done
+  trap - TERM INT HUP
 }
 
 dm_run_with_progress() {
@@ -2377,6 +2611,7 @@ restore_sha256_file() {
 
 restore_verify_checksums() {
   local expected rel file actual count=0
+  local -A verified_paths=()
   [[ -f checksums.sha256 ]] || return 2
   while IFS=$'\t' read -r expected rel; do
     [[ -n "$expected" && -n "$rel" ]] || continue
@@ -2385,14 +2620,14 @@ restore_verify_checksums() {
     [[ -f "$file" ]] || return 1
     actual="$(restore_sha256_file "$file")" || return 1
     [[ "$actual" == "$expected" ]] || return 1
+    verified_paths["$rel"]=1
     count=$((count + 1))
   done <checksums.sha256
   (( count > 0 )) || return 1
   while IFS= read -r -d '' file; do
     rel="${file#"${BUNDLE_DIR}/"}"
     case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
-    awk -F '\t' -v rel="$rel" '$2 == rel { found=1 } END { exit found ? 0 : 1 }' \
-      checksums.sha256 || return 1
+    [[ -n "${verified_paths["$rel"]+present}" ]] || return 1
   done < <(find "$BUNDLE_DIR" -type f -print0)
 }
 
@@ -2436,16 +2671,18 @@ archive_members_safe() {
   local archive="$1"
   local allowed_prefix="${2:-}"
   local entry
-  tar -tzf "$archive" >/dev/null 2>&1 || return 1
-  while IFS= read -r entry; do
-    entry="${entry#./}"
-    case "$entry" in /*|..|../*|*/../*|*/..) return 1 ;; esac
-    if [[ -n "$allowed_prefix" &&
-          "$entry" != "$allowed_prefix" &&
-          "$entry" != "${allowed_prefix}/"* ]]; then
-      return 1
-    fi
-  done < <(tar -tzf "$archive")
+  # 单次列出成员即可同时验证 gzip/tar 完整性和成员路径；安全链接仍在解压到
+  # 一次性容器后由 tree_links_stay_within_root 校验，保持现有链接支持语义。
+  tar -tzf "$archive" 2>/dev/null |
+    while IFS= read -r entry; do
+      entry="${entry#./}"
+      case "$entry" in /*|..|../*|*/../*|*/..) exit 1 ;; esac
+      if [[ -n "$allowed_prefix" &&
+            "$entry" != "$allowed_prefix" &&
+            "$entry" != "${allowed_prefix}/"* ]]; then
+        exit 1
+      fi
+    done || return 1
 }
 
 tree_links_stay_within_root() {
@@ -3138,17 +3375,59 @@ transaction_restore_container_state() {
   esac
 }
 
+transaction_quiesce_containers() {
+  local name state running stop_rc=0 verify_rc=0
+  local -a stop_names=()
+  (($# > 0)) || return 0
+
+  for name in "$@"; do
+    transaction_container_exists "$name" || return 1
+    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    [[ "$state" != "paused" ]] || docker unpause "$name" >/dev/null 2>&1 || return 1
+    case "$state" in
+      running | restarting | paused) stop_names+=("$name") ;;
+    esac
+  done
+  ((${#stop_names[@]} > 0)) || return 0
+
+  dm_run_with_activity "批量停止目标端容器（${#stop_names[@]} 个）" \
+    docker stop "${stop_names[@]}" >/dev/null || stop_rc=$?
+  for name in "${stop_names[@]}"; do
+    if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" ||
+      [[ "$running" != "false" ]]; then
+      warn " · 目标端容器未能停止或状态不可确认：$name"
+      verify_rc=1
+    fi
+  done
+  ((verify_rc == 0)) || return 1
+  if ((stop_rc != 0)); then
+    warn " · docker stop 返回异常，但已确认所有目标端容器停止。"
+  fi
+  return 0
+}
+
 transaction_quiesce_container() {
-  local name="$1" state
-  transaction_container_exists "$name" || return 1
-  state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
-  [[ "$state" != "paused" ]] || docker unpause "$name" >/dev/null 2>&1 || return 1
-  case "$state" in
-    running | restarting | paused)
-      dm_run_with_activity "停止目标端容器：$name" docker stop "$name" >/dev/null
-      ;;
-    *) return 0 ;;
-  esac
+  transaction_quiesce_containers "$1"
+}
+
+transaction_build_quiesce_list() {
+  local shared_file="$1" managed_file="$2" output="$3"
+  local partial="${output}.partial.$$" rc=0
+  rm -f -- "$partial"
+  if {
+    cut -f1 "$shared_file" || exit 1
+    cat "$managed_file" || exit 1
+  } | awk 'NF' | sort -u >"$partial"; then
+    if mv "$partial" "$output"; then
+      return 0
+    else
+      rc=$?
+    fi
+  else
+    rc=$?
+  fi
+  rm -f -- "$partial"
+  return "$rc"
 }
 
 transaction_discard_prepared() {
@@ -3534,7 +3813,8 @@ transaction_exit_handler() {
 transaction_prepare() {
   local policy="${RESTORE_EXISTING:-replace}" has_data=0 existing_targets=0
   local project run name state had_old id inspect mount type source selected_path matched
-  local rollback_dir rollback_base lock_base self_container_name=""
+  local rollback_dir rollback_base lock_base self_container_name="" quiesce_list_file
+  local -a quiesce_names=()
 
   case "$policy" in replace | skip | fail) ;; *)
     warn "RESTORE_EXISTING 值无效：$policy（应为 replace、skip 或 fail）"
@@ -3720,16 +4000,18 @@ transaction_prepare() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
-  while IFS=$'\t' read -r name state; do
-    [[ -n "$name" ]] || continue
-    echo " · 暂停共享挂载写入者：$name"
-    transaction_quiesce_container "$name" || return 1
-  done <"${RESTORE_TRANSACTION_DIR}/shared.tsv"
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    echo " · 暂停目标端旧服务：$name"
-    transaction_quiesce_container "$name" || return 1
-  done <"${RESTORE_TRANSACTION_DIR}/managed_names.list"
+  quiesce_list_file="${RESTORE_TRANSACTION_DIR}/quiesce_names.list"
+  if ! transaction_build_quiesce_list \
+    "${RESTORE_TRANSACTION_DIR}/shared.tsv" \
+    "${RESTORE_TRANSACTION_DIR}/managed_names.list" "$quiesce_list_file"; then
+    warn "无法完整生成目标端停机名单，尚未停止服务或回灌数据。"
+    return 1
+  fi
+  mapfile -t quiesce_names <"$quiesce_list_file"
+  for name in "${quiesce_names[@]}"; do
+    echo " · 准备暂停目标端服务或共享写入者：$name"
+  done
+  transaction_quiesce_containers "${quiesce_names[@]}" || return 1
 
   # 所有目标服务及共享写入者停止后再提交 writable layer，使容器快照与
   # 随后建立的 volume/bind 数据回滚点处于同一个静默窗口。
@@ -3802,6 +4084,42 @@ if ! transaction_internal_paths_are_safe; then
   exit 1
 fi
 
+RESTORE_STAGE="预检数据归档"
+say "[0.1] 在停止目标服务前预检 volume 与 bind 归档"
+if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
+  while IFS= read -r row; do
+    vname="$(jq -r '.name' <<<"$row")"
+    file="vol_${vname}.tgz"
+    if [[ ! -f "volumes/$file" ]]; then
+      warn " 命名卷缺少备份文件：$vname（volumes/$file）"
+      FAILED_VOLUMES+=("$vname")
+    elif ! dm_run_with_activity "预检命名卷归档：$vname" \
+      archive_members_safe "volumes/$file"; then
+      warn " 命名卷归档结构异常：$vname"
+      FAILED_VOLUMES+=("$vname")
+    fi
+  done < <(jq -c '.volumes[]' manifest.json)
+fi
+if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
+  while IFS= read -r row; do
+    host="$(jq -r '.host' <<<"$row")"
+    file="$(jq -r '.file' <<<"$row")"
+    bind_prefix="${host#/}"
+    if [[ ! -f "binds/$file" ]]; then
+      warn " 绑定目录缺少备份文件：$host（binds/$file）"
+      FAILED_BINDS+=("$host")
+    elif ! dm_run_with_activity "预检绑定目录归档：$host" \
+      archive_members_safe "binds/$file" "$bind_prefix"; then
+      warn " 绑定目录归档结构异常：$host"
+      FAILED_BINDS+=("$host")
+    fi
+  done < <(jq -c '.binds[]' manifest.json)
+fi
+if ((${#FAILED_VOLUMES[@]} > 0 || ${#FAILED_BINDS[@]} > 0)); then
+  print_failure_summary
+  exit 1
+fi
+
 RESTORE_STAGE="加载镜像"
 say "[A] 加载镜像（如 images.tar 存在）"
 if [[ -f images.tar ]]; then
@@ -3831,12 +4149,6 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
     file="vol_${vname}.tgz"
     if [[ ! -f "volumes/$file" ]]; then
       warn " 命名卷缺少备份文件：$vname（volumes/$file）"
-      FAILED_VOLUMES+=("$vname")
-      continue
-    fi
-    if ! dm_run_with_activity "检查命名卷归档：$vname" \
-      archive_members_safe "volumes/$file"; then
-      warn " 命名卷归档结构异常：$vname"
       FAILED_VOLUMES+=("$vname")
       continue
     fi
@@ -3887,13 +4199,6 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     file=$(jq -r '.file' <<<"$row")
     if [[ ! -f "binds/$file" ]]; then
       warn " 绑定目录缺少备份文件：$host（binds/$file）"
-      FAILED_BINDS+=("$host")
-      continue
-    fi
-    bind_prefix="${host#/}"
-    if ! dm_run_with_activity "检查绑定目录归档：$host" \
-      archive_members_safe "binds/$file" "$bind_prefix"; then
-      warn " 绑定目录归档结构异常：$host"
       FAILED_BINDS+=("$host")
       continue
     fi
@@ -4237,27 +4542,17 @@ restore_main() {
   fi
   OK "[OK] 保存路径：$DOWNLOAD_FILE"
   BLUE "[INFO] 文件大小：$(du -h "$DOWNLOAD_FILE" | awk '{print $1}')"
-  if [[ -n "$EXPECTED_SHA256" ]]; then
-    BLUE "[INFO] 验证下载包的外部 SHA-256 摘要 ..."
-    if ! run_with_activity "校验下载包 SHA-256" \
-      verify_archive_sha256 "$DOWNLOAD_FILE" "$EXPECTED_SHA256"; then
-      RED "[ERR] 下载包与源服务器提供的 SHA-256 摘要不一致，拒绝解压。"
-      exit 1
-    fi
-    OK "[OK] 下载包来源摘要校验通过"
-  else
-    YEL "[WARN] 已按兼容模式跳过外部来源校验。"
-  fi
   if ((encrypted == 1)); then
     ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
     MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
-    BLUE "[INFO] 验证加密迁移包 HMAC ..."
-    if ! run_with_activity "验证加密迁移包 HMAC" verify_bundle_hmac \
-      "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" "$ENCRYPTION_MAC"; then
-      RED "[ERR] 加密迁移包认证失败，文件可能被篡改或链接密钥不正确。"
+    BLUE "[INFO] 一次读取验证加密包 SHA-256 与 HMAC ..."
+    if ! run_with_activity "验证加密迁移包完整性" verify_bundle_digests \
+      "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" \
+      "$EXPECTED_SHA256" "$ENCRYPTION_MAC"; then
+      RED "[ERR] 加密迁移包摘要或认证失败，文件可能被篡改或链接密钥不正确。"
       exit 1
     fi
-    OK "[OK] 加密迁移包认证通过"
+    OK "[OK] 加密迁移包来源摘要与认证均通过"
     BLUE "[INFO] 正在解密迁移包 ..."
     if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
       "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
@@ -4270,6 +4565,16 @@ restore_main() {
     ENCRYPTION_KEY=""
     MAC_KEY=""
     OK "[OK] 迁移包解密完成"
+  elif [[ -n "$EXPECTED_SHA256" ]]; then
+    BLUE "[INFO] 验证下载包的外部 SHA-256 摘要 ..."
+    if ! run_with_activity "校验下载包 SHA-256" \
+      verify_archive_sha256 "$DOWNLOAD_FILE" "$EXPECTED_SHA256"; then
+      RED "[ERR] 下载包与源服务器提供的 SHA-256 摘要不一致，拒绝解压。"
+      exit 1
+    fi
+    OK "[OK] 下载包来源摘要校验通过"
+  else
+    YEL "[WARN] 已按兼容模式跳过外部来源校验。"
   fi
   if ! run_with_activity "扫描迁移包目录结构" archive_layout_is_safe "$TGZ"; then
     RED "[ERR] 迁移包结构不安全或已损坏，拒绝解压。"
@@ -4446,6 +4751,7 @@ case "$PKGMGR" in
     try_optional_bin python3 python3
     need_bin tar tar
     need_bin gzip gzip
+    try_optional_bin pigz pigz
     need_bin openssl openssl
     need_bin docker docker.io
     ;;
@@ -4455,6 +4761,7 @@ case "$PKGMGR" in
     try_optional_bin python3 python3
     need_bin tar tar
     need_bin gzip gzip
+    try_optional_bin pigz pigz
     need_bin openssl openssl
     if ! command -v docker >/dev/null 2>&1; then
       pm_install "$PKGMGR" docker || pm_install "$PKGMGR" docker-ce || true
@@ -4466,6 +4773,7 @@ case "$PKGMGR" in
     try_optional_bin python3 python3
     need_bin tar tar
     need_bin gzip gzip
+    try_optional_bin pigz pigz
     need_bin openssl openssl
     need_bin docker docker
     ;;
@@ -4475,6 +4783,7 @@ case "$PKGMGR" in
     try_optional_bin python3 python3
     need_bin tar tar
     need_bin gzip gzip
+    try_optional_bin pigz pigz
     need_bin openssl openssl
     need_bin docker docker
     ;;
@@ -4598,6 +4907,7 @@ hard_clean() {
   [[ -z "${BUNDLE:-}" ]] || rm -rf "${BUNDLE}" 2>/dev/null || failed=1
   [[ -z "${SINGLE_TAR_PATH:-}" ]] || rm -f "${SINGLE_TAR_PATH}" 2>/dev/null || failed=1
   [[ -z "${ENCRYPTED_TAR_PATH:-}" ]] || rm -f "${ENCRYPTED_TAR_PATH}" 2>/dev/null || failed=1
+  [[ -z "${ENCRYPTED_PARTIAL_PATH:-}" ]] || rm -f "${ENCRYPTED_PARTIAL_PATH}" 2>/dev/null || failed=1
   [[ -z "${BUNDLE_ROOT:-}" ]] || rm -rf "${BUNDLE_ROOT}/_bb_http_serve" 2>/dev/null || failed=1
   [[ -z "${BUNDLE_ROOT:-}" ]] || rm -f "${BUNDLE_ROOT}/nc_http_response.http" 2>/dev/null || failed=1
   if ((failed == 0)); then
@@ -4737,8 +5047,14 @@ trap 'exit 129' HUP
 # 容器选择（支持 compose 分组）
 #####################################
 if [[ -n "$INCLUDE_LIST" ]]; then
-  mapfile -t ALL_IDS < <(docker ps -a --format '{{.ID}}')
-  ((${#ALL_IDS[@]})) || {
+  declare -A INCLUDE_ID_BY_NAME=()
+  include_container_count=0
+  while IFS=$'\t' read -r id n; do
+    [[ -n "$id" && -n "$n" ]] || continue
+    INCLUDE_ID_BY_NAME["$n"]="$id"
+    include_container_count=$((include_container_count + 1))
+  done < <(docker ps -a --format '{{.ID}}\t{{.Names}}')
+  ((include_container_count > 0)) || {
     RED "[ERR] 没有任何容器（运行中或已停止）"
     exit 1
   }
@@ -4746,13 +5062,8 @@ if [[ -n "$INCLUDE_LIST" ]]; then
   for n in "${NAMES[@]}"; do
     n="$(echo "$n" | xargs)"
     [[ -z "$n" ]] && continue
-    # 精确匹配容器名：Docker --filter name= 是子字符串匹配，即使带 ^$ 也不做正则锚定。
-    # 改用先列出所有容器名，再 grep 做精确字符串匹配，避免误匹配到包含元字符的容器名。
-    id=""
-    while IFS= read -r cid; do
-      id="$cid"
-      break
-    done < <(docker ps -a --format '{{.ID}}\t{{.Names}}' | awk -F'\t' -v name="$n" '$2 == name {print $1}')
+    # 一次性建立精确 name -> ID 索引，避免每个 --include 名称都重新扫描 Docker。
+    id="${INCLUDE_ID_BY_NAME[$n]:-}"
     if [[ -n "$id" ]]; then
       IDS+=("$id")
     else
@@ -4965,6 +5276,7 @@ declare -A COMPOSE_GROUP=()
 declare -A COMPOSE_CFGS=()
 declare -A SELECTED_COMPOSE_COUNT=()
 declare -A COMPOSE_SERVICE_COUNT=()
+declare -A SELECTED_INSPECT_JSON=()
 
 # 关键修复：重新按最终选择的容器统计 compose 分组数量，避免菜单阶段归类为单容器，元数据阶段又被重新归为 compose。
 metadata_total=${#IDS[@]}
@@ -4973,6 +5285,7 @@ for id in "${IDS[@]}"; do
   metadata_index=$((metadata_index + 1))
   progress_count "分析所选容器" "$metadata_index" "$metadata_total" "$id"
   jtmp="$(docker inspect "$id")"
+  SELECTED_INSPECT_JSON["$id"]="$jtmp"
   projtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$jtmp")
   wdirtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$jtmp")
   # 兼容 v1：缺少 working_dir 时从 config_files 推断
@@ -4998,7 +5311,7 @@ done
 metadata_index=0
 for id in "${IDS[@]}"; do
   metadata_index=$((metadata_index + 1))
-  j="$(docker inspect "$id")"
+  j="${SELECTED_INSPECT_JSON[$id]}"
   name=$(jq -r '.[0].Name | ltrimstr("/")' <<<"$j")
   progress_count "采集容器元数据" "$metadata_index" "$metadata_total" "$name"
   img=$(jq -r '.[0].Config.Image' <<<"$j")
@@ -5162,8 +5475,12 @@ fi
 # 预拉取卷操作镜像，避免把下载时间计入后面的停机快照窗口
 #####################################
 BLUE "[INFO] 预拉取 alpine:3.20 镜像（用于卷操作）..."
-run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 ||
-  YEL "[WARN] 无法拉取 alpine:3.20，卷操作可能失败"
+if docker image inspect alpine:3.20 >/dev/null 2>&1; then
+  OK "[OK] 已存在 alpine:3.20，跳过联网检查"
+else
+  run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 ||
+    YEL "[WARN] 无法拉取 alpine:3.20，卷操作可能失败"
+fi
 
 #####################################
 # 检查未选中容器是否仍在写共享挂载
@@ -5200,6 +5517,7 @@ if ((${#SHARED_MOUNT_ROWS[@]} > 0)); then
     exit 1
   fi
 
+  declare -a SHARED_STOP_NAMES=()
   for shared_row in "${SHARED_MOUNT_ROWS[@]}"; do
     IFS=$'\t' read -r _ shared_name _ <<<"$shared_row"
     shared_state="$(docker inspect -f '{{.State.Status}}' "$shared_name" 2>/dev/null || echo running)"
@@ -5207,12 +5525,12 @@ if ((${#SHARED_MOUNT_ROWS[@]} > 0)); then
     # Write-ahead：在 unpause/stop 前登记原状态；信号可在任意指令后安全恢复。
     STOPPED_ON_BACKUP+=("${shared_name}"$'\t'"${shared_state}")
     [[ "$shared_state" != "paused" ]] || docker unpause "$shared_name" >/dev/null 2>&1 || true
-    if ! run_with_activity "停止共享挂载容器：$shared_name" \
-      docker stop "$shared_name" >/dev/null; then
-      [[ "$shared_state" != "paused" ]] || docker pause "$shared_name" >/dev/null 2>&1 || true
-      BACKUP_FAILURES+=("无法停止共享挂载容器：$shared_name")
-    fi
+    SHARED_STOP_NAMES+=("$shared_name")
   done
+  if ! docker_stop_batch_verified \
+    "批量停止共享挂载容器（${#SHARED_STOP_NAMES[@]} 个）" "${SHARED_STOP_NAMES[@]}"; then
+    BACKUP_FAILURES+=("共享挂载容器未能全部停止")
+  fi
   if ((${#BACKUP_FAILURES[@]} > 0)); then
     RED "[ERR] 共享挂载容器未全部停止，已取消备份。"
     exit 1
@@ -5230,24 +5548,27 @@ else
   if [[ "$STOPNOW" =~ ^[Yy]$ ]]; then
     total_count=${#IDS[@]}
     idx=0
+    declare -a SOURCE_STOP_NAMES=()
     for id in "${IDS[@]}"; do
       idx=$((idx + 1))
       n="${CONTAINER_NAME[$id]}"
-      was_running="$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null || echo false)"
+      source_state_row="$(docker inspect -f '{{.State.Running}} {{.State.Status}}' \
+        "$id" 2>/dev/null || echo 'false missing')"
+      read -r was_running source_state <<<"$source_state_row"
       if [[ "$was_running" != "true" ]]; then
         printf "[停机] (%d/%d) %s ... already stopped\n" "$idx" "$total_count" "$n"
         continue
       fi
-      source_state="$(docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || echo running)"
       printf "[停机] (%d/%d) %s\n" "$idx" "$total_count" "$n"
       # Write-ahead：先登记再改变源容器状态，避免 TERM 落在 stop 与数组追加之间。
       STOPPED_ON_BACKUP+=("${n}"$'\t'"${source_state}")
       [[ "$source_state" != "paused" ]] || docker unpause "$n" >/dev/null 2>&1 || true
-      if ! run_with_activity "停止源容器：$n" docker stop "$n" >/dev/null; then
-        [[ "$source_state" != "paused" ]] || docker pause "$n" >/dev/null 2>&1 || true
-        BACKUP_FAILURES+=("无法停止正在运行的容器：$n")
-      fi
+      SOURCE_STOP_NAMES+=("$n")
     done
+    if ! docker_stop_batch_verified \
+      "批量停止源容器（${#SOURCE_STOP_NAMES[@]} 个）" "${SOURCE_STOP_NAMES[@]}"; then
+      BACKUP_FAILURES+=("源容器未能全部停止")
+    fi
     if ((${#BACKUP_FAILURES[@]} > 0)); then
       RED "[ERR] 停机阶段失败，已取消备份以避免不一致数据。"
       exit 1
@@ -5340,15 +5661,18 @@ for id in "${IDS[@]}"; do
         [[ -z "${BACKED_VOLUMES[$vname]:-}" ]] || continue
         BACKED_VOLUMES["$vname"]=1
         # 捕获卷的 driver 和 options，用于恢复时精确还原
-        v_driver="$(docker volume inspect "$vname" -f '{{.Driver}}' 2>/dev/null || echo local)"
-        v_opts_json="$(docker volume inspect "$vname" -f '{{json .Options}}' 2>/dev/null || echo '{}')"
+        if v_inspect="$(docker volume inspect "$vname" 2>/dev/null)"; then
+          v_driver="$(jq -r '.[0].Driver // "local"' <<<"$v_inspect")"
+          v_opts_json="$(jq -c '.[0].Options // {}' <<<"$v_inspect")"
+        else
+          v_driver="local"
+          v_opts_json='{}'
+        fi
         printf " [VOL] (%d/%d) %s :: %s -> %s\n" "$v_idx" "$vol_count" "$n" "$vname" "$dest"
         mkdir -p "${BUNDLE}/volumes"
         out="${BUNDLE}/volumes/vol_${vname}.tgz"
-        if ! run_with_file_progress "打包命名卷：$vname" "$out" 0 docker run --rm \
-          -v "${vname}:/from:ro" \
-          -v "${BUNDLE}/volumes:/to" \
-          alpine:3.20 sh -c "cd /from && tar -czf /to/$(basename "$out") ."; then
+        if ! run_with_file_progress "打包命名卷：$vname" "$out" 0 \
+          archive_volume_to_gzip "$vname" "$out"; then
           YEL " [WARN] 打包卷失败：$vname"
           BACKUP_FAILURES+=("命名卷备份失败：$vname")
           continue
@@ -5373,7 +5697,7 @@ for id in "${IDS[@]}"; do
         printf " [BIND] (%d/%d) %s :: %s -> %s\n" "$b_idx" "$bind_count" "$n" "$src" "$dest"
         mkdir -p "${BUNDLE}/binds"
         if ! run_with_file_progress "打包绑定目录：$src" "$out" 0 \
-          tar -C / -czf "$out" "${src#/}"; then
+          archive_bind_to_gzip "$src" "$out"; then
           YEL " [WARN] 跳过不可读路径：$src"
           BACKUP_FAILURES+=("绑定目录备份失败：$src")
           continue
@@ -5551,14 +5875,10 @@ BLUE "[INFO] 生成迁移包完整性校验 ..."
 run_with_activity "计算迁移包内文件校验值" generate_bundle_checksums "$BUNDLE"
 
 #####################################
-# 打包成单文件 tar.gz
+# 流式压缩并加密成单文件
 #####################################
 BUNDLE_BASENAME="docker_migrate_${STAMP}_${RID}"
 SINGLE_TAR_PATH="${BUNDLE_ROOT}/${BUNDLE_BASENAME}.tar.gz"
-BLUE "[INFO] 打包一键迁移包：${SINGLE_TAR_PATH}"
-run_with_file_progress "压缩一键迁移包" "$SINGLE_TAR_PATH" 0 \
-  tar -C "$BUNDLE_ROOT" -czf "$SINGLE_TAR_PATH" "$RID"
-OK "[OK] 一键迁移包已生成，大小：$(du -h "$SINGLE_TAR_PATH" | awk '{print $1}')"
 BUNDLE_SECRET="$(openssl rand -hex 64)" || {
   RED "[ERR] 无法生成迁移包加密密钥。"
   exit 1
@@ -5574,24 +5894,25 @@ valid_hex_length "$BUNDLE_SECRET" 128 && valid_hex_length "$BUNDLE_IV" 32 || {
 BUNDLE_ENCRYPTION_KEY="$(bundle_secret_encryption_key "$BUNDLE_SECRET")"
 BUNDLE_MAC_KEY="$(bundle_secret_mac_key "$BUNDLE_SECRET")"
 ENCRYPTED_TAR_PATH="${SINGLE_TAR_PATH}.enc"
-BLUE "[INFO] 加密迁移包（AES-256-CTR + HMAC-SHA256）..."
-if ! run_with_file_progress "加密迁移包" "${ENCRYPTED_TAR_PATH}.partial.$$" \
-  "$(progress_file_size "$SINGLE_TAR_PATH")" bundle_encrypt_file \
-  "$SINGLE_TAR_PATH" "$ENCRYPTED_TAR_PATH" \
-  "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_IV"; then
-  RED "[ERR] 迁移包加密失败，拒绝启动明文下载服务。"
+ENCRYPTED_PARTIAL_PATH="${ENCRYPTED_TAR_PATH}.partial.$$"
+BLUE "[INFO] 流式压缩并加密迁移包（AES-256-CTR + HMAC-SHA256）..."
+if ! BUNDLE_DIGESTS="$(run_with_file_progress "压缩并加密迁移包" \
+  "$ENCRYPTED_PARTIAL_PATH" 0 bundle_pack_encrypt_directory \
+  "$BUNDLE_ROOT" "$RID" "$ENCRYPTED_PARTIAL_PATH" \
+  "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_MAC_KEY" "$BUNDLE_IV")"; then
+  RED "[ERR] 迁移包压缩或加密失败，拒绝启动下载服务。"
   exit 1
 fi
-BUNDLE_HMAC="$(run_with_activity "计算加密包 HMAC" bundle_hmac_sha256_file \
-  "$ENCRYPTED_TAR_PATH" "$BUNDLE_MAC_KEY" "$BUNDLE_IV")" || {
-  RED "[ERR] 无法计算加密迁移包 HMAC。"
+IFS=$'\t' read -r BUNDLE_SHA256 BUNDLE_HMAC BUNDLE_DIGEST_EXTRA <<<"$BUNDLE_DIGESTS"
+if [[ -n "$BUNDLE_DIGEST_EXTRA" ]] || ! valid_sha256 "$BUNDLE_SHA256" ||
+  ! valid_sha256 "$BUNDLE_HMAC"; then
+  RED "[ERR] 无法生成加密迁移包摘要。"
   exit 1
-}
-BUNDLE_SHA256="$(run_with_activity "计算加密包 SHA-256" sha256_file "$ENCRYPTED_TAR_PATH")" || {
-  RED "[ERR] 无法计算加密迁移包 SHA-256。"
+fi
+if ! mv "$ENCRYPTED_PARTIAL_PATH" "$ENCRYPTED_TAR_PATH"; then
+  RED "[ERR] 无法提交已完成的加密迁移包。"
   exit 1
-}
-rm -f "$SINGLE_TAR_PATH"
+fi
 TRANSFER_NAME="${BUNDLE_BASENAME}.tar.gz.enc"
 TRANSFER_PATH="$ENCRYPTED_TAR_PATH"
 TRANSFER_FRAGMENT="#sha256=${BUNDLE_SHA256}&enc=${BUNDLE_ENCRYPTION_SCHEME}&secret=${BUNDLE_SECRET}&iv=${BUNDLE_IV}&mac=${BUNDLE_HMAC}"
