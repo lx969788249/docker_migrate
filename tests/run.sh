@@ -37,8 +37,79 @@ test_progress_propagates_failure() {
   rc=$?
   set -e
   [[ "$rc" -eq 7 ]]
-  grep -Fq 'images.tar 失败' <<<"$output"
-  ! grep -Fq 'images.tar 完成' <<<"$output"
+  grep -Fq '保存镜像 images.tar：失败' <<<"$output"
+  ! grep -Fq '保存镜像 images.tar：完成' <<<"$output"
+}
+
+test_activity_progress_plain_failure_contract() {
+  local output rc label='测试失败传播'
+  set +e
+  output="$(DOCKER_MIGRATE_PROGRESS_MODE=plain \
+    run_with_activity "$label" bash -c 'exit 7' 2>&1)"
+  rc=$?
+  set -e
+
+  [[ "$rc" -eq 7 ]]
+  [[ "$(grep -Fc "[进度] ${label}：开始" <<<"$output")" -eq 1 ]]
+  [[ "$(grep -Fc "[进度] ${label}：失败" <<<"$output")" -eq 1 ]]
+  ! grep -Fq "[进度] ${label}：完成" <<<"$output"
+}
+
+test_progress_render_reports_only_real_percentages() {
+  local known unknown clamped
+  known="$(progress_render '已知总量' 50 100 0)"
+  grep -Fq '50%' <<<"$known"
+
+  unknown="$(progress_render '未知总量' 2048 0 0)"
+  grep -Fq '已处理 2KB' <<<"$unknown"
+  [[ "$unknown" != *%* ]]
+
+  clamped="$(progress_render '超出总量' 150 100 0)"
+  grep -Fq '100%' <<<"$clamped"
+  grep -Fq '100B/100B' <<<"$clamped"
+}
+
+test_file_progress_plain_reports_written_bytes() {
+  local tmp output label='测试文件写入'
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  output="$(DOCKER_MIGRATE_PROGRESS_MODE=plain \
+    run_with_file_progress "$label" "${tmp}/output.bin" 0 \
+    bash -c 'printf data >"$1"' _ "${tmp}/output.bin" 2>&1)"
+
+  [[ "$(<"${tmp}/output.bin")" == 'data' ]]
+  [[ "$(grep -Fc "[进度] ${label}：开始" <<<"$output")" -eq 1 ]]
+  [[ "$(grep -Fc "[进度] ${label}：完成" <<<"$output")" -eq 1 ]]
+  grep -Fq '已处理 4B' <<<"$output"
+  ! grep -Fq "[进度] ${label}：失败" <<<"$output"
+}
+
+test_activity_progress_emits_heartbeat() {
+  local output label='测试运行心跳'
+  output="$(DOCKER_MIGRATE_PROGRESS_INTERVAL=1 \
+    run_with_activity "$label" bash -c 'sleep 2' 2>&1)"
+  grep -Fq "[进度] ${label}：仍在执行" <<<"$output"
+  grep -Fq '无需按键' <<<"$output"
+  grep -Fq "[进度] ${label}：完成" <<<"$output"
+}
+
+test_activity_progress_preserves_shell_state_and_stdin() {
+  local received
+  set -e
+  DOCKER_MIGRATE_PROGRESS_MODE=plain run_with_activity '测试 errexit 开启' true \
+    >/dev/null 2>&1
+  [[ $- == *e* ]]
+
+  set +e
+  DOCKER_MIGRATE_PROGRESS_MODE=plain run_with_activity '测试 errexit 关闭' true \
+    >/dev/null 2>&1
+  [[ $- != *e* ]]
+  set -e
+
+  received="$(printf 'sentinel\n' | DOCKER_MIGRATE_PROGRESS_MODE=plain \
+    run_with_activity '测试标准输入' bash -c 'read -r value; printf "%s" "$value"' 2>/dev/null)"
+  [[ "$received" == 'sentinel' ]]
 }
 
 test_snapshot_cleanup_keeps_failed_records() {
@@ -102,6 +173,7 @@ test_generated_scripts_are_valid_bash() {
   write_bundle_restore_script "${tmp}/bundle/restore.sh"
   bash -n "${tmp}/bundle/runs/demo.sh"
   bash -n "${tmp}/bundle/restore.sh"
+  grep -Fq 'restore_load_images()' "${tmp}/bundle/restore.sh"
 }
 
 test_checksums_detect_tampering() {
@@ -316,6 +388,11 @@ test_manifest_validates_compose_working_directories() {
 }
 
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
+run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
+run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
+run_test "plain file progress reports bytes written" test_file_progress_plain_reports_written_bytes
+run_test "activity progress emits a non-TTY heartbeat" test_activity_progress_emits_heartbeat
+run_test "activity progress preserves errexit and command stdin" test_activity_progress_preserves_shell_state_and_stdin
 run_test "snapshot cleanup preserves records when Docker is unavailable" test_snapshot_cleanup_keeps_failed_records
 run_test "final result summaries expose one unambiguous status" test_final_result_summaries_are_unambiguous
 run_test "generated restore scripts parse as Bash" test_generated_scripts_are_valid_bash

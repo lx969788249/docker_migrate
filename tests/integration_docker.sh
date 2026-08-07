@@ -6,6 +6,17 @@ export DOCKER_MIGRATE_LIB_ONLY=1
 # shellcheck source=../docker_migrate_perfect.sh
 source "${ROOT_DIR}/docker_migrate_perfect.sh"
 
+assert_line_contains() {
+  local text="$1" first="$2" second="$3" line
+  while IFS= read -r line; do
+    if [[ "$line" == *"$first"* && "$line" == *"$second"* ]]; then
+      return 0
+    fi
+  done <<<"$text"
+  printf 'expected one output line to contain both %q and %q\n' "$first" "$second" >&2
+  return 1
+}
+
 for bin in docker jq; do
   command -v "$bin" >/dev/null 2>&1 || {
     echo "skip: $bin is unavailable"
@@ -103,6 +114,8 @@ docker inspect "$container_name" >"${bundle}/meta/${container_name}.inspect.json
 snapshot_image="$(snapshot_image_ref "$suffix" "$(docker inspect -f '{{.Id}}' "$container_name")")"
 snapshot_container_image "$container_name" "${bundle}/meta/${container_name}.inspect.json" "$snapshot_image"
 write_run_script "$container_name" "${bundle}/runs/${container_name}.sh"
+# 生成脚本必须自带长耗时提示能力，不能依赖调用它们的外层进程补提示。
+grep -Fq '脚本正在正常执行，无需按键' "${bundle}/runs/${container_name}.sh"
 
 network_json="$(docker network inspect "$network_name" | jq '.[0] | {
   name: .Name,
@@ -124,6 +137,7 @@ jq -n \
   '{images:[],networks:[$network],projects:[],volumes:[],binds:[],runs:[$run]}' \
   >"${bundle}/manifest.json"
 write_bundle_restore_script "${bundle}/restore.sh"
+grep -Fq '脚本正在正常执行，无需按键' "${bundle}/restore.sh"
 generate_bundle_checksums "$bundle"
 
 docker rm -f "$container_name" >/dev/null
@@ -151,6 +165,10 @@ initial_restore_output="$(cd "$bundle" && bash restore.sh 2>&1)"
 grep -Fq '结果：✅ 恢复成功' <<<"$initial_restore_output"
 grep -Fq '容器：1 个（运行 1 / 暂停 0 / 停止 0）' <<<"$initial_restore_output"
 ! grep -Fq '若端口被占用' <<<"$initial_restore_output"
+assert_line_contains "$initial_restore_output" '校验迁移包内全部文件：开始' \
+  '脚本正在正常执行，无需按键'
+assert_line_contains "$initial_restore_output" "等待容器健康检查：${container_name}" \
+  '脚本正在正常执行，无需按键'
 
 [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]
 [[ "$(docker exec "$container_name" cat /writable-state.txt)" == "writable-layer-state" ]]
@@ -674,6 +692,11 @@ YAML
   grep -Fq '结果：✅ 恢复成功' <<<"$compose_restore_output"
   grep -Fq '容器：2 个（运行 1 / 暂停 0 / 停止 1）' <<<"$compose_restore_output"
   ! grep -Fq '若端口被占用' <<<"$compose_restore_output"
+  assert_line_contains "$compose_restore_output" '等待 Compose 服务健康检查：first' \
+    '脚本正在正常执行，无需按键'
+  assert_line_contains "$compose_restore_output" \
+    "等待 Compose 项目健康检查：${compose_project}" \
+    '脚本正在正常执行，无需按键'
   docker inspect "${compose_project}-first-1" |
     jq -e '.[0].Config.Env | index("MIGRATION_TEST=merged-config") != null' >/dev/null
   grep -Fq 'MIGRATION_TEST: merged-config' "${compose_work}/_resolved_config.yml"

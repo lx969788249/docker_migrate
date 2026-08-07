@@ -129,41 +129,40 @@ chmod +x "${docker_proxy_dir}/tar"
 ) <<<"Y" >"$backup_log" 2>&1 &
 backup_pid=$!
 
-for _ in $(seq 1 180); do
-  [[ ! -e "$archive_started" ]] || break
+# Docker 不保证 Mounts 的遍历顺序；哪个归档先开始就先验证并释放，避免测试
+# 把“volume 必须早于 bind”误当成产品契约。
+volume_released=0
+bind_released=0
+for _ in $(seq 1 240); do
+  if ((volume_released == 0)) && [[ -e "$archive_started" ]]; then
+    grep -Fq "[进度] 打包命名卷：${volume_name}：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键" \
+      "$backup_log"
+    [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
+    [[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
+    touch "$archive_release"
+    volume_released=1
+  fi
+  if ((bind_released == 0)) && [[ -e "$bind_archive_started" ]]; then
+    grep -Fq "[进度] 打包绑定目录：${bind_path}：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键" \
+      "$backup_log"
+    [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
+    [[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
+    touch "$bind_archive_release"
+    bind_released=1
+  fi
+  ((volume_released == 0 || bind_released == 0)) || break
   if ! kill -0 "$backup_pid" 2>/dev/null; then
-    echo "backup process exited before starting the volume archive" >&2
+    echo "backup process exited before both data archives completed" >&2
     tail -n 80 "$backup_log" >&2 || true
     exit 1
   fi
   sleep 1
 done
-if [[ ! -e "$archive_started" ]]; then
-  echo "timed out waiting for the volume archive" >&2
+if ((volume_released == 0 || bind_released == 0)); then
+  echo "timed out waiting for volume/bind archives" >&2
   tail -n 80 "$backup_log" >&2 || true
   exit 1
 fi
-[[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
-[[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
-touch "$archive_release"
-
-for _ in $(seq 1 60); do
-  [[ ! -e "$bind_archive_started" ]] || break
-  if ! kill -0 "$backup_pid" 2>/dev/null; then
-    echo "backup process exited before starting the bind archive" >&2
-    tail -n 80 "$backup_log" >&2 || true
-    exit 1
-  fi
-  sleep 1
-done
-if [[ ! -e "$bind_archive_started" ]]; then
-  echo "timed out waiting for the bind archive" >&2
-  tail -n 80 "$backup_log" >&2 || true
-  exit 1
-fi
-[[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
-[[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
-touch "$bind_archive_release"
 
 download_url=""
 for _ in $(seq 1 180); do

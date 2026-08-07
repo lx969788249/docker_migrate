@@ -301,7 +301,7 @@ pm_install() {
 need_bin() {
   local bin="$1" pkg="$2"
   if ! command -v "$bin" >/dev/null 2>&1; then
-    echo "[INFO] 安装依赖：$bin"
+    echo "[INFO] 安装依赖：$bin（可能耗时；如出现 sudo 密码提示，请按提示输入）"
     pm_install "$PKGMGR" "$pkg"
   fi
 }
@@ -310,7 +310,8 @@ try_optional_bin() {
   local bin="$1" pkg="$2"
   command -v "$bin" >/dev/null 2>&1 && return 0
   [[ "${PKGMGR:-none}" != "none" ]] || return 0
-  (pm_install "$PKGMGR" "$pkg") >/dev/null 2>&1 || true
+  echo "[INFO] 安装可选依赖：$bin（可能耗时；如出现 sudo 密码提示，请按提示输入）"
+  pm_install "$PKGMGR" "$pkg" || true
 }
 
 ensure_docker_running() {
@@ -325,9 +326,11 @@ ensure_docker_running() {
 
   YEL "[INFO] 尝试启动 Docker 服务..."
   if command -v systemctl >/dev/null 2>&1; then
+    YEL "[INFO] 正在通过 systemctl 启动 Docker；如出现 sudo 密码提示，请按提示输入。"
     asudo systemctl enable --now docker || true
   fi
   if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
+    YEL "[INFO] 正在通过 service 启动 Docker；如出现 sudo 密码提示，请按提示输入。"
     asudo service docker start || true
   fi
   if ! docker info >/dev/null 2>&1; then
@@ -354,64 +357,156 @@ human() {
   echo "${b}${units[$i]}"
 }
 
+progress_file_size() {
+  local file="$1"
+  stat -c %s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
+}
+
+progress_start() {
+  local label="$1"
+  printf '[进度] %s：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键，请耐心等待。\n' \
+    "$label" >&2
+}
+
+# 只在确实知道总字节数时显示百分比；未知总量时仅报告已处理字节和耗时，
+# 避免用“假进度条”误导用户。该函数保持纯输出，便于单元测试。
+progress_render() {
+  local label="$1" current="${2:-0}" total="${3:-0}" elapsed="${4:-0}"
+  local percent filled empty bar
+  [[ "$current" =~ ^[0-9]+$ ]] || current=0
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  [[ "$elapsed" =~ ^[0-9]+$ ]] || elapsed=0
+  if ((total > 0)); then
+    ((current <= total)) || current=$total
+    percent=$((current * 100 / total))
+    filled=$((percent * 24 / 100))
+    empty=$((24 - filled))
+    printf -v bar '%*s' "$filled" ''
+    bar=${bar// /#}
+    printf -v empty '%*s' "$empty" ''
+    empty=${empty// /-}
+    printf '[进度] %s [%s%s] %d%%（%s/%s，已用 %s）' \
+      "$label" "$bar" "$empty" "$percent" "$(human "$current")" \
+      "$(human "$total")" "$(format_elapsed "$elapsed")"
+  elif ((current > 0)); then
+    printf '[进度] %s：仍在执行，已处理 %s，已用 %s；无需按键' \
+      "$label" "$(human "$current")" "$(format_elapsed "$elapsed")"
+  else
+    printf '[进度] %s：仍在执行，已用 %s；无需按键' \
+      "$label" "$(format_elapsed "$elapsed")"
+  fi
+}
+
+progress_finish() {
+  local label="$1" rc="$2" elapsed="$3" current="${4:-0}"
+  local suffix=""
+  [[ "$current" =~ ^[0-9]+$ ]] || current=0
+  ((current == 0)) || suffix="，已处理 $(human "$current")"
+  if ((rc == 0)); then
+    printf '[进度] %s：完成（耗时 %s%s）\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
+  else
+    printf '[进度] %s：失败（耗时 %s%s）\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
+  fi
+}
+
+progress_count() {
+  local label="$1" current="$2" total="$3" item="${4:-}"
+  local suffix=""
+  [[ -z "$item" ]] || suffix="（${item}）"
+  if [[ -t 2 ]]; then
+    printf '\r%-120s\r[进度] %s：%d/%d%s' "" "$label" "$current" "$total" "$suffix" >&2
+    ((current < total)) || printf '\n' >&2
+  elif ((current == 1 || current == total || current % 10 == 0)); then
+    printf '[进度] %s：%d/%d%s\n' "$label" "$current" "$total" "$suffix" >&2
+  fi
+}
+
+progress_watch() {
+  local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed
+  [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
+  if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
+    interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
+  elif [[ -t 2 ]]; then
+    interval=1
+  else
+    interval=10
+  fi
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  while kill -0 "$owner_pid" 2>/dev/null; do
+    sleep "$interval"
+    kill -0 "$owner_pid" 2>/dev/null || break
+    current=0
+    [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+    elapsed=$((SECONDS - started))
+    if [[ -t 2 ]]; then
+      printf '\r%-120s\r' "" >&2
+      progress_render "$label" "$current" "$total" "$elapsed" >&2
+    else
+      progress_render "$label" "$current" "$total" "$elapsed" >&2
+      printf '\n' >&2
+    fi
+  done
+}
+
+run_with_progress() {
+  local label="$1" file="$2" total="$3"
+  shift 3
+  local started=$SECONDS watcher_pid rc current=0 restore_errexit=0
+  case $- in *e*) restore_errexit=1 ;; esac
+  progress_start "$label"
+  progress_watch "$label" "$file" "$total" "$started" "$$" &
+  watcher_pid=$!
+  set +e
+  "$@"
+  rc=$?
+  ((restore_errexit == 0)) || set -e
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  [[ ! -t 2 ]] || printf '\r%-120s\r' "" >&2
+  [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+  progress_finish "$label" "$rc" "$((SECONDS - started))" "$current"
+  return "$rc"
+}
+
+run_with_activity() {
+  local label="$1"
+  shift
+  run_with_progress "$label" "" 0 "$@"
+}
+
+run_with_file_progress() {
+  local label="$1" file="$2" total="${3:-0}"
+  shift 3
+  run_with_progress "$label" "$file" "$total" "$@"
+}
+
+progress_capture_stdout() {
+  local outfile="$1"
+  shift
+  "$@" >"$outfile"
+}
+
 progress_docker_save() {
   local outfile="$1"
   shift
-  local rc=0
+  local rc=0 started=$SECONDS current=0 restore_errexit=0
   if command -v pv >/dev/null 2>&1; then
-    BLUE "[INFO] 保存镜像 images.tar（使用 pv 显示进度）..."
-    if "$@" | pv -b >"$outfile"; then
-      rc=0
-    else
-      rc=$?
-    fi
-    local cur
-    cur=$(stat -c %s "$outfile" 2>/dev/null || stat -f%z "$outfile" 2>/dev/null || echo 0)
-    if ((rc == 0)); then
-      echo "[进度] images.tar 完成：$(human "$cur")"
-    else
-      echo "[进度] images.tar 失败（已写入：$(human "$cur")）"
-    fi
+    progress_start "保存镜像 images.tar"
+    case $- in *e*) restore_errexit=1 ;; esac
+    set +e
+    # -f 保证日志被重定向时也持续输出；pipefail 保留 docker save 的失败状态。
+    "$@" | pv -f -b >"$outfile"
+    rc=$?
+    ((restore_errexit == 0)) || set -e
+    current="$(progress_file_size "$outfile")"
+    progress_finish "保存镜像 images.tar" "$rc" "$((SECONDS - started))" "$current"
   else
-    BLUE "[INFO] 保存镜像 images.tar（此步骤可能较久，请耐心等待）..."
-    "$@" >"$outfile" &
-    local pid=$!
-    printf "[进度] images.tar "
-    # 把进度显示放到后台子 shell，避免 PID 竞态导致死循环。
-    # wait 直接等待子进程，不受 OS 回收 PID 影响。
-    (
-      local last=0 cur=0
-      local spin='-/|\' i=0
-      while kill -0 "$pid" 2>/dev/null; do
-        if [[ -f "$outfile" ]]; then
-          cur=$(stat -c %s "$outfile" 2>/dev/null || stat -f%z "$outfile" 2>/dev/null || echo 0)
-          if ((cur != last)); then
-            printf "\r[进度] images.tar %c 已写入：%s" "${spin:$i:1}" "$(human "$cur")"
-            last=$cur
-          else
-            printf "\r[进度] images.tar %c 写入中 ..." "${spin:$i:1}"
-          fi
-        else
-          printf "\r[进度] images.tar %c 准备中 ..." "${spin:$i:1}"
-        fi
-        i=$(((i + 1) % 4))
-        sleep 1
-      done
-    ) &
-    local spinner_pid=$!
-    if wait "$pid"; then
+    if run_with_file_progress "保存镜像 images.tar" "$outfile" 0 \
+      progress_capture_stdout "$outfile" "$@"; then
       rc=0
     else
       rc=$?
-    fi
-    kill "$spinner_pid" 2>/dev/null || true
-    wait "$spinner_pid" 2>/dev/null || true
-    cur=$(stat -c %s "$outfile" 2>/dev/null || stat -f%z "$outfile" 2>/dev/null || echo 0)
-    printf "\r%-80s\r" ""
-    if ((rc == 0)); then
-      echo "[进度] images.tar 完成：$(human "$cur")"
-    else
-      echo "[进度] images.tar 失败（已写入：$(human "$cur")）"
     fi
   fi
   return "$rc"
@@ -919,6 +1014,71 @@ umask 077
 BUNDLE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 META="${BUNDLE_DIR}/meta/__NAME__.inspect.json"
 
+dm_format_elapsed() {
+  local seconds="${1:-0}"
+  if ((seconds >= 60)); then
+    printf '%d 分 %d 秒' "$((seconds / 60))" "$((seconds % 60))"
+  else
+    printf '%d 秒' "$seconds"
+  fi
+}
+
+dm_progress_watch() {
+  local label="$1" started="$2" owner_pid="$3"
+  local interval elapsed
+  [[ "${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" != "plain" ]] || return 0
+  if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
+    interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
+  elif [[ -t 2 ]]; then
+    interval=1
+  else
+    interval=10
+  fi
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  while kill -0 "$owner_pid" 2>/dev/null; do
+    sleep "$interval"
+    kill -0 "$owner_pid" 2>/dev/null || break
+    elapsed=$((SECONDS - started))
+    if [[ -t 2 ]]; then
+      printf '\r%-120s\r[进度] %s：仍在执行，已用 %s；无需按键' \
+        "" "$label" "$(dm_format_elapsed "$elapsed")" >&2
+    else
+      printf '[进度] %s：仍在执行，已用 %s；无需按键\n' \
+        "$label" "$(dm_format_elapsed "$elapsed")" >&2
+    fi
+  done
+}
+
+dm_run_with_activity() {
+  local label="$1"
+  shift
+  local started=$SECONDS watcher_pid rc restore_errexit=0
+  case $- in *e*) restore_errexit=1 ;; esac
+  printf '[进度] %s：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键，请耐心等待。\n' \
+    "$label" >&2
+  dm_progress_watch "$label" "$started" "$$" &
+  watcher_pid=$!
+  set +e
+  "$@"
+  rc=$?
+  ((restore_errexit == 0)) || set -e
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  [[ ! -t 2 ]] || printf '\r%-120s\r' "" >&2
+  if ((rc == 0)); then
+    printf '[进度] %s：完成（耗时 %s）\n' "$label" "$(dm_format_elapsed "$((SECONDS - started))")" >&2
+  else
+    printf '[进度] %s：失败（耗时 %s）\n' "$label" "$(dm_format_elapsed "$((SECONDS - started))")" >&2
+  fi
+  return "$rc"
+}
+
+dm_capture_command() {
+  local output_file="$1"
+  shift
+  "$@" >"$output_file" 2>&1
+}
+
 if [[ ! -f "$META" ]]; then
   echo "[WARN] missing metadata: $META" >&2
   exit 1
@@ -1068,7 +1228,7 @@ trap replacement_exit_handler EXIT
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then
   echo "[INFO] image is not loaded; pull before changing any existing container: $image"
-  docker pull "$image" >/dev/null || {
+  dm_run_with_activity "拉取容器镜像：$image" docker pull "$image" || {
     echo "[WARN] image is unavailable; existing container was left unchanged: $image" >&2
     exit 1
   }
@@ -1109,7 +1269,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
       [[ "$existing_state" == "paused" ]] && docker unpause "$name" >/dev/null 2>&1 || true
       case "$existing_state" in
         running | restarting | paused)
-          docker stop "$name" >/dev/null 2>&1 || {
+          dm_run_with_activity "停止目标端旧容器：$name" docker stop "$name" >/dev/null || {
             echo "[WARN] failed to stop existing container; it was left unchanged: $name" >&2
             exit 1
           }
@@ -1421,10 +1581,13 @@ if ((${#cmd_args[@]})); then
 fi
 
 run_output=""
+run_log="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-run.XXXXXX")" || exit 1
 set +e
-run_output="$("${args[@]}" 2>&1)"
+dm_run_with_activity "创建并启动容器：$name" dm_capture_command "$run_log" "${args[@]}"
 run_rc=$?
 set -e
+run_output="$(cat "$run_log")"
+rm -f "$run_log"
 
 if [[ $run_rc -ne 0 ]]; then
   echo "[ERR] 容器创建或启动失败：$name" >&2
@@ -1487,10 +1650,23 @@ if [[ "$original_running" == "true" &&
     exit 1
   fi
   health_deadline=$((SECONDS + health_timeout))
+  health_started=$SECONDS
+  health_next_report=0
+  health_last_status=""
+  echo "[进度] 等待容器健康检查：$name（最长 ${health_timeout}s；脚本正在正常执行，无需按键）" >&2
   while ((SECONDS < health_deadline)); do
     health_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$name" 2>/dev/null || true)"
+    health_elapsed=$((SECONDS - health_started))
+    if [[ "$health_status" != "$health_last_status" ]] || ((health_elapsed >= health_next_report)); then
+      echo "[进度] 等待容器健康检查：$name（当前 ${health_status:-未知}，已等待 ${health_elapsed}/${health_timeout}s；无需按键）" >&2
+      health_last_status="$health_status"
+      health_next_report=$((health_elapsed + 5))
+    fi
     case "$health_status" in
-      healthy) break ;;
+      healthy)
+        echo "[进度] 容器健康检查通过：$name（耗时 ${health_elapsed}s）" >&2
+        break
+        ;;
       unhealthy | exited | dead)
         echo "[WARN] new container did not become healthy: $name ($health_status)" >&2
         exit 1
@@ -1509,6 +1685,8 @@ elif [[ "$original_running" == "true" ]]; then
     exit 1
   fi
   startup_deadline=$((SECONDS + startup_grace))
+  startup_started=$SECONDS
+  echo "[进度] 验证容器持续运行：$name（需要 ${startup_grace}s；无需按键）" >&2
   while :; do
     startup_status="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
     case "$startup_status" in
@@ -1521,6 +1699,7 @@ elif [[ "$original_running" == "true" ]]; then
     ((SECONDS >= startup_deadline)) && break
     sleep 1
   done
+  echo "[进度] 容器启动验证通过：$name（耗时 $((SECONDS - startup_started))s）" >&2
 fi
 
 if [[ "$original_paused" == "true" ]]; then
@@ -1569,6 +1748,114 @@ cd "$BUNDLE_DIR"
 
 say(){ echo -e "\033[1;34m$*\033[0m"; }
 warn(){ echo -e "\033[1;33m$*\033[0m"; }
+
+dm_format_elapsed() {
+  local seconds="${1:-0}"
+  if ((seconds >= 60)); then
+    printf '%d 分 %d 秒' "$((seconds / 60))" "$((seconds % 60))"
+  else
+    printf '%d 秒' "$seconds"
+  fi
+}
+
+dm_human() {
+  local bytes="${1:-0}" unit=0
+  local -a units=(B KB MB GB TB)
+  while ((bytes >= 1024 && unit < ${#units[@]} - 1)); do
+    bytes=$((bytes / 1024))
+    unit=$((unit + 1))
+  done
+  printf '%s%s' "$bytes" "${units[$unit]}"
+}
+
+dm_file_size() {
+  stat -c %s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
+}
+
+restore_load_images() {
+  local archive="$1" total
+  if command -v pv >/dev/null 2>&1; then
+    total="$(dm_file_size "$archive")"
+    pv -f -s "$total" "$archive" | docker load
+  else
+    docker load -i "$archive"
+  fi
+}
+
+dm_progress_watch() {
+  local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
+  local interval current elapsed percent message
+  [[ "${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" != "plain" ]] || return 0
+  if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
+    interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
+  elif [[ -t 2 ]]; then
+    interval=1
+  else
+    interval=10
+  fi
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  while kill -0 "$owner_pid" 2>/dev/null; do
+    sleep "$interval"
+    kill -0 "$owner_pid" 2>/dev/null || break
+    current=0
+    [[ -z "$file" ]] || current="$(dm_file_size "$file")"
+    elapsed=$((SECONDS - started))
+    if ((total > 0)); then
+      ((current <= total)) || current=$total
+      percent=$((current * 100 / total))
+      message="[进度] ${label}：${percent}%（$(dm_human "$current")/$(dm_human "$total")，已用 $(dm_format_elapsed "$elapsed")）"
+    elif ((current > 0)); then
+      message="[进度] ${label}：仍在执行，已处理 $(dm_human "$current")，已用 $(dm_format_elapsed "$elapsed")；无需按键"
+    else
+      message="[进度] ${label}：仍在执行，已用 $(dm_format_elapsed "$elapsed")；无需按键"
+    fi
+    if [[ -t 2 ]]; then
+      printf '\r%-120s\r%s' "" "$message" >&2
+    else
+      printf '%s\n' "$message" >&2
+    fi
+  done
+}
+
+dm_run_with_progress() {
+  local label="$1" file="$2" total="$3"
+  shift 3
+  local started=$SECONDS watcher_pid rc current=0 restore_errexit=0 suffix=""
+  case $- in *e*) restore_errexit=1 ;; esac
+  printf '[进度] %s：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键，请耐心等待。\n' \
+    "$label" >&2
+  dm_progress_watch "$label" "$file" "$total" "$started" "$$" &
+  watcher_pid=$!
+  set +e
+  "$@"
+  rc=$?
+  ((restore_errexit == 0)) || set -e
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  [[ ! -t 2 ]] || printf '\r%-120s\r' "" >&2
+  [[ -z "$file" ]] || current="$(dm_file_size "$file")"
+  ((current == 0)) || suffix="，已处理 $(dm_human "$current")"
+  if ((rc == 0)); then
+    printf '[进度] %s：完成（耗时 %s%s）\n' "$label" \
+      "$(dm_format_elapsed "$((SECONDS - started))")" "$suffix" >&2
+  else
+    printf '[进度] %s：失败（耗时 %s）\n' "$label" \
+      "$(dm_format_elapsed "$((SECONDS - started))")" >&2
+  fi
+  return "$rc"
+}
+
+dm_run_with_activity() {
+  local label="$1"
+  shift
+  dm_run_with_progress "$label" "" 0 "$@"
+}
+
+dm_run_with_file_progress() {
+  local label="$1" file="$2" total="${3:-0}"
+  shift 3
+  dm_run_with_progress "$label" "$file" "$total" "$@"
+}
 
 # Failure tracking
 FAILED_VOLUMES=()
@@ -1855,7 +2142,8 @@ compose_capture_rollback_images() {
       return 1
     fi
     image="docker-migrate-rollback:${id:0:12}-$$"
-    if ! docker commit "$id" "$image" >/dev/null; then
+    if ! dm_run_with_activity "创建 Compose 回滚镜像：$service" \
+      docker commit "$id" "$image" >/dev/null; then
       warn " · 目标端容器回滚镜像创建失败：$service"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
@@ -1951,7 +2239,8 @@ compose_source_state_records() {
 compose_wait_services() {
   local timeout="$1"
   shift
-  local deadline=$((SECONDS + timeout)) service id status all_ready service_found
+  local deadline=$((SECONDS + timeout)) started=$SECONDS next_report=0
+  local service id status all_ready service_found elapsed pending first_pending
   local -a compose_args=()
   while (($# > 0)) && [[ "$1" != -- ]]; do
     compose_args+=("$1")
@@ -1960,26 +2249,52 @@ compose_wait_services() {
   (($# == 0)) || shift
   local -a services=("$@")
 
+  echo "[进度] 等待 Compose 服务健康检查：${services[*]}（最长 ${timeout}s；脚本正在正常执行，无需按键）" >&2
+
   while ((SECONDS < deadline)); do
     all_ready=1
+    pending=0
+    first_pending=""
     for service in "${services[@]}"; do
       service_found=0
       while IFS= read -r id; do
         [[ -n "$id" ]] || {
           all_ready=0
+          pending=$((pending + 1))
+          [[ -n "$first_pending" ]] || first_pending="$service（尚未创建）"
           continue
         }
         service_found=1
         status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$id" 2>/dev/null || true)"
         case "$status" in
           healthy | running) ;;
-          unhealthy | exited | dead) return 1 ;;
-          *) all_ready=0 ;;
+          unhealthy | exited | dead)
+            warn "Compose 服务健康检查失败：$service（当前 $status）"
+            return 1
+            ;;
+          *)
+            all_ready=0
+            pending=$((pending + 1))
+            [[ -n "$first_pending" ]] || first_pending="$service（${status:-未知}）"
+            ;;
         esac
       done < <(compose_run "${compose_args[@]}" ps -q "$service")
-      ((service_found == 1)) || all_ready=0
+      if ((service_found == 0)); then
+        all_ready=0
+        pending=$((pending + 1))
+        [[ -n "$first_pending" ]] || first_pending="$service（未找到容器）"
+      fi
     done
-    ((all_ready == 0)) || return 0
+    if ((all_ready == 0)); then
+      elapsed=$((SECONDS - started))
+      if ((elapsed >= next_report)); then
+        echo "[进度] 等待 Compose 服务健康检查：${services[*]}（待就绪 ${pending} 个，首个 ${first_pending:-未知}，已等待 ${elapsed}/${timeout}s；无需按键）" >&2
+        next_report=$((elapsed + 5))
+      fi
+    else
+      echo "[进度] Compose 服务健康检查通过：${services[*]}（耗时 $((SECONDS - started))s）" >&2
+      return 0
+    fi
     sleep 1
   done
   return 1
@@ -1987,10 +2302,14 @@ compose_wait_services() {
 
 compose_wait_project_health() {
   local project="$1" timeout="$2"
-  local deadline=$((SECONDS + timeout)) id running health all_ready found
+  local deadline=$((SECONDS + timeout)) started=$SECONDS next_report=0
+  local id running health all_ready found elapsed pending first_pending
+  echo "[进度] 等待 Compose 项目健康检查：$project（最长 ${timeout}s；脚本正在正常执行，无需按键）" >&2
   while ((SECONDS < deadline)); do
     all_ready=1
     found=0
+    pending=0
+    first_pending=""
     while IFS= read -r id; do
       [[ -n "$id" ]] || continue
       found=1
@@ -1999,13 +2318,33 @@ compose_wait_project_health() {
       health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || true)"
       case "$health" in
         healthy | none) ;;
-        unhealthy) return 1 ;;
-        *) all_ready=0 ;;
+        unhealthy)
+          warn "Compose 项目健康检查失败：$project（容器 $id 当前 unhealthy）"
+          return 1
+          ;;
+        *)
+          all_ready=0
+          pending=$((pending + 1))
+          [[ -n "$first_pending" ]] || first_pending="容器 $id（${health:-未知}）"
+          ;;
       esac
     done < <(docker ps -a \
       --filter "label=com.docker.compose.project=${project}" --format '{{.ID}}')
-    ((found == 1)) || all_ready=0
-    ((all_ready == 0)) || return 0
+    if ((found == 0)); then
+      all_ready=0
+      pending=1
+      first_pending="尚未找到项目容器"
+    fi
+    if ((all_ready == 0)); then
+      elapsed=$((SECONDS - started))
+      if ((elapsed >= next_report)); then
+        echo "[进度] 等待 Compose 项目健康检查：$project（待就绪 ${pending} 个，首个 ${first_pending:-未知}，已等待 ${elapsed}/${timeout}s；无需按键）" >&2
+        next_report=$((elapsed + 5))
+      fi
+    else
+      echo "[进度] Compose 项目健康检查通过：$project（耗时 $((SECONDS - started))s）" >&2
+      return 0
+    fi
     sleep 1
   done
   return 1
@@ -2789,11 +3128,11 @@ transaction_restore_container_state() {
   local name="$1" state="$2"
   case "$state" in
     running | restarting)
-      docker start "$name" >/dev/null 2>&1 || return 1
+      dm_run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
       [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]]
       ;;
     paused)
-      docker start "$name" >/dev/null 2>&1 || return 1
+      dm_run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
       docker pause "$name" >/dev/null 2>&1
       ;;
   esac
@@ -2805,7 +3144,9 @@ transaction_quiesce_container() {
   state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
   [[ "$state" != "paused" ]] || docker unpause "$name" >/dev/null 2>&1 || return 1
   case "$state" in
-    running | restarting | paused) docker stop "$name" >/dev/null 2>&1 ;;
+    running | restarting | paused)
+      dm_run_with_activity "停止目标端容器：$name" docker stop "$name" >/dev/null
+      ;;
     *) return 0 ;;
   esac
 }
@@ -3084,22 +3425,29 @@ transaction_rollback() {
   if [[ -f "${RESTORE_TRANSACTION_DIR}/shared.tsv" ]]; then
     while IFS=$'\t' read -r name state; do
       [[ -n "$name" ]] || continue
-      transaction_quiesce_container "$name" >/dev/null 2>&1 || true
+      transaction_quiesce_container "$name" >/dev/null || true
     done <"${RESTORE_TRANSACTION_DIR}/shared.tsv"
   fi
 
-  transaction_remove_new_services || services_quiet=0
+  dm_run_with_activity "自动回滚：停止并移除本次新服务" \
+    transaction_remove_new_services || services_quiet=0
   if ((services_quiet == 1)); then
     # 目标文件最后写入、但可能位于已替换 bind 内；严格按修改逆序回滚，
     # 先撤销单文件覆盖，再整体换回 bind，最后恢复 volume。
-    transaction_restore_files || data_ok=0
-    transaction_restore_binds || data_ok=0
-    transaction_restore_volumes || data_ok=0
+    dm_run_with_activity "自动回滚：恢复被替换的配置文件" \
+      transaction_restore_files || data_ok=0
+    dm_run_with_activity "自动回滚：恢复绑定目录数据" \
+      transaction_restore_binds || data_ok=0
+    dm_run_with_activity "自动回滚：恢复命名卷数据" \
+      transaction_restore_volumes || data_ok=0
     ((data_ok == 1)) || rc=1
 
+    say "[进度] 自动回滚：恢复旧 Compose 项目"
     transaction_restore_compose "$data_ok" || rc=1
+    say "[进度] 自动回滚：恢复旧独立容器"
     transaction_restore_standalones "$data_ok" || rc=1
     if ((data_ok == 1)); then
+      say "[进度] 自动回滚：恢复共享挂载写入者"
       transaction_restore_shared || rc=1
     else
       warn "数据回滚不完整，旧服务与共享写入者保持停止，请按回滚目录人工处理。"
@@ -3413,11 +3761,13 @@ transaction_commit() {
   RESTORE_STAGE="提交与清理回滚点"
   RESTORE_COMMIT_STARTED=1
   TRANSACTION_ACTIVE=0
-  if ! transaction_cleanup_artifacts; then
+  if ! dm_run_with_activity "提交事务：清理旧容器、镜像和数据回滚点" \
+    transaction_cleanup_artifacts; then
     warn "服务与数据已恢复，但部分旧回滚资料清理失败：$RESTORE_TRANSACTION_DIR"
     return 1
   fi
-  if ! rm -rf "$RESTORE_TRANSACTION_DIR"; then
+  if ! dm_run_with_activity "提交事务：删除临时事务目录" \
+    rm -rf "$RESTORE_TRANSACTION_DIR"; then
     warn "服务与数据已恢复，但事务目录清理失败：$RESTORE_TRANSACTION_DIR"
     return 1
   fi
@@ -3437,7 +3787,7 @@ if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" == "1" ]]; then
   :
 elif [[ -f checksums.sha256 ]]; then
   say "[0] 验证迁移包完整性"
-  if ! restore_verify_checksums; then
+  if ! dm_run_with_activity "校验迁移包内全部文件" restore_verify_checksums; then
     warn "迁移包完整性校验失败，拒绝恢复。"
     exit 1
   fi
@@ -3455,7 +3805,8 @@ fi
 RESTORE_STAGE="加载镜像"
 say "[A] 加载镜像（如 images.tar 存在）"
 if [[ -f images.tar ]]; then
-  docker load -i images.tar || warn "部分镜像加载失败，将尝试在线拉取"
+  dm_run_with_activity "加载镜像归档 images.tar" restore_load_images images.tar || \
+    warn "部分镜像加载失败，将尝试在线拉取"
 else
   warn "images.tar 不存在，将按需在线拉取镜像。"
 fi
@@ -3464,7 +3815,7 @@ RESTORE_STAGE="建立统一回滚事务"
 say "[A.1] 建立目标端服务与数据统一回滚事务"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
-  docker pull alpine:3.20 >/dev/null 2>&1 || {
+  dm_run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 || {
     warn "无法准备 alpine:3.20；为避免在无回滚能力时修改数据，恢复终止。"
     exit 1
   }
@@ -3483,7 +3834,8 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       FAILED_VOLUMES+=("$vname")
       continue
     fi
-    if ! archive_members_safe "volumes/$file"; then
+    if ! dm_run_with_activity "检查命名卷归档：$vname" \
+      archive_members_safe "volumes/$file"; then
       warn " 命名卷归档结构异常：$vname"
       FAILED_VOLUMES+=("$vname")
       continue
@@ -3517,7 +3869,8 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
         continue
       fi
     fi
-    if ! restore_volume_exact "$vname" "$PWD/volumes" "$file" \
+    if ! dm_run_with_activity "回灌命名卷：$vname" \
+      restore_volume_exact "$vname" "$PWD/volumes" "$file" \
       "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed"; then
       warn " 恢复卷 ${vname} 失败，跳过"
       FAILED_VOLUMES+=("$vname")
@@ -3538,13 +3891,15 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
       continue
     fi
     bind_prefix="${host#/}"
-    if ! archive_members_safe "binds/$file" "$bind_prefix"; then
+    if ! dm_run_with_activity "检查绑定目录归档：$host" \
+      archive_members_safe "binds/$file" "$bind_prefix"; then
       warn " 绑定目录归档结构异常：$host"
       FAILED_BINDS+=("$host")
       continue
     fi
     echo " - ${host}"
-    if ! restore_bind_exact "$host" "$PWD/binds/${file}"; then
+    if ! dm_run_with_activity "回灌绑定目录：$host" \
+      restore_bind_exact "$host" "$PWD/binds/${file}"; then
       warn " 无法恢复绑定目录：$host（可能需要 root 权限）"
       FAILED_BINDS+=("$host")
     fi
@@ -3884,7 +4239,8 @@ restore_main() {
   BLUE "[INFO] 文件大小：$(du -h "$DOWNLOAD_FILE" | awk '{print $1}')"
   if [[ -n "$EXPECTED_SHA256" ]]; then
     BLUE "[INFO] 验证下载包的外部 SHA-256 摘要 ..."
-    if ! verify_archive_sha256 "$DOWNLOAD_FILE" "$EXPECTED_SHA256"; then
+    if ! run_with_activity "校验下载包 SHA-256" \
+      verify_archive_sha256 "$DOWNLOAD_FILE" "$EXPECTED_SHA256"; then
       RED "[ERR] 下载包与源服务器提供的 SHA-256 摘要不一致，拒绝解压。"
       exit 1
     fi
@@ -3896,13 +4252,16 @@ restore_main() {
     ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
     MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
     BLUE "[INFO] 验证加密迁移包 HMAC ..."
-    if ! verify_bundle_hmac "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" "$ENCRYPTION_MAC"; then
+    if ! run_with_activity "验证加密迁移包 HMAC" verify_bundle_hmac \
+      "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" "$ENCRYPTION_MAC"; then
       RED "[ERR] 加密迁移包认证失败，文件可能被篡改或链接密钥不正确。"
       exit 1
     fi
     OK "[OK] 加密迁移包认证通过"
     BLUE "[INFO] 正在解密迁移包 ..."
-    if ! bundle_decrypt_file "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
+    if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
+      "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
+      "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
       rm -f "$TGZ"
       RED "[ERR] 迁移包解密失败。"
       exit 1
@@ -3912,14 +4271,14 @@ restore_main() {
     MAC_KEY=""
     OK "[OK] 迁移包解密完成"
   fi
-  if ! archive_layout_is_safe "$TGZ"; then
+  if ! run_with_activity "扫描迁移包目录结构" archive_layout_is_safe "$TGZ"; then
     RED "[ERR] 迁移包结构不安全或已损坏，拒绝解压。"
     exit 1
   fi
   BLUE "[INFO] 解压到：$OUTDIR"
   mkdir -p "$OUTDIR"
   BLUE "[INFO] 正在解压压缩包（根据文件大小可能需要一段时间，请不要中断）..."
-  if ! tar -xzf "$TGZ" -C "$OUTDIR"; then
+  if ! run_with_activity "解压迁移包" tar -xzf "$TGZ" -C "$OUTDIR"; then
     RED "[ERR] 解压失败，请检查磁盘空间或确认文件是否完整。"
     exit 1
   fi
@@ -3935,7 +4294,8 @@ restore_main() {
   fi
   if [[ -f "${BUNDLE_DIR}/checksums.sha256" ]]; then
     BLUE "[INFO] 验证迁移包完整性 ..."
-    if ! verify_bundle_checksums "$BUNDLE_DIR"; then
+    if ! run_with_activity "校验迁移包内全部文件" \
+      verify_bundle_checksums "$BUNDLE_DIR"; then
       RED "[ERR] 完整性校验未通过，拒绝恢复。"
       exit 1
     fi
@@ -3991,7 +4351,7 @@ restore_main() {
     if [[ "${RESTORE_KEEP:-0}" == "1" ]]; then
       cleanup_line="恢复文件已按 RESTORE_KEEP=1 保留：$SESSION_DIR"
     else
-      if rm -rf "$SESSION_DIR" 2>/dev/null; then
+      if run_with_activity "清理恢复临时文件" rm -rf "$SESSION_DIR"; then
         cleanup_line="下载文件与临时目录已删除"
       else
         cleanup_line="恢复成功，但部分下载文件或临时目录未能删除，请人工检查"
@@ -4000,7 +4360,7 @@ restore_main() {
     fi
   else
     if [[ "${RESTORE_CLEAN_ALL:-0}" == "1" ]]; then
-      if rm -rf "$SESSION_DIR" 2>/dev/null; then
+      if run_with_activity "清理恢复临时文件" rm -rf "$SESSION_DIR"; then
         cleanup_line="已按 RESTORE_CLEAN_ALL=1 删除下载文件与临时目录"
       else
         cleanup_line="RESTORE_CLEAN_ALL=1 清理未完成，请人工检查"
@@ -4263,7 +4623,7 @@ restart_source_containers() {
   local -a remaining=()
   for record in "${STOPPED_ON_BACKUP[@]}"; do
     IFS=$'\t' read -r n original_state <<<"$record"
-    printf " [恢复源状态] %s (%s) ... " "$n" "$original_state"
+    printf " [恢复源状态] %s (%s)\n" "$n" "$original_state"
     current_state="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo missing)"
     restore_ok=1
     case "$original_state" in
@@ -4271,7 +4631,10 @@ restart_source_containers() {
         if [[ "$current_state" != "paused" ]]; then
           case "$current_state" in
             running | restarting) ;;
-            *) run_with_timeout 60 docker start "$n" >/dev/null 2>&1 || restore_ok=0 ;;
+            *)
+              run_with_activity "启动源容器：$n" \
+                run_with_timeout 60 docker start "$n" >/dev/null || restore_ok=0
+              ;;
           esac
           ((restore_ok == 0)) || docker pause "$n" >/dev/null 2>&1 || restore_ok=0
         fi
@@ -4280,15 +4643,18 @@ restart_source_containers() {
         case "$current_state" in
           running | restarting) ;;
           paused) docker unpause "$n" >/dev/null 2>&1 || restore_ok=0 ;;
-          *) run_with_timeout 60 docker start "$n" >/dev/null 2>&1 || restore_ok=0 ;;
+          *)
+            run_with_activity "启动源容器：$n" \
+              run_with_timeout 60 docker start "$n" >/dev/null || restore_ok=0
+            ;;
         esac
         ;;
     esac
     if ((restore_ok == 1)); then
-      printf "ok\n"
+      printf " [恢复源状态] %s：ok\n" "$n"
       ok=$((ok + 1))
     else
-      printf "fail\n"
+      printf " [恢复源状态] %s：fail\n" "$n"
       fail=$((fail + 1))
       remaining+=("$record")
     fi
@@ -4317,7 +4683,7 @@ graceful_exit() {
   # 由仍待恢复的 write-ahead 记录推导结果，避免信号落在两次账本赋值之间
   # 时出现重复计数或明明已恢复却少计数。
   SOURCE_RESTORED_COUNT=$((SOURCE_RESTORE_EXPECTED - ${#STOPPED_ON_BACKUP[@]}))
-  if ! hard_clean; then
+  if ! run_with_activity "清理源端临时文件与快照" hard_clean; then
     ((rc != 0)) || rc=1
   fi
   if [[ "$LOCK_METHOD" == "flock" ]]; then
@@ -4414,10 +4780,15 @@ else
   declare -a PANEL_CONTAINERS=()
   declare -A PANEL_WARN_OF=()
 
+  scan_total=${#PS_LINES[@]}
+  scan_index=0
+  BLUE "[INFO] 正在识别容器与 Compose 分组（共 ${scan_total} 个）..."
   for line in "${PS_LINES[@]}"; do
+    scan_index=$((scan_index + 1))
     id="${line%% *}"
     cname="${line#* }"
     [[ -z "$cname" || "$cname" == "$id" ]] && cname="$id"
+    progress_count "识别容器分组" "$scan_index" "$scan_total" "$cname"
     NAME_OF_ID["$id"]="$cname"
 
     j="$(docker inspect "$id")"
@@ -4596,7 +4967,11 @@ declare -A SELECTED_COMPOSE_COUNT=()
 declare -A COMPOSE_SERVICE_COUNT=()
 
 # 关键修复：重新按最终选择的容器统计 compose 分组数量，避免菜单阶段归类为单容器，元数据阶段又被重新归为 compose。
+metadata_total=${#IDS[@]}
+metadata_index=0
 for id in "${IDS[@]}"; do
+  metadata_index=$((metadata_index + 1))
+  progress_count "分析所选容器" "$metadata_index" "$metadata_total" "$id"
   jtmp="$(docker inspect "$id")"
   projtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$jtmp")
   wdirtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$jtmp")
@@ -4620,9 +4995,12 @@ for id in "${IDS[@]}"; do
   fi
 done
 
+metadata_index=0
 for id in "${IDS[@]}"; do
+  metadata_index=$((metadata_index + 1))
   j="$(docker inspect "$id")"
   name=$(jq -r '.[0].Name | ltrimstr("/")' <<<"$j")
+  progress_count "采集容器元数据" "$metadata_index" "$metadata_total" "$name"
   img=$(jq -r '.[0].Config.Image' <<<"$j")
   CONTAINER_NAME["$id"]="$name"
   IMGSET["$img"]=1
@@ -4699,9 +5077,13 @@ done
 #####################################
 if ((${#COMPOSE_GROUP[@]})); then
   BLUE "[INFO] 打包 docker compose 项目配置 ..."
+  compose_total=${#COMPOSE_GROUP[@]}
+  compose_index=0
   for key in "${!COMPOSE_GROUP[@]}"; do
+    compose_index=$((compose_index + 1))
     proj="${key%%|*}"
     wdir="${key#*|}"
+    progress_count "采集 Compose 配置" "$compose_index" "$compose_total" "$proj"
     dest="${BUNDLE}/compose/${proj}"
     mkdir -p "$dest"
     cfgs="${COMPOSE_CFGS[$key]:-}"
@@ -4738,6 +5120,7 @@ if ((${#COMPOSE_GROUP[@]})); then
     # 使用全部 -f 文件生成规范配置，合并覆盖文件并解析 env_file。
     if ((${#CFG_SOURCE_ARGS[@]} > 0)); then
       resolved_tmp="${dest}/.resolved_config.yml.tmp"
+      BLUE "[INFO] 解析 Compose 配置：$proj（复杂项目可能需要一段时间，无需按键）..."
       if docker compose version >/dev/null 2>&1 &&
         { docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>/dev/null ||
           docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>/dev/null; }; then
@@ -4779,13 +5162,17 @@ fi
 # 预拉取卷操作镜像，避免把下载时间计入后面的停机快照窗口
 #####################################
 BLUE "[INFO] 预拉取 alpine:3.20 镜像（用于卷操作）..."
-docker pull alpine:3.20 >/dev/null 2>&1 || YEL "[WARN] 无法拉取 alpine:3.20，卷操作可能失败"
+run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 ||
+  YEL "[WARN] 无法拉取 alpine:3.20，卷操作可能失败"
 
 #####################################
 # 检查未选中容器是否仍在写共享挂载
 #####################################
 declare -a SHARED_MOUNT_ROWS=()
-mapfile -t SHARED_MOUNT_ROWS < <(collect_shared_running_containers "${IDS[@]}")
+mapfile -t SHARED_MOUNT_ROWS < <(
+  run_with_activity "检查未选中容器的共享挂载写入" \
+    collect_shared_running_containers "${IDS[@]}"
+)
 if ((${#SHARED_MOUNT_ROWS[@]} > 0)); then
   YEL "[WARN] 检测到未选中的运行容器正在使用相同 volume 或重叠 bind 路径："
   for shared_row in "${SHARED_MOUNT_ROWS[@]}"; do
@@ -4816,15 +5203,13 @@ if ((${#SHARED_MOUNT_ROWS[@]} > 0)); then
   for shared_row in "${SHARED_MOUNT_ROWS[@]}"; do
     IFS=$'\t' read -r _ shared_name _ <<<"$shared_row"
     shared_state="$(docker inspect -f '{{.State.Status}}' "$shared_name" 2>/dev/null || echo running)"
-    printf "[停机-共享挂载] %s ... " "$shared_name"
+    printf "[停机-共享挂载] %s\n" "$shared_name"
     # Write-ahead：在 unpause/stop 前登记原状态；信号可在任意指令后安全恢复。
     STOPPED_ON_BACKUP+=("${shared_name}"$'\t'"${shared_state}")
     [[ "$shared_state" != "paused" ]] || docker unpause "$shared_name" >/dev/null 2>&1 || true
-    if docker stop "$shared_name" >/dev/null 2>&1; then
-      printf "ok\n"
-    else
+    if ! run_with_activity "停止共享挂载容器：$shared_name" \
+      docker stop "$shared_name" >/dev/null; then
       [[ "$shared_state" != "paused" ]] || docker pause "$shared_name" >/dev/null 2>&1 || true
-      printf "fail\n"
       BACKUP_FAILURES+=("无法停止共享挂载容器：$shared_name")
     fi
   done
@@ -4854,15 +5239,12 @@ else
         continue
       fi
       source_state="$(docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || echo running)"
-      printf "[停机] (%d/%d) %s ..." "$idx" "$total_count" "$n"
+      printf "[停机] (%d/%d) %s\n" "$idx" "$total_count" "$n"
       # Write-ahead：先登记再改变源容器状态，避免 TERM 落在 stop 与数组追加之间。
       STOPPED_ON_BACKUP+=("${n}"$'\t'"${source_state}")
       [[ "$source_state" != "paused" ]] || docker unpause "$n" >/dev/null 2>&1 || true
-      if docker stop "$n" >/dev/null 2>&1; then
-        printf " ok\n"
-      else
+      if ! run_with_activity "停止源容器：$n" docker stop "$n" >/dev/null; then
         [[ "$source_state" != "paused" ]] || docker pause "$n" >/dev/null 2>&1 || true
-        printf " fail\n"
         BACKUP_FAILURES+=("无法停止正在运行的容器：$n")
       fi
     done
@@ -4898,9 +5280,9 @@ for id in "${IDS[@]}"; do
   snapshot_index=$((snapshot_index + 1))
   n="${CONTAINER_NAME[$id]}"
   snapshot_image="$(snapshot_image_ref "$RID" "$id")"
-  printf " [SNAPSHOT] (%d/%d) %s ... " "$snapshot_index" "$snapshot_total" "$n"
-  if ! snapshot_container_image "$id" "${BUNDLE}/meta/${n}.inspect.json" "$snapshot_image"; then
-    printf "fail\n"
+  printf " [SNAPSHOT] (%d/%d) %s\n" "$snapshot_index" "$snapshot_total" "$n"
+  if ! run_with_activity "创建容器可写层快照：$n" \
+    snapshot_container_image "$id" "${BUNDLE}/meta/${n}.inspect.json" "$snapshot_image"; then
     BACKUP_FAILURES+=("容器可写层快照失败：$n")
     continue
   fi
@@ -4912,12 +5294,11 @@ for id in "${IDS[@]}"; do
     compose_service="$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // empty' <<<"$j")"
     if ! write_compose_snapshot_override \
       "${BUNDLE}/compose/${proj}/_migration_images.yml" "$compose_service" "$snapshot_image"; then
-      printf "fail\n"
+      YEL " [WARN] Compose 快照覆盖配置生成失败：$n"
       BACKUP_FAILURES+=("Compose 快照覆盖配置生成失败：$n")
       continue
     fi
   fi
-  printf "ok\n"
 done
 if ((${#BACKUP_FAILURES[@]} > 0)); then
   RED "[ERR] 可写层快照不完整，已取消备份。"
@@ -4964,14 +5345,14 @@ for id in "${IDS[@]}"; do
         printf " [VOL] (%d/%d) %s :: %s -> %s\n" "$v_idx" "$vol_count" "$n" "$vname" "$dest"
         mkdir -p "${BUNDLE}/volumes"
         out="${BUNDLE}/volumes/vol_${vname}.tgz"
-        docker run --rm \
+        if ! run_with_file_progress "打包命名卷：$vname" "$out" 0 docker run --rm \
           -v "${vname}:/from:ro" \
           -v "${BUNDLE}/volumes:/to" \
-          alpine:3.20 sh -c "cd /from && tar -czf /to/$(basename "$out") ." || {
+          alpine:3.20 sh -c "cd /from && tar -czf /to/$(basename "$out") ."; then
           YEL " [WARN] 打包卷失败：$vname"
           BACKUP_FAILURES+=("命名卷备份失败：$vname")
           continue
-        }
+        fi
         MAN_VOL+=("$(jq -cn --arg name "$vname" --arg dest "$dest" --arg driver "$v_driver" --argjson opts "$v_opts_json" '{name:$name,dest:$dest,driver:$driver,opts:$opts}')")
         ;;
       bind)
@@ -4991,7 +5372,8 @@ for id in "${IDS[@]}"; do
         out="${BUNDLE}/binds/bind_${esc}_${src_id}.tgz"
         printf " [BIND] (%d/%d) %s :: %s -> %s\n" "$b_idx" "$bind_count" "$n" "$src" "$dest"
         mkdir -p "${BUNDLE}/binds"
-        if ! tar -C / -czf "$out" "${src#/}" 2>/dev/null; then
+        if ! run_with_file_progress "打包绑定目录：$src" "$out" 0 \
+          tar -C / -czf "$out" "${src#/}"; then
           YEL " [WARN] 跳过不可读路径：$src"
           BACKUP_FAILURES+=("绑定目录备份失败：$src")
           continue
@@ -5166,7 +5548,7 @@ README
 
 generate_manifest_and_restore
 BLUE "[INFO] 生成迁移包完整性校验 ..."
-generate_bundle_checksums "$BUNDLE"
+run_with_activity "计算迁移包内文件校验值" generate_bundle_checksums "$BUNDLE"
 
 #####################################
 # 打包成单文件 tar.gz
@@ -5174,10 +5556,8 @@ generate_bundle_checksums "$BUNDLE"
 BUNDLE_BASENAME="docker_migrate_${STAMP}_${RID}"
 SINGLE_TAR_PATH="${BUNDLE_ROOT}/${BUNDLE_BASENAME}.tar.gz"
 BLUE "[INFO] 打包一键迁移包：${SINGLE_TAR_PATH}"
-(
-  cd "$BUNDLE_ROOT"
-  tar -czf "${BUNDLE_BASENAME}.tar.gz" "$RID"
-)
+run_with_file_progress "压缩一键迁移包" "$SINGLE_TAR_PATH" 0 \
+  tar -C "$BUNDLE_ROOT" -czf "$SINGLE_TAR_PATH" "$RID"
 OK "[OK] 一键迁移包已生成，大小：$(du -h "$SINGLE_TAR_PATH" | awk '{print $1}')"
 BUNDLE_SECRET="$(openssl rand -hex 64)" || {
   RED "[ERR] 无法生成迁移包加密密钥。"
@@ -5195,16 +5575,19 @@ BUNDLE_ENCRYPTION_KEY="$(bundle_secret_encryption_key "$BUNDLE_SECRET")"
 BUNDLE_MAC_KEY="$(bundle_secret_mac_key "$BUNDLE_SECRET")"
 ENCRYPTED_TAR_PATH="${SINGLE_TAR_PATH}.enc"
 BLUE "[INFO] 加密迁移包（AES-256-CTR + HMAC-SHA256）..."
-if ! bundle_encrypt_file "$SINGLE_TAR_PATH" "$ENCRYPTED_TAR_PATH" \
+if ! run_with_file_progress "加密迁移包" "${ENCRYPTED_TAR_PATH}.partial.$$" \
+  "$(progress_file_size "$SINGLE_TAR_PATH")" bundle_encrypt_file \
+  "$SINGLE_TAR_PATH" "$ENCRYPTED_TAR_PATH" \
   "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_IV"; then
   RED "[ERR] 迁移包加密失败，拒绝启动明文下载服务。"
   exit 1
 fi
-BUNDLE_HMAC="$(bundle_hmac_sha256_file "$ENCRYPTED_TAR_PATH" "$BUNDLE_MAC_KEY" "$BUNDLE_IV")" || {
+BUNDLE_HMAC="$(run_with_activity "计算加密包 HMAC" bundle_hmac_sha256_file \
+  "$ENCRYPTED_TAR_PATH" "$BUNDLE_MAC_KEY" "$BUNDLE_IV")" || {
   RED "[ERR] 无法计算加密迁移包 HMAC。"
   exit 1
 }
-BUNDLE_SHA256="$(sha256_file "$ENCRYPTED_TAR_PATH")" || {
+BUNDLE_SHA256="$(run_with_activity "计算加密包 SHA-256" sha256_file "$ENCRYPTED_TAR_PATH")" || {
   RED "[ERR] 无法计算加密迁移包 SHA-256。"
   exit 1
 }
