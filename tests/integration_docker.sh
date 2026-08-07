@@ -63,6 +63,12 @@ cleanup() {
   docker volume rm "$data_volume_name" >/dev/null 2>&1 || true
   docker volume rm "$compose_data_volume_name" >/dev/null 2>&1 || true
   docker volume rm "$standalone_tx_volume_name" >/dev/null 2>&1 || true
+  # 恢复流程会以 root 精确保留文件权限；CI runner 是普通用户，先在一次性
+  # 容器内放宽这个测试专用临时树，避免功能测试通过后仅因清理权限而失败。
+  if [[ -d "$tmp" ]]; then
+    docker run --rm -v "${tmp}:/cleanup" alpine:3.20 \
+      chmod -R a+rwX /cleanup >/dev/null 2>&1 || true
+  fi
   rm -rf "$tmp"
 }
 trap cleanup EXIT

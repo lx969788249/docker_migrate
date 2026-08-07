@@ -31,6 +31,10 @@ cleanup() {
   docker rm -f "$paused_shared_name" >/dev/null 2>&1 || true
   docker network rm "$network_name" >/dev/null 2>&1 || true
   docker volume rm "$volume_name" >/dev/null 2>&1 || true
+  if [[ -d "$tmp" ]]; then
+    docker run --rm -v "${tmp}:/cleanup" alpine:3.20 \
+      chmod -R a+rwX /cleanup >/dev/null 2>&1 || true
+  fi
   rm -rf "$tmp"
 }
 trap cleanup EXIT
