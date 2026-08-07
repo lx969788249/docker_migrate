@@ -54,6 +54,10 @@ test_checksums_detect_tampering() {
   verify_bundle_checksums "${tmp}/bundle" >/dev/null
   printf 'tampered\n' >>"${tmp}/bundle/meta/demo.json"
   ! verify_bundle_checksums "${tmp}/bundle" >/dev/null 2>&1
+
+  printf 'metadata\n' >"${tmp}/bundle/meta/demo.json"
+  printf 'unlisted\n' >"${tmp}/bundle/meta/unlisted.json"
+  ! verify_bundle_checksums "${tmp}/bundle" >/dev/null 2>&1
 }
 
 test_archive_layout_rejects_symlinks() {
@@ -89,11 +93,56 @@ YAML
   [[ "${actual[*]}" == "${expected[*]}" ]]
 }
 
+test_external_bundle_digest() {
+  local tmp digest url
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  printf 'trusted bundle\n' >"${tmp}/bundle.tar.gz"
+  digest="$(sha256_file "${tmp}/bundle.tar.gz")"
+  url="http://192.0.2.1/token/bundle.tar.gz#sha256=${digest}"
+
+  [[ "$(bundle_download_url "$url")" == "http://192.0.2.1/token/bundle.tar.gz" ]]
+  [[ "$(bundle_expected_sha256 "$url")" == "$digest" ]]
+  valid_sha256 "$digest"
+  verify_archive_sha256 "${tmp}/bundle.tar.gz" "$digest"
+
+  printf 'tampered\n' >>"${tmp}/bundle.tar.gz"
+  ! verify_archive_sha256 "${tmp}/bundle.tar.gz" "$digest"
+  ! valid_sha256 not-a-digest
+}
+
+test_mount_path_overlap_detection() {
+  mount_paths_overlap /srv/data /srv/data
+  mount_paths_overlap /srv/data /srv/data/cache
+  mount_paths_overlap /srv/data/cache /srv/data
+  mount_paths_overlap / /var/lib/docker
+  ! mount_paths_overlap /srv/data /srv/database
+  ! mount_paths_overlap /opt/app /opt/app2
+}
+
+test_manifest_rejects_unsafe_run_paths() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bundle/runs"
+  printf '#!/usr/bin/env bash\n' >"${tmp}/bundle/runs/safe.sh"
+  jq -n '{images:[],networks:[],projects:[],volumes:[],binds:[],runs:["runs/safe.sh"]}' \
+    >"${tmp}/bundle/manifest.json"
+  bundle_manifest_is_safe "${tmp}/bundle"
+
+  jq -n '{images:[],networks:[],projects:[],volumes:[],binds:[],runs:["../evil.sh"]}' \
+    >"${tmp}/bundle/manifest.json"
+  ! bundle_manifest_is_safe "${tmp}/bundle"
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "generated restore scripts parse as Bash" test_generated_scripts_are_valid_bash
 run_test "bundle checksum detects tampering" test_checksums_detect_tampering
 run_test "top-level archive rejects symlinks" test_archive_layout_rejects_symlinks
 run_test "Compose env_file parser handles scalar/list/long syntax" test_compose_env_file_parser
+run_test "external bundle digest pins the downloaded archive" test_external_bundle_digest
+run_test "bind mount overlap detection respects path boundaries" test_mount_path_overlap_detection
+run_test "manifest rejects executable paths outside runs" test_manifest_rejects_unsafe_run_paths
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

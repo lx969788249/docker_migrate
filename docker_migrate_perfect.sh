@@ -43,6 +43,7 @@ declare -a IDS=()
 declare -a RUNS=()
 declare -a STOPPED_ON_BACKUP=()
 declare -a BACKUP_FAILURES=()
+declare -a TEMP_IMAGES=()
 
 #####################################
 # 基础函数 & 依赖管理
@@ -375,6 +376,65 @@ compose_env_file_refs() {
   ' "$1"
 }
 
+mount_paths_overlap() {
+  local left="$1" right="$2"
+  [[ "$left" == "/" ]] || left="${left%/}"
+  [[ "$right" == "/" ]] || right="${right%/}"
+  [[ "$left" != "/" && "$right" != "/" ]] || return 0
+  [[ "$left" == "$right" || "$left" == "${right}/"* || "$right" == "${left}/"* ]]
+}
+
+collect_shared_running_containers() {
+  local selected_id selected_full_id id name inspect mount type source selected_path reason
+  declare -A selected_ids=() selected_volumes=()
+  local -a selected_binds=()
+
+  for selected_id in "$@"; do
+    selected_ids["$selected_id"]=1
+    inspect="$(docker inspect "$selected_id")" || return 1
+    selected_full_id="$(jq -r '.[0].Id' <<<"$inspect")"
+    selected_ids["$selected_full_id"]=1
+    selected_ids["${selected_full_id:0:12}"]=1
+    while IFS= read -r source; do
+      [[ -n "$source" ]] && selected_volumes["$source"]=1
+    done < <(jq -r '.[0].Mounts[]? | select(.Type == "volume") | .Name' <<<"$inspect")
+    while IFS= read -r source; do
+      [[ -n "$source" ]] && selected_binds+=("$source")
+    done < <(jq -r '.[0].Mounts[]? | select(.Type == "bind") | .Source' <<<"$inspect")
+  done
+
+  while IFS=$'\t' read -r id name; do
+    [[ -n "$id" && -z "${selected_ids[$id]:-}" ]] || continue
+    case ",${DOCKER_MIGRATE_IGNORE_CONTAINERS:-}," in
+      *,"$name",*) continue ;;
+    esac
+    inspect="$(docker inspect "$id")" || return 1
+    reason=""
+    while IFS= read -r mount; do
+      type="$(jq -r '.Type' <<<"$mount")"
+      case "$type" in
+        volume)
+          source="$(jq -r '.Name' <<<"$mount")"
+          if [[ -n "${selected_volumes[$source]:-}" ]]; then
+            reason="volume:${source}"
+            break
+          fi
+          ;;
+        bind)
+          source="$(jq -r '.Source' <<<"$mount")"
+          for selected_path in "${selected_binds[@]}"; do
+            if mount_paths_overlap "$source" "$selected_path"; then
+              reason="bind:${source}"
+              break 2
+            fi
+          done
+          ;;
+      esac
+    done < <(jq -c '.[0].Mounts[]?' <<<"$inspect")
+    [[ -z "$reason" ]] || printf '%s\t%s\t%s\n' "$id" "$name" "$reason"
+  done < <(docker ps --format '{{.ID}}\t{{.Names}}')
+}
+
 sha256_file() {
   local file="$1"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -388,6 +448,85 @@ sha256_file() {
   fi
 }
 
+bundle_download_url() {
+  printf '%s\n' "${1%%#*}"
+}
+
+bundle_expected_sha256() {
+  local url="$1" fragment
+  case "$url" in
+    *#sha256=*)
+      fragment="${url#*#sha256=}"
+      printf '%s\n' "${fragment%%&*}"
+      ;;
+    *) printf '\n' ;;
+  esac
+}
+
+valid_sha256() {
+  [[ "$1" =~ ^[[:xdigit:]]{64}$ ]]
+}
+
+verify_archive_sha256() {
+  local file="$1" expected="$2" actual
+  valid_sha256 "$expected" || return 2
+  actual="$(sha256_file "$file")" || return 1
+  [[ "${actual,,}" == "${expected,,}" ]]
+}
+
+snapshot_image_ref() {
+  local rid="$1" container_id="$2"
+  printf 'docker-migrate-snapshot:%s-%s\n' "${rid,,}" "${container_id:0:12}"
+}
+
+snapshot_container_image() {
+  local container_id="$1" metadata_file="$2" snapshot_image="$3"
+  local original_image running tmp
+  local -a commit_args=(docker commit)
+
+  original_image="$(jq -r '.[0].Config.Image' "$metadata_file")"
+  running="$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || echo false)"
+  # 用户选择不停机时不偷偷暂停业务；这种模式本身已明确提示快照可能不一致。
+  [[ "$running" != "true" ]] || commit_args+=(--pause=false)
+  if ! "${commit_args[@]}" "$container_id" "$snapshot_image" >/dev/null; then
+    return 1
+  fi
+  TEMP_IMAGES+=("$snapshot_image")
+
+  tmp="${metadata_file}.snapshot.tmp"
+  if ! jq --arg original "$original_image" --arg snapshot "$snapshot_image" '
+      .[0].Config.Image = $snapshot |
+      .[0].DockerMigrate = ((.[0].DockerMigrate // {}) + {
+        original_image: $original,
+        snapshot_image: $snapshot,
+        writable_layer_captured: true
+      })
+    ' "$metadata_file" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$metadata_file"
+}
+
+write_compose_snapshot_override() {
+  local file="$1" service="$2" image="$3" tmp
+  if [[ ! -f "$file" ]]; then
+    printf '{"services":{}}\n' >"$file"
+  fi
+  tmp="${file}.tmp"
+  jq --arg service "$service" --arg image "$image" \
+    '.services[$service].image = $image' "$file" >"$tmp"
+  mv "$tmp" "$file"
+}
+
+cleanup_snapshot_images() {
+  local image
+  for image in "${TEMP_IMAGES[@]}"; do
+    docker image rm "$image" >/dev/null 2>&1 || true
+  done
+  TEMP_IMAGES=()
+}
+
 generate_bundle_checksums() {
   local bundle_dir="$1"
   local manifest="${bundle_dir}/checksums.sha256"
@@ -395,7 +534,7 @@ generate_bundle_checksums() {
   : >"$manifest"
   while IFS= read -r -d '' file; do
     rel="${file#"${bundle_dir}/"}"
-    case "$rel" in checksums.sha256 | restore.sh) continue ;; esac
+    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
     digest="$(sha256_file "$file")" || {
       RED "[ERR] 系统缺少 SHA-256 工具（sha256sum/shasum/openssl）。"
       return 1
@@ -436,6 +575,41 @@ verify_bundle_checksums() {
     RED "[ERR] 校验清单为空。"
     return 1
   }
+  while IFS= read -r -d '' file; do
+    rel="${file#"${bundle_dir}/"}"
+    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
+    if ! awk -F '\t' -v rel="$rel" '$2 == rel { found=1 } END { exit found ? 0 : 1 }' "$manifest"; then
+      RED "[ERR] 迁移包含未纳入校验清单的文件：$rel"
+      return 1
+    fi
+  done < <(find "$bundle_dir" -type f -print0)
+}
+
+bundle_manifest_is_safe() {
+  local bundle_dir="$1" manifest run
+  manifest="${bundle_dir}/manifest.json"
+  [[ -f "$manifest" ]] || return 1
+  jq -e '
+    type == "object" and
+    (.images | type == "array") and
+    (.networks | type == "array") and
+    (.projects | type == "array") and
+    (.volumes | type == "array") and
+    (.binds | type == "array") and
+    (.runs | type == "array") and
+    all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
+    all(.projects[]; (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
+    all(.volumes[]; (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
+    all(.binds[];
+      (.host | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not)) and
+      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$"))
+    )
+  ' "$manifest" >/dev/null || return 1
+
+  while IFS= read -r run; do
+    [[ -f "${bundle_dir}/${run}" ]] || return 1
+  done < <(jq -r '.runs[]' "$manifest")
 }
 
 archive_layout_is_safe() {
@@ -512,6 +686,41 @@ if [[ -z "$name" || -z "$image" || "$image" == "null" ]]; then
   exit 1
 fi
 
+replacement_backup_name=""
+replacement_original_state=""
+replacement_active=0
+
+restore_previous_container() {
+  ((replacement_active == 1)) || return 0
+  echo "[WARN] new container failed; restoring previous container: $name" >&2
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  if ! docker rename "$replacement_backup_name" "$name" >/dev/null 2>&1; then
+    echo "[WARN] automatic rollback failed; previous container remains as: $replacement_backup_name" >&2
+    return 1
+  fi
+  case "$replacement_original_state" in
+    running | restarting)
+      docker start "$name" >/dev/null 2>&1 || return 1
+      ;;
+    paused)
+      docker start "$name" >/dev/null 2>&1 || return 1
+      docker pause "$name" >/dev/null 2>&1 || return 1
+      ;;
+  esac
+  replacement_active=0
+  echo "[INFO] previous container restored: $name" >&2
+}
+
+replacement_exit_handler() {
+  local rc=$?
+  trap - EXIT
+  if ((rc != 0 && replacement_active == 1)); then
+    restore_previous_container || rc=1
+  fi
+  exit "$rc"
+}
+trap replacement_exit_handler EXIT
+
 if ! docker image inspect "$image" >/dev/null 2>&1; then
   echo "[INFO] image is not loaded; pull before changing any existing container: $image"
   docker pull "$image" >/dev/null || {
@@ -525,11 +734,26 @@ if docker ps -a --format '{{.Names}}' | grep -Fxq "$name"; then
   case "${RESTORE_EXISTING:-replace}" in
     replace)
       echo "[WARN] container exists; replace it to restore the complete configuration: $name"
+      replacement_original_state="$existing_state"
+      replacement_backup_name="${name}.docker-migrate-backup-$$"
+      if docker ps -a --format '{{.Names}}' | grep -Fxq "$replacement_backup_name"; then
+        echo "[WARN] rollback container name already exists: $replacement_backup_name" >&2
+        exit 1
+      fi
       [[ "$existing_state" == "paused" ]] && docker unpause "$name" >/dev/null 2>&1 || true
-      docker rm -f "$name" >/dev/null 2>&1 || {
-        echo "[WARN] failed to remove existing container: $name" >&2
+      case "$existing_state" in
+        running | restarting | paused)
+          docker stop "$name" >/dev/null 2>&1 || {
+            echo "[WARN] failed to stop existing container; it was left unchanged: $name" >&2
+            exit 1
+          }
+          ;;
+      esac
+      docker rename "$name" "$replacement_backup_name" >/dev/null 2>&1 || {
+        echo "[WARN] failed to preserve existing container; it was left unchanged: $name" >&2
         exit 1
       }
+      replacement_active=1
       ;;
     skip)
       echo "[WARN] container exists; skipped by RESTORE_EXISTING=skip: $name"
@@ -546,7 +770,13 @@ if docker ps -a --format '{{.Names}}' | grep -Fxq "$name"; then
   esac
 fi
 
-args=(docker run -d --name "$name")
+original_running="$(jq -r '.[0].State.Running // false' "$META")"
+original_paused="$(jq -r '.[0].State.Paused // false' "$META")"
+if [[ "$original_running" == "true" ]]; then
+  args=(docker run -d --name "$name")
+else
+  args=(docker create --name "$name")
+fi
 cmd_args=()
 
 mapfile -t entrypoint < <(jq -r '.[0].Config.Entrypoint[]?' "$META")
@@ -846,6 +1076,7 @@ if [[ $run_rc -ne 0 ]]; then
 fi
 
 # 连接额外网络。
+network_restore_failed=0
 if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" != container:* ]]; then
   mapfile -t net_entries < <(jq -r '.[0].NetworkSettings.Networks | to_entries[]? | @base64' "$META")
   for entry in "${net_entries[@]}"; do
@@ -862,6 +1093,7 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
       for a in $aliases_raw; do conn_args+=(--alias "$a"); done
     fi
     docker network connect "${conn_args[@]}" "$net_name" "$name" >/dev/null 2>&1 || {
+      network_restore_failed=1
       echo "[WARN] 连接额外网络失败：$net_name，容器可能缺少网络" >&2
       case "$net_name" in
         macvlan*|ipvlan*|overlay*)
@@ -870,6 +1102,48 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
       esac
     }
   done
+fi
+if ((network_restore_failed == 1)); then
+  exit 1
+fi
+
+# 有 healthcheck 时等待健康，避免“docker run 成功但应用实际启动失败”后过早删除旧容器。
+health_kind="$(jq -r '.[0].Config.Healthcheck.Test[0] // empty' "$META" 2>/dev/null || true)"
+if [[ "$original_running" == "true" &&
+      ("$health_kind" == "CMD" || "$health_kind" == "CMD-SHELL") ]]; then
+  health_timeout="${RESTORE_HEALTH_TIMEOUT:-60}"
+  health_deadline=$((SECONDS + health_timeout))
+  while ((SECONDS < health_deadline)); do
+    health_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$name" 2>/dev/null || true)"
+    case "$health_status" in
+      healthy) break ;;
+      unhealthy | exited | dead)
+        echo "[WARN] new container did not become healthy: $name ($health_status)" >&2
+        exit 1
+        ;;
+    esac
+    sleep 1
+  done
+  if [[ "${health_status:-}" != "healthy" ]]; then
+    echo "[WARN] healthcheck timed out after ${health_timeout}s: $name" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$original_paused" == "true" ]]; then
+  docker pause "$name" >/dev/null 2>&1 || {
+    echo "[WARN] failed to restore paused state: $name" >&2
+    exit 1
+  }
+fi
+
+if ((replacement_active == 1)); then
+  if docker rm -f "$replacement_backup_name" >/dev/null 2>&1; then
+    replacement_active=0
+    echo "[INFO] replacement verified; removed rollback container: $replacement_backup_name"
+  else
+    echo "[WARN] new container is running, but rollback container could not be removed: $replacement_backup_name" >&2
+  fi
 fi
 RUN_SH
   # 安全转义容器名中的 \ / &，防止 sed 替换出错
@@ -937,6 +1211,198 @@ compose_run() {
   fi
 }
 
+compose_rollback_image_cleanup() {
+  local rollback_dir="$1" image
+  [[ -f "${rollback_dir}/images.list" ]] || return 0
+  while IFS= read -r image; do
+    [[ -n "$image" ]] || continue
+    docker image rm "$image" >/dev/null 2>&1 || true
+  done <"${rollback_dir}/images.list"
+}
+
+compose_capture_rollback() {
+  local project="$1" rollback_dir="$2"
+  local first_id old_wdir config_files normalized file id service state image tmp
+  local -a ids=() config_args=()
+
+  mapfile -t ids < <(docker ps -a \
+    --filter "label=com.docker.compose.project=${project}" --format '{{.ID}}')
+  ((${#ids[@]} > 0)) || return 2
+  mkdir -p "$rollback_dir"
+  first_id="${ids[0]}"
+  old_wdir="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$first_id" 2>/dev/null || true)"
+  config_files="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$first_id" 2>/dev/null || true)"
+  normalized="${config_files//,/:}"
+  if [[ -n "$normalized" ]]; then
+    IFS=':' read -r -a old_files <<<"$normalized"
+    for file in "${old_files[@]}"; do
+      [[ -n "$file" ]] || continue
+      [[ "$file" == /* ]] || file="${old_wdir}/${file}"
+      [[ -f "$file" ]] || {
+        warn " · 目标端旧 Compose 配置不存在，无法建立回滚点：$file"
+        return 1
+      }
+      config_args+=(-f "$file")
+    done
+  fi
+
+  if [[ -n "$old_wdir" ]]; then
+    if ! (cd "$old_wdir" && compose_run -p "$project" "${config_args[@]}" config) \
+      >"${rollback_dir}/config.yml" 2>/dev/null; then
+      warn " · 无法解析目标端旧 Compose 配置，拒绝破坏性替换：$project"
+      return 1
+    fi
+  elif ! compose_run -p "$project" "${config_args[@]}" config \
+    >"${rollback_dir}/config.yml" 2>/dev/null; then
+    warn " · 目标端缺少 Compose 工作目录，无法建立回滚点：$project"
+    return 1
+  fi
+
+  printf '{"services":{}}\n' >"${rollback_dir}/images.yml"
+  : >"${rollback_dir}/images.list"
+  : >"${rollback_dir}/states.tsv"
+  for id in "${ids[@]}"; do
+    service="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$id" 2>/dev/null || true)"
+    [[ -n "$service" ]] || {
+      warn " · 目标端容器缺少 Compose service 标签：$id"
+      compose_rollback_image_cleanup "$rollback_dir"
+      return 1
+    }
+    if awk -F '\t' -v service="$service" '$1 == service { found=1 } END { exit found ? 0 : 1 }' \
+      "${rollback_dir}/states.tsv"; then
+      warn " · Compose 服务存在多个副本，当前无法保证逐容器回滚：$service"
+      compose_rollback_image_cleanup "$rollback_dir"
+      return 1
+    fi
+    state="$(docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || echo unknown)"
+    image="docker-migrate-rollback:${id:0:12}-$$"
+    if ! docker commit "$id" "$image" >/dev/null; then
+      warn " · 目标端容器回滚镜像创建失败：$service"
+      compose_rollback_image_cleanup "$rollback_dir"
+      return 1
+    fi
+    printf '%s\n' "$image" >>"${rollback_dir}/images.list"
+    printf '%s\t%s\n' "$service" "$state" >>"${rollback_dir}/states.tsv"
+    tmp="${rollback_dir}/images.yml.tmp"
+    jq --arg service "$service" --arg image "$image" \
+      '.services[$service].image = $image' "${rollback_dir}/images.yml" >"$tmp"
+    mv "$tmp" "${rollback_dir}/images.yml"
+  done
+}
+
+compose_restore_rollback() {
+  local project="$1" rollback_dir="$2"
+  local service state id
+  local -a start_services=() pause_services=()
+  [[ -s "${rollback_dir}/config.yml" && -s "${rollback_dir}/images.yml" ]] || return 1
+  (
+    cd "$rollback_dir"
+    compose_run -p "$project" -f config.yml -f images.yml up --no-start
+    while IFS=$'\t' read -r service state; do
+      case "$state" in
+        running | restarting) start_services+=("$service") ;;
+        paused)
+          start_services+=("$service")
+          pause_services+=("$service")
+          ;;
+      esac
+    done <states.tsv
+    ((${#start_services[@]} == 0)) || \
+      compose_run -p "$project" -f config.yml -f images.yml start "${start_services[@]}"
+    for service in "${pause_services[@]}"; do
+      while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        docker pause "$id" >/dev/null
+      done < <(compose_run -p "$project" -f config.yml -f images.yml ps -q "$service")
+    done
+  )
+}
+
+compose_source_state_records() {
+  local project="$1" file file_project service running paused found=0
+  for file in "${BUNDLE_DIR}"/meta/*.inspect.json; do
+    [[ -f "$file" ]] || continue
+    file_project="$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' "$file" 2>/dev/null || true)"
+    [[ "$file_project" == "$project" ]] || continue
+    service="$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // empty' "$file")"
+    [[ -n "$service" ]] || continue
+    running="$(jq -r '.[0].State.Running // false' "$file")"
+    paused="$(jq -r '.[0].State.Paused // false' "$file")"
+    if [[ "$paused" == "true" ]]; then
+      printf '%s\tpaused\n' "$service"
+    elif [[ "$running" == "true" ]]; then
+      printf '%s\trunning\n' "$service"
+    else
+      printf '%s\tstopped\n' "$service"
+    fi
+    found=1
+  done
+  ((found == 1))
+}
+
+compose_wait_services() {
+  local timeout="$1"
+  shift
+  local deadline=$((SECONDS + timeout)) service id status all_ready service_found
+  local -a compose_args=()
+  while (($# > 0)) && [[ "$1" != -- ]]; do
+    compose_args+=("$1")
+    shift
+  done
+  (($# == 0)) || shift
+  local -a services=("$@")
+
+  while ((SECONDS < deadline)); do
+    all_ready=1
+    for service in "${services[@]}"; do
+      service_found=0
+      while IFS= read -r id; do
+        [[ -n "$id" ]] || {
+          all_ready=0
+          continue
+        }
+        service_found=1
+        status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$id" 2>/dev/null || true)"
+        case "$status" in
+          healthy | running) ;;
+          unhealthy | exited | dead) return 1 ;;
+          *) all_ready=0 ;;
+        esac
+      done < <(compose_run "${compose_args[@]}" ps -q "$service")
+      ((service_found == 1)) || all_ready=0
+    done
+    ((all_ready == 0)) || return 0
+    sleep 1
+  done
+  return 1
+}
+
+compose_wait_project_health() {
+  local project="$1" timeout="$2"
+  local deadline=$((SECONDS + timeout)) id running health all_ready found
+  while ((SECONDS < deadline)); do
+    all_ready=1
+    found=0
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      found=1
+      running="$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null || echo false)"
+      [[ "$running" == "true" ]] || continue
+      health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || true)"
+      case "$health" in
+        healthy | none) ;;
+        unhealthy) return 1 ;;
+        *) all_ready=0 ;;
+      esac
+    done < <(docker ps -a \
+      --filter "label=com.docker.compose.project=${project}" --format '{{.ID}}')
+    ((found == 1)) || all_ready=0
+    ((all_ready == 0)) || return 0
+    sleep 1
+  done
+  return 1
+}
+
 run_with_timeout() {
   local seconds="$1"
   shift
@@ -974,7 +1440,37 @@ restore_verify_checksums() {
     [[ "$actual" == "$expected" ]] || return 1
     count=$((count + 1))
   done <checksums.sha256
-  (( count > 0 ))
+  (( count > 0 )) || return 1
+  while IFS= read -r -d '' file; do
+    rel="${file#"${BUNDLE_DIR}/"}"
+    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
+    awk -F '\t' -v rel="$rel" '$2 == rel { found=1 } END { exit found ? 0 : 1 }' \
+      checksums.sha256 || return 1
+  done < <(find "$BUNDLE_DIR" -type f -print0)
+}
+
+restore_manifest_is_safe() {
+  local run
+  jq -e '
+    type == "object" and
+    (.images | type == "array") and
+    (.networks | type == "array") and
+    (.projects | type == "array") and
+    (.volumes | type == "array") and
+    (.binds | type == "array") and
+    (.runs | type == "array") and
+    all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
+    all(.projects[]; (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
+    all(.volumes[]; (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
+    all(.binds[];
+      (.host | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not)) and
+      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$"))
+    )
+  ' manifest.json >/dev/null || return 1
+  while IFS= read -r run; do
+    [[ -f "${BUNDLE_DIR}/${run}" ]] || return 1
+  done < <(jq -r '.runs[]' manifest.json)
 }
 
 archive_members_safe() {
@@ -991,6 +1487,93 @@ archive_members_safe() {
       return 1
     fi
   done < <(tar -tzf "$archive")
+}
+
+volume_clear_and_extract() {
+  local volume="$1" archive_dir="$2" archive_file="$3"
+  docker run --rm \
+    -v "${volume}:/to" \
+    -v "${archive_dir}:/from:ro" \
+    alpine:3.20 sh -eu -c '
+      find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} \;
+      tar -xzf "/from/$1" -C /to
+    ' sh "$archive_file"
+}
+
+restore_volume_exact() {
+  local volume="$1" archive_dir="$2" archive_file="$3" rollback_dir="$4" existed="$5"
+  local rollback_file="rollback_${volume}.tgz"
+  mkdir -p "$rollback_dir"
+  if ((existed == 1)); then
+    if ! docker run --rm \
+      -v "${volume}:/from:ro" \
+      -v "${rollback_dir}:/rollback" \
+      alpine:3.20 sh -eu -c 'tar -czf "/rollback/$1" -C /from .' sh "$rollback_file"; then
+      return 1
+    fi
+  fi
+
+  if volume_clear_and_extract "$volume" "$archive_dir" "$archive_file"; then
+    rm -f "${rollback_dir}/${rollback_file}"
+    return 0
+  fi
+
+  warn " 卷恢复失败，正在回滚目标端原数据：$volume"
+  if ((existed == 1)); then
+    volume_clear_and_extract "$volume" "$rollback_dir" "$rollback_file" || return 1
+    rm -f "${rollback_dir}/${rollback_file}"
+  else
+    docker volume rm "$volume" >/dev/null 2>&1 || true
+  fi
+  return 1
+}
+
+root_exec() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo -n "$@"
+  else
+    "$@"
+  fi
+}
+
+restore_bind_exact() {
+  local host="$1" archive="$2"
+  local parent base stage old staged had_old=0
+  [[ "$host" == /* && "$host" != "/" ]] || return 1
+  parent="$(dirname "$host")"
+  base="$(basename "$host")"
+  stage="${parent}/.${base}.docker-migrate-stage-$$"
+  old="${parent}/.${base}.docker-migrate-old-$$"
+
+  root_exec mkdir -p "$parent" || return 1
+  root_exec rm -rf "$stage" "$old" || return 1
+  root_exec mkdir -p "$stage" || return 1
+  if ! root_exec tar -C "$stage" -xzf "$archive"; then
+    root_exec rm -rf "$stage" || true
+    return 1
+  fi
+  staged="${stage}/${host#/}"
+  if ! root_exec test -e "$staged" && ! root_exec test -L "$staged"; then
+    root_exec rm -rf "$stage" || true
+    return 1
+  fi
+
+  if root_exec test -e "$host" || root_exec test -L "$host"; then
+    root_exec mv "$host" "$old" || {
+      root_exec rm -rf "$stage" || true
+      return 1
+    }
+    had_old=1
+  fi
+  if ! root_exec mv "$staged" "$host"; then
+    if ((had_old == 1)); then root_exec mv "$old" "$host" || true; fi
+    root_exec rm -rf "$stage" || true
+    return 1
+  fi
+  root_exec rm -rf "$stage" || true
+  if ((had_old == 1)); then root_exec rm -rf "$old" || true; fi
 }
 
 compose_networks_from_meta_all() {
@@ -1189,6 +1772,10 @@ elif [[ -f checksums.sha256 ]]; then
 else
   warn "旧版迁移包未包含校验清单，按兼容模式继续。"
 fi
+if ! restore_manifest_is_safe; then
+  warn "迁移包 manifest 结构或路径不安全，拒绝恢复。"
+  exit 1
+fi
 
 say "[A] 加载镜像（如 images.tar 存在）"
 if [[ -f images.tar ]]; then
@@ -1217,6 +1804,8 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
     echo " - ${vname}"
     # 使用备份时记录的 driver 和 options 创建卷
     v_driver=$(jq -r '.driver // "local"' <<<"$row")
+    volume_existed=0
+    docker volume inspect "$vname" >/dev/null 2>&1 && volume_existed=1
     volume_create_args=(docker volume create --driver "$v_driver")
     mapfile -t volume_opts < <(jq -r '.opts // {} | to_entries[]? | "\(.key)=\(.value)"' <<<"$row" 2>/dev/null || true)
     for volume_opt in "${volume_opts[@]}"; do
@@ -1228,10 +1817,8 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       FAILED_VOLUMES+=("$vname")
       continue
     fi
-    if ! docker run --rm \
-      -v "${vname}:/to" \
-      -v "$PWD/volumes:/from" \
-      alpine:3.20 sh -c "cd /to && tar -xzf /from/${file}"; then
+    if ! restore_volume_exact "$vname" "$PWD/volumes" "$file" \
+      "$PWD/.docker_migrate_rollback/volumes" "$volume_existed"; then
       warn " 恢复卷 ${vname} 失败，跳过"
       FAILED_VOLUMES+=("$vname")
     fi
@@ -1256,15 +1843,7 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
       continue
     fi
     echo " - ${host}"
-    parent="$(dirname "$host")"
-    if ! run_with_timeout 10 sudo -n mkdir -p "$parent" 2>/dev/null &&
-       ! mkdir -p "$parent" 2>/dev/null; then
-      warn " 无法创建绑定目录的父目录：$parent"
-      FAILED_BINDS+=("$host")
-      continue
-    fi
-    if ! run_with_timeout 30 sudo -n tar -C / -xzf "binds/${file}" 2>/dev/null &&
-       ! tar -C / -xzf "binds/${file}" 2>/dev/null; then
+    if ! restore_bind_exact "$host" "$PWD/binds/${file}"; then
       warn " 无法恢复绑定目录：$host（可能需要 root 权限）"
       FAILED_BINDS+=("$host")
     fi
@@ -1286,6 +1865,47 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     wdir=$(jq -r '.working_dir // ""' <<<"$row")
     echo " - project: $name"
     mkdir -p "compose_restore/${name}"
+
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+      compose_impl="plugin"
+    elif command -v docker-compose >/dev/null 2>&1; then
+      compose_impl="legacy"
+    else
+      warn " 新机未安装 docker compose/docker-compose，跳过该项目。"
+      FAILED_PROJECTS+=("$name")
+      continue
+    fi
+    COMPOSE_IMPL="$compose_impl"
+
+    rollback_dir="${BUNDLE_DIR}/.docker_migrate_rollback/${name}"
+    rollback_active=0
+    if docker ps -a --filter "label=com.docker.compose.project=${name}" --format '{{.ID}}' | grep -q .; then
+      case "${RESTORE_EXISTING:-replace}" in
+        replace)
+          echo " · 保存目标端旧 Compose 项目作为自动回滚点"
+          if ! compose_capture_rollback "$name" "$rollback_dir"; then
+            warn " · 无法安全建立回滚点，已跳过 Compose 项目：$name"
+            FAILED_PROJECTS+=("$name")
+            continue
+          fi
+          rollback_active=1
+          ;;
+        skip)
+          warn " · Compose 项目已存在，按 RESTORE_EXISTING=skip 跳过：$name"
+          continue
+          ;;
+        fail)
+          warn " · Compose 项目已存在，按 RESTORE_EXISTING=fail 拒绝替换：$name"
+          FAILED_PROJECTS+=("$name")
+          continue
+          ;;
+        *)
+          warn " · RESTORE_EXISTING 值无效：${RESTORE_EXISTING}"
+          FAILED_PROJECTS+=("$name")
+          continue
+          ;;
+      esac
+    fi
 
     if [[ -d "compose/${name}" ]]; then
       cp -a "compose/${name}/." "compose_restore/${name}/"
@@ -1324,29 +1944,75 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       done < <(jq -r '.config_files[]?' <<<"$row")
     fi
 
-    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-      compose_impl="plugin"
-    elif command -v docker-compose >/dev/null 2>&1; then
-      compose_impl="legacy"
-    else
-      warn " 新机未安装 docker compose/docker-compose，跳过该项目。"
-      FAILED_PROJECTS+=("$name")
-      continue
-    fi
-
     if [[ "$USE_WDIR" == "1" ]]; then
       compose_dir="$wdir"
     else
       compose_dir="compose_restore/${name}"
     fi
+    compose_rc=0
     (
       cd "$compose_dir"
       COMPOSE_IMPL="$compose_impl"
-      # down 与 up 使用完全相同的多文件参数，避免操作到错误的 Compose 项目。
-      compose_run "${COMPOSE_FILE_ARGS[@]}" down || true
-      compose_prepare_networks "$name" "${COMPOSE_FILE_ARGS[@]}"
-      compose_run "${COMPOSE_FILE_ARGS[@]}" up -d 2>&1
-    ) || FAILED_PROJECTS+=("$name")
+      compose_run "${COMPOSE_FILE_ARGS[@]}" config >/dev/null || exit 1
+      compose_prepare_networks "$name" "${COMPOSE_FILE_ARGS[@]}" || exit 1
+      declare -a source_state_records=() start_services=() pause_services=()
+      mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
+      echo " · 已读取 ${#source_state_records[@]} 条源端服务状态"
+      if ((${#source_state_records[@]} == 0)); then
+        # 兼容旧迁移包：没有状态元数据时沿用全部启动行为。
+        compose_run "${COMPOSE_FILE_ARGS[@]}" up -d 2>&1 || exit 1
+        compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
+      else
+        compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start 2>&1 || exit 1
+        for state_record in "${source_state_records[@]}"; do
+          service="${state_record%%$'\t'*}"
+          state="${state_record#*$'\t'}"
+          case "$state" in
+            running) start_services+=("$service") ;;
+            paused)
+              start_services+=("$service")
+              pause_services+=("$service")
+              ;;
+          esac
+        done
+        if ((${#start_services[@]} > 0)); then
+          compose_run "${COMPOSE_FILE_ARGS[@]}" start "${start_services[@]}" 2>&1 || exit 1
+          compose_wait_services "${RESTORE_HEALTH_TIMEOUT:-60}" \
+            "${COMPOSE_FILE_ARGS[@]}" -- "${start_services[@]}" || exit 1
+        fi
+        compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
+        for service in "${pause_services[@]}"; do
+          while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            docker pause "$id" >/dev/null || exit 1
+          done < <(compose_run "${COMPOSE_FILE_ARGS[@]}" ps -q "$service")
+        done
+      fi
+    ) || compose_rc=$?
+
+    if ((compose_rc != 0)); then
+      warn " · 新 Compose 项目启动失败：$name"
+      if ((rollback_active == 1)); then
+        warn " · 正在自动恢复目标端旧 Compose 项目：$name"
+        (
+          cd "$compose_dir"
+          COMPOSE_IMPL="$compose_impl"
+          compose_run "${COMPOSE_FILE_ARGS[@]}" down >/dev/null 2>&1 || true
+        )
+        if compose_restore_rollback "$name" "$rollback_dir"; then
+          warn " · 目标端旧 Compose 项目已恢复：$name"
+        else
+          warn " · Compose 自动回滚失败，请保留目录人工处理：$rollback_dir"
+        fi
+      fi
+      FAILED_PROJECTS+=("$name")
+      continue
+    fi
+
+    if ((rollback_active == 1)); then
+      compose_rollback_image_cleanup "$rollback_dir"
+      rm -rf "$rollback_dir"
+    fi
   done < <(jq -c '.projects[]' manifest.json)
 fi
 
@@ -1414,7 +2080,7 @@ restore_prompt_url() {
   if [[ -z "$restore_url" ]]; then
     read -rp "请输入旧服务器的一键包下载链接（以 .tar.gz 结尾）： " restore_url
   fi
-  if ! [[ "$restore_url" =~ \.tar\.gz($|\?) ]]; then
+  if ! [[ "$restore_url" =~ \.tar\.gz($|[?#]) ]]; then
     RED "[ERR] 链接必须以 .tar.gz 结尾。"
     exit 1
   fi
@@ -1468,24 +2134,52 @@ restore_ensure_deps() {
 }
 
 restore_main() {
-  restore_ensure_deps
-  local URL
+  local URL DOWNLOAD_URL EXPECTED_SHA256
   URL="$(restore_prompt_url "${1:-}")"
+  DOWNLOAD_URL="$(bundle_download_url "$URL")"
+  EXPECTED_SHA256="$(bundle_expected_sha256 "$URL")"
+  if [[ -n "$EXPECTED_SHA256" ]] && ! valid_sha256 "$EXPECTED_SHA256"; then
+    RED "[ERR] 下载链接中的 SHA-256 摘要格式无效。"
+    exit 1
+  fi
+  if [[ -z "$EXPECTED_SHA256" && "${RESTORE_ALLOW_UNVERIFIED:-0}" != "1" ]]; then
+    if [[ -t 0 ]]; then
+      YEL "[WARN] 链接没有外部 SHA-256 摘要，无法确认迁移包来源。"
+      local allow_unverified
+      read -rp "仍要恢复这个旧版链接吗？[y/N] " allow_unverified
+      [[ "$allow_unverified" =~ ^[Yy]$ ]] || exit 1
+    else
+      RED "[ERR] 链接缺少外部 SHA-256 摘要；非交互模式拒绝恢复。"
+      YEL "[INFO] 仅兼容可信旧包时可显式设置 RESTORE_ALLOW_UNVERIFIED=1。"
+      exit 1
+    fi
+  fi
+  restore_ensure_deps
   local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
   mkdir -p "$BASE"
   local RID
-  RID="$(basename "$URL" | sed 's/\.tar\.gz.*$//' | tr -dc 'A-Za-z0-9_-')"
+  RID="$(basename "$DOWNLOAD_URL" | sed 's/\.tar\.gz.*$//' | tr -dc 'A-Za-z0-9_-')"
   [[ -n "$RID" ]] || RID="$(date +%s)"
   local TGZ="${BASE}/bundle.tar.gz"
   local OUTDIR="${BASE}/${RID}"
 
-  BLUE "[INFO] 下载：$URL"
-  if ! curl -fL --progress-bar --retry 5 --retry-delay 10 --retry-max-time 300 --connect-timeout 30 "$URL" -o "$TGZ"; then
-    RED "[ERR] 下载失败：$URL"
+  BLUE "[INFO] 下载：$DOWNLOAD_URL"
+  if ! curl -fL --progress-bar --retry 5 --retry-delay 10 --retry-max-time 300 --connect-timeout 30 "$DOWNLOAD_URL" -o "$TGZ"; then
+    RED "[ERR] 下载失败：$DOWNLOAD_URL"
     exit 1
   fi
   OK "[OK] 保存路径：$TGZ"
   BLUE "[INFO] 文件大小：$(du -h "$TGZ" | awk '{print $1}')"
+  if [[ -n "$EXPECTED_SHA256" ]]; then
+    BLUE "[INFO] 验证下载包的外部 SHA-256 摘要 ..."
+    if ! verify_archive_sha256 "$TGZ" "$EXPECTED_SHA256"; then
+      RED "[ERR] 下载包与源服务器提供的 SHA-256 摘要不一致，拒绝解压。"
+      exit 1
+    fi
+    OK "[OK] 下载包来源摘要校验通过"
+  else
+    YEL "[WARN] 已按兼容模式跳过外部来源校验。"
+  fi
   if ! archive_layout_is_safe "$TGZ"; then
     RED "[ERR] 迁移包结构不安全或已损坏，拒绝解压。"
     exit 1
@@ -1513,6 +2207,10 @@ restore_main() {
     OK "[OK] 迁移包完整性校验通过"
   else
     YEL "[WARN] 这是未带校验清单的旧版迁移包，将按兼容模式继续。"
+  fi
+  if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
+    RED "[ERR] manifest.json 结构或路径不安全，拒绝恢复。"
+    exit 1
   fi
 
   # 使用当前脚本内置的修复版 restore.sh 覆盖包内旧 restore.sh。
@@ -1729,6 +2427,7 @@ cleanup_http() {
 }
 
 hard_clean() {
+  cleanup_snapshot_images
   [[ -z "${BUNDLE:-}" ]] || rm -rf "${BUNDLE}" 2>/dev/null || true
   [[ -z "${SINGLE_TAR_PATH:-}" ]] || rm -f "${SINGLE_TAR_PATH}" 2>/dev/null || true
   [[ -z "${BUNDLE_ROOT:-}" ]] || rm -rf "${BUNDLE_ROOT}/_bb_http_serve" 2>/dev/null || true
@@ -2009,6 +2708,7 @@ declare -A CONTAINER_IS_COMPOSE=()
 declare -A COMPOSE_GROUP=()
 declare -A COMPOSE_CFGS=()
 declare -A SELECTED_COMPOSE_COUNT=()
+declare -A COMPOSE_SERVICE_COUNT=()
 
 # 关键修复：重新按最终选择的容器统计 compose 分组数量，避免菜单阶段归类为单容器，元数据阶段又被重新归为 compose。
 for id in "${IDS[@]}"; do
@@ -2067,6 +2767,13 @@ for id in "${IDS[@]}"; do
     COMPOSE_GROUP["$key"]=1
     [[ -n "$cfgs" ]] && COMPOSE_CFGS["$key"]="$cfgs"
     CONTAINER_IS_COMPOSE["$id"]=1
+    compose_service="$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // empty' <<<"$j")"
+    if [[ -n "$compose_service" ]]; then
+      service_key="${key}|${compose_service}"
+      COMPOSE_SERVICE_COUNT["$service_key"]=$((${COMPOSE_SERVICE_COUNT["$service_key"]:-0} + 1))
+    else
+      BACKUP_FAILURES+=("Compose 容器缺少 service 标签：$name")
+    fi
   else
     CONTAINER_IS_COMPOSE["$id"]=0
     mapfile -t nets < <(jq -r '.[0].NetworkSettings.Networks | keys[]?' <<<"$j" || true)
@@ -2181,6 +2888,55 @@ if ((${#COMPOSE_GROUP[@]})); then
 fi
 
 #####################################
+# 检查未选中容器是否仍在写共享挂载
+#####################################
+declare -a SHARED_MOUNT_ROWS=()
+mapfile -t SHARED_MOUNT_ROWS < <(collect_shared_running_containers "${IDS[@]}")
+if ((${#SHARED_MOUNT_ROWS[@]} > 0)); then
+  YEL "[WARN] 检测到未选中的运行容器正在使用相同 volume 或重叠 bind 路径："
+  for shared_row in "${SHARED_MOUNT_ROWS[@]}"; do
+    IFS=$'\t' read -r _ shared_name shared_reason <<<"$shared_row"
+    YEL " - ${shared_name} (${shared_reason})"
+  done
+
+  if ((NO_STOP == 1)); then
+    RED "[ERR] --no-stop 无法保证共享挂载一致性，已取消备份。"
+    RED "[INFO] 请停止这些容器，或去掉 --no-stop 让脚本临时暂停并自动恢复。"
+    exit 1
+  fi
+
+  stop_shared=0
+  if [[ -t 0 ]]; then
+    read -rp "是否临时停止这些共享挂载容器？备份结束会自动重启。[Y/n] " STOP_SHARED
+    STOP_SHARED=${STOP_SHARED:-Y}
+    [[ "$STOP_SHARED" =~ ^[Yy]$ ]] && stop_shared=1
+  elif [[ "${STOP_SHARED_MOUNTS:-0}" == "1" ]]; then
+    stop_shared=1
+  fi
+  if ((stop_shared == 0)); then
+    RED "[ERR] 未获得停止共享挂载容器的许可，已取消备份以避免不一致数据。"
+    RED "[INFO] 非交互模式可显式设置 STOP_SHARED_MOUNTS=1。"
+    exit 1
+  fi
+
+  for shared_row in "${SHARED_MOUNT_ROWS[@]}"; do
+    IFS=$'\t' read -r _ shared_name _ <<<"$shared_row"
+    printf "[停机-共享挂载] %s ... " "$shared_name"
+    if docker stop "$shared_name" >/dev/null 2>&1; then
+      STOPPED_ON_BACKUP+=("$shared_name")
+      printf "ok\n"
+    else
+      printf "fail\n"
+      BACKUP_FAILURES+=("无法停止共享挂载容器：$shared_name")
+    fi
+  done
+  if ((${#BACKUP_FAILURES[@]} > 0)); then
+    RED "[ERR] 共享挂载容器未全部停止，已取消备份。"
+    exit 1
+  fi
+fi
+
+#####################################
 # 停机窗口（可选）
 #####################################
 if ((NO_STOP == 1)); then
@@ -2215,6 +2971,55 @@ else
   else
     YEL "[WARN] 你选择了不停机备份。"
   fi
+fi
+
+#####################################
+# 捕获容器 writable layer
+#####################################
+BLUE "[INFO] 捕获容器可写层快照 ..."
+for service_key in "${!COMPOSE_SERVICE_COUNT[@]}"; do
+  if ((${COMPOSE_SERVICE_COUNT[$service_key]} > 1)); then
+    BACKUP_FAILURES+=("Compose 服务存在多个副本，无法逐容器保留可写层：${service_key##*|}")
+  fi
+done
+if ((${#BACKUP_FAILURES[@]} > 0)); then
+  RED "[ERR] 可写层快照预检查失败："
+  for failure in "${BACKUP_FAILURES[@]}"; do RED " - $failure"; done
+  exit 1
+fi
+
+# 后续只需保存临时快照镜像；其父镜像层会由 docker image save 自动包含。
+IMGSET=()
+snapshot_total=${#IDS[@]}
+snapshot_index=0
+for id in "${IDS[@]}"; do
+  snapshot_index=$((snapshot_index + 1))
+  n="${CONTAINER_NAME[$id]}"
+  snapshot_image="$(snapshot_image_ref "$RID" "$id")"
+  printf " [SNAPSHOT] (%d/%d) %s ... " "$snapshot_index" "$snapshot_total" "$n"
+  if ! snapshot_container_image "$id" "${BUNDLE}/meta/${n}.inspect.json" "$snapshot_image"; then
+    printf "fail\n"
+    BACKUP_FAILURES+=("容器可写层快照失败：$n")
+    continue
+  fi
+  IMGSET["$snapshot_image"]=1
+
+  if [[ "${CONTAINER_IS_COMPOSE[$id]}" == "1" ]]; then
+    j="$(cat "${BUNDLE}/meta/${n}.inspect.json")"
+    proj="$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$j")"
+    compose_service="$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // empty' <<<"$j")"
+    if ! write_compose_snapshot_override \
+      "${BUNDLE}/compose/${proj}/_migration_images.yml" "$compose_service" "$snapshot_image"; then
+      printf "fail\n"
+      BACKUP_FAILURES+=("Compose 快照覆盖配置生成失败：$n")
+      continue
+    fi
+  fi
+  printf "ok\n"
+done
+if ((${#BACKUP_FAILURES[@]} > 0)); then
+  RED "[ERR] 可写层快照不完整，已取消备份。"
+  exit 1
 fi
 
 #####################################
@@ -2332,6 +3137,7 @@ if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
   if progress_docker_save "${OUT_IMG}" docker image save "${IMAGES[@]}"; then
     OK "[OK] images.tar 已生成，大小：$(du -h "${OUT_IMG}" | awk '{print $1}')"
+    cleanup_snapshot_images
   else
     RED "[ERR] docker image save 失败，请检查磁盘空间或 Docker 状态。"
     rm -f "${OUT_IMG}" 2>/dev/null || true
@@ -2366,7 +3172,11 @@ generate_manifest_and_restore() {
     # 解析后的单文件配置优先；否则保持原始 config_files 顺序。
     local cfs="${COMPOSE_CFGS[$key]:-}"
     if [[ -f "${BUNDLE}/compose/${proj}/_resolved_config.yml" ]]; then
-      cfgs_json='["_resolved_config.yml"]'
+      if [[ -f "${BUNDLE}/compose/${proj}/_migration_images.yml" ]]; then
+        cfgs_json='["_resolved_config.yml","_migration_images.yml"]'
+      else
+        cfgs_json='["_resolved_config.yml"]'
+      fi
     elif [[ -n "$cfs" ]]; then
       IFS=':' read -r -a CFS_ARR <<<"$cfs"
       declare -a cfgs_abs
@@ -2377,6 +3187,9 @@ generate_manifest_and_restore() {
         if [[ "$c" == /* ]]; then cfgs_abs+=("$c"); elif [[ -n "$wdir" ]]; then cfgs_abs+=("${wdir}/${c}"); else cfgs_abs+=("$c"); fi
       done
       if ((${#cfgs_abs[@]})); then
+        if [[ -f "${BUNDLE}/compose/${proj}/_migration_images.yml" ]]; then
+          cfgs_abs+=("_migration_images.yml")
+        fi
         cfgs_json="$(json_array_from_lines "${cfgs_abs[@]}")"
       fi
     fi
@@ -2453,6 +3266,10 @@ BLUE "[INFO] 打包一键迁移包：${SINGLE_TAR_PATH}"
   tar -czf "${BUNDLE_BASENAME}.tar.gz" "$RID"
 )
 OK "[OK] 一键迁移包已生成，大小：$(du -h "$SINGLE_TAR_PATH" | awk '{print $1}')"
+BUNDLE_SHA256="$(sha256_file "$SINGLE_TAR_PATH")" || {
+  RED "[ERR] 无法计算迁移包 SHA-256，拒绝启动下载服务。"
+  exit 1
+}
 
 #####################################
 # HTTP 下载服务
@@ -2541,7 +3358,7 @@ with ThreadingTCPServer(("", port), Handler) as httpd:
     httpd.serve_forever()
 PY
   SHPID=$!
-  FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${BUNDLE_BASENAME}.tar.gz"
+  FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${BUNDLE_BASENAME}.tar.gz#sha256=${BUNDLE_SHA256}"
 
 elif command -v busybox >/dev/null 2>&1; then
   # --- Fallback 2: Busybox httpd (widespread on minimal/embedded systems) ---
@@ -2553,7 +3370,7 @@ elif command -v busybox >/dev/null 2>&1; then
   ln -sf "$TGZ_PATH" "$BUSYBOX_WEB/$SECRET_TOKEN/$TGZ_NAME"
   busybox httpd -f -p "$PORT" -h "$BUSYBOX_WEB" >"${HTTP_LOG}" 2>&1 &
   SHPID=$!
-  FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${TGZ_NAME}"
+  FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${TGZ_NAME}#sha256=${BUNDLE_SHA256}"
 
 elif command -v nc >/dev/null 2>&1; then
   # --- Fallback 3: Netcat one-shot HTTP (virtually universal) ---
@@ -2584,7 +3401,7 @@ NCEOF
   ) >"${HTTP_LOG}" 2>&1 &
   SHPID=$!
   # nc fallback: no secret token — URL is just http://host:port/<file>
-  FINAL_URL="${BASE_URL}/${TGZ_NAME}"
+  FINAL_URL="${BASE_URL}/${TGZ_NAME}#sha256=${BUNDLE_SHA256}"
 
 else
   RED "[ERR] 未找到可用的 HTTP 服务方式（python3 / busybox httpd / nc），请手动安装其一后重试。"
