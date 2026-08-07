@@ -10,9 +10,16 @@ PASS_COUNT=0
 FAIL_COUNT=0
 
 run_test() {
-  local name="$1"
+  local name="$1" rc
   shift
-  if ("$@"); then
+  set +e
+  (
+    set -e
+    "$@"
+  )
+  rc=$?
+  set -e
+  if ((rc == 0)); then
     printf 'ok - %s\n' "$name"
     PASS_COUNT=$((PASS_COUNT + 1))
   else
@@ -22,14 +29,68 @@ run_test() {
 }
 
 test_progress_propagates_failure() {
-  local tmp rc
+  local tmp rc output
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   set +e
-  progress_docker_save "${tmp}/images.tar" bash -c 'printf partial; exit 7' >/dev/null 2>&1
+  output="$(progress_docker_save "${tmp}/images.tar" bash -c 'printf partial; exit 7' 2>&1)"
   rc=$?
   set -e
   [[ "$rc" -eq 7 ]]
+  grep -Fq 'images.tar 失败' <<<"$output"
+  ! grep -Fq 'images.tar 完成' <<<"$output"
+}
+
+test_snapshot_cleanup_keeps_failed_records() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin"
+  cat >"${tmp}/bin/docker" <<'SH'
+#!/bin/sh
+# 同时模拟 image rm 与 daemon 探测失败；不能把它误判为“镜像已不存在”。
+exit 97
+SH
+  chmod +x "${tmp}/bin/docker"
+  TEMP_IMAGES=(docker-migrate-snapshot:test)
+  if PATH="${tmp}/bin:$PATH" cleanup_snapshot_images; then
+    return 1
+  fi
+  [[ "${#TEMP_IMAGES[@]}" -eq 1 ]]
+  [[ "${TEMP_IMAGES[0]}" == "docker-migrate-snapshot:test" ]]
+}
+
+test_final_result_summaries_are_unambiguous() {
+  local success rolled_back incomplete source
+  success="$(print_restore_result_summary SUCCESS 完成 \
+    '容器：2 个（运行 1 / 暂停 0 / 停止 1）' \
+    '数据：1 个 volume、1 个 bind 目录' \
+    '下载文件与临时目录已删除' '' '' '12 秒')"
+  [[ "$(grep -Fc 'Docker 迁移结果' <<<"$success")" -eq 1 ]]
+  [[ "$(grep -Fc '结果：' <<<"$success")" -eq 1 ]]
+  grep -Fq '结果：✅ 恢复成功' <<<"$success"
+  grep -Fq '停止 1' <<<"$success"
+  ! grep -Fq '若端口被占用' <<<"$success"
+
+  rolled_back="$(print_restore_result_summary FAILED_ROLLED_BACK 恢复独立容器 \
+    '' '' '恢复文件已保留，便于排查' '/tmp/session' '' '8 秒')"
+  [[ "$(grep -Fc '结果：' <<<"$rolled_back")" -eq 1 ]]
+  grep -Fq '结果：❌ 恢复失败，已安全回滚' <<<"$rolled_back"
+  grep -Fq '目标端状态：旧服务与原数据已恢复' <<<"$rolled_back"
+
+  incomplete="$(print_restore_result_summary FAILED_ROLLBACK_INCOMPLETE 回灌命名卷 \
+    '' '' '恢复文件已保留，便于排查' '/tmp/session' '/tmp/rollback' '9 秒')"
+  [[ "$(grep -Fc '结果：' <<<"$incomplete")" -eq 1 ]]
+  grep -Fq '自动回滚未完全成功' <<<"$incomplete"
+  grep -Fq '请勿直接启动相关容器' <<<"$incomplete"
+  grep -Fq '回滚资料：/tmp/rollback' <<<"$incomplete"
+
+  source="$(print_source_result_summary SUCCESS '已生成、完成加密并提供下载' \
+    '已停止' '已恢复 2/2' '临时迁移文件已删除' '15 秒')"
+  [[ "$(grep -Fc 'Docker 迁移结果' <<<"$source")" -eq 1 ]]
+  [[ "$(grep -Fc '结果：' <<<"$source")" -eq 1 ]]
+  grep -Fq '结果：✅ 源端任务已安全结束' <<<"$source"
+  grep -Fq '源容器：已恢复 2/2' <<<"$source"
 }
 
 test_generated_scripts_are_valid_bash() {
@@ -255,6 +316,8 @@ test_manifest_validates_compose_working_directories() {
 }
 
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
+run_test "snapshot cleanup preserves records when Docker is unavailable" test_snapshot_cleanup_keeps_failed_records
+run_test "final result summaries expose one unambiguous status" test_final_result_summaries_are_unambiguous
 run_test "generated restore scripts parse as Bash" test_generated_scripts_are_valid_bash
 run_test "bundle checksum detects tampering" test_checksums_detect_tampering
 run_test "top-level archive rejects symlinks" test_archive_layout_rejects_symlinks

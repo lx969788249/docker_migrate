@@ -17,12 +17,22 @@ source_work="${tmp}/source-work"
 bind_path="${tmp}/bind-data"
 restore_base="${tmp}/restore"
 backup_log="${tmp}/backup.log"
+restore_log="${tmp}/restore.log"
+http_failure_log="${tmp}/http-failure.log"
 backup_pid=""
 ignore_container=""
 confidential_marker="docker-migrate-e2e-confidential-${suffix}"
 wire_payload="${tmp}/wire-bundle.tar.gz.enc"
+docker_proxy_dir="${tmp}/docker-proxy"
+archive_started="${tmp}/archive-started"
+archive_release="${tmp}/archive-release"
+bind_archive_started="${tmp}/bind-archive-started"
+bind_archive_release="${tmp}/bind-archive-release"
+http_failure_proxy_dir="${tmp}/http-failure-proxy"
 
 cleanup() {
+  touch "$archive_release" 2>/dev/null || true
+  touch "$bind_archive_release" 2>/dev/null || true
   if [[ -n "$backup_pid" ]] && kill -0 "$backup_pid" 2>/dev/null; then
     kill -TERM "$backup_pid" 2>/dev/null || true
     wait "$backup_pid" 2>/dev/null || true
@@ -74,9 +84,43 @@ docker run -d --name "$paused_shared_name" -v "${volume_name}:/shared" \
   alpine:3.20 sleep 300 >/dev/null
 docker pause "$paused_shared_name" >/dev/null
 
+# 在真正开始归档命名卷前暂停一次 docker run，让测试能确定源容器在整个
+# writable layer + volume/bind 快照窗口内保持停止，而不是只在 URL 发布后检查。
+mkdir -p "$docker_proxy_dir"
+real_docker="$(command -v docker)"
+cat >"${docker_proxy_dir}/docker" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"${SOURCE_ARCHIVE_VOLUME}:/from:ro"*"tar -czf"*)
+    : >"${SOURCE_ARCHIVE_STARTED}"
+    while [ ! -e "${SOURCE_ARCHIVE_RELEASE}" ]; do sleep 0.1; done
+    ;;
+esac
+exec "$REAL_DOCKER" "$@"
+SH
+chmod +x "${docker_proxy_dir}/docker"
+real_tar="$(command -v tar)"
+cat >"${docker_proxy_dir}/tar" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"/binds/bind_"*".tgz"*)
+    : >"${SOURCE_BIND_ARCHIVE_STARTED}"
+    while [ ! -e "${SOURCE_BIND_ARCHIVE_RELEASE}" ]; do sleep 0.1; done
+    ;;
+esac
+exec "$REAL_TAR" "$@"
+SH
+chmod +x "${docker_proxy_dir}/tar"
+
 (
   cd "$source_work"
-  exec env PORT=18880 ADVERTISE_HOST=127.0.0.1 \
+  exec env PATH="${docker_proxy_dir}:$PATH" REAL_DOCKER="$real_docker" REAL_TAR="$real_tar" \
+    SOURCE_ARCHIVE_VOLUME="$volume_name" \
+    SOURCE_ARCHIVE_STARTED="$archive_started" \
+    SOURCE_ARCHIVE_RELEASE="$archive_release" \
+    SOURCE_BIND_ARCHIVE_STARTED="$bind_archive_started" \
+    SOURCE_BIND_ARCHIVE_RELEASE="$bind_archive_release" \
+    PORT=18880 ADVERTISE_HOST=127.0.0.1 \
     STOP_SHARED_MOUNTS=1 \
     DOCKER_MIGRATE_LOCK_BASE="${tmp}/source-locks" \
     DOCKER_MIGRATE_IGNORE_CONTAINERS="$ignore_container" \
@@ -84,6 +128,42 @@ docker pause "$paused_shared_name" >/dev/null
     --include="$container_name"
 ) <<<"Y" >"$backup_log" 2>&1 &
 backup_pid=$!
+
+for _ in $(seq 1 180); do
+  [[ ! -e "$archive_started" ]] || break
+  if ! kill -0 "$backup_pid" 2>/dev/null; then
+    echo "backup process exited before starting the volume archive" >&2
+    tail -n 80 "$backup_log" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+if [[ ! -e "$archive_started" ]]; then
+  echo "timed out waiting for the volume archive" >&2
+  tail -n 80 "$backup_log" >&2 || true
+  exit 1
+fi
+[[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
+[[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
+touch "$archive_release"
+
+for _ in $(seq 1 60); do
+  [[ ! -e "$bind_archive_started" ]] || break
+  if ! kill -0 "$backup_pid" 2>/dev/null; then
+    echo "backup process exited before starting the bind archive" >&2
+    tail -n 80 "$backup_log" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+if [[ ! -e "$bind_archive_started" ]]; then
+  echo "timed out waiting for the bind archive" >&2
+  tail -n 80 "$backup_log" >&2 || true
+  exit 1
+fi
+[[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
+[[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
+touch "$bind_archive_release"
 
 download_url=""
 for _ in $(seq 1 180); do
@@ -103,6 +183,10 @@ if [[ -z "$download_url" ]]; then
   exit 1
 fi
 
+# 数据快照完成后源容器应立即恢复，不能为了等待下载而持续停机。
+[[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]
+[[ "$(docker inspect -f '{{.State.Paused}}' "$paused_shared_name")" == "true" ]]
+
 # URL fragment 中的密钥不会发送到 HTTP 服务；先直接下载一次，确认线上载荷只有密文。
 wire_url="${download_url%%#*}"
 expected_wire_sha="${download_url#*#sha256=}"
@@ -121,14 +205,20 @@ if tar -tzf "$wire_payload" >/dev/null 2>&1; then
 fi
 
 # 同一 Docker daemon 模拟两台主机：删除源容器，并破坏目标数据，确保恢复来自迁移包。
-docker rm "$container_name" >/dev/null
+docker rm -f "$container_name" >/dev/null
 docker run --rm -v "${volume_name}:/to" alpine:3.20 \
   sh -c 'find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} \;; printf "stale\n" >/to/stale.txt'
 printf 'stale\n' >"${bind_path}/stale.txt"
 
 RESTORE_IGNORE_CONTAINERS="$ignore_container" RESTORE_BASE="$restore_base" \
   bash "$ROOT_DIR/docker_migrate_perfect.sh" \
-  --restore="$download_url" >/dev/null
+  --restore="$download_url" >"$restore_log" 2>&1
+
+[[ "$(grep -Fc 'Docker 迁移结果' "$restore_log")" -eq 1 ]]
+[[ "$(grep -Fc '结果：' "$restore_log")" -eq 1 ]]
+grep -Fq '结果：✅ 恢复成功' "$restore_log"
+grep -Fq '容器：1 个（运行 1 / 暂停 0 / 停止 0）' "$restore_log"
+! grep -Fq '若端口被占用' "$restore_log"
 
 [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]
 [[ "$(docker exec "$container_name" cat /writable.txt)" == "source-writable-data" ]]
@@ -139,8 +229,51 @@ RESTORE_IGNORE_CONTAINERS="$ignore_container" RESTORE_BASE="$restore_base" \
 [[ "$(docker inspect -f "{{with index .NetworkSettings.Networks \"${network_name}\"}}{{.IPAddress}}{{end}}" "$container_name")" == "$container_ip" ]]
 
 kill -TERM "$backup_pid" 2>/dev/null || true
-wait "$backup_pid" 2>/dev/null || true
+if ! wait "$backup_pid" 2>/dev/null; then
+  echo "source task reported success but returned a nonzero exit code" >&2
+  tail -n 80 "$backup_log" >&2 || true
+  exit 1
+fi
 backup_pid=""
+[[ "$(docker inspect -f '{{.State.Paused}}' "$paused_shared_name")" == "true" ]]
+[[ "$(grep -Fc 'Docker 迁移结果' "$backup_log")" -eq 1 ]]
+[[ "$(grep -Fc '结果：' "$backup_log")" -eq 1 ]]
+grep -Fq '结果：✅ 源端任务已安全结束' "$backup_log"
+grep -Fq 'HTTP 服务：已停止' "$backup_log"
+grep -Fq '源容器：已恢复 2/2' "$backup_log"
+grep -Fq '清理：临时迁移文件已删除' "$backup_log"
+if curl -fsS --max-time 2 "$wire_url" -o /dev/null 2>/dev/null; then
+  echo "HTTP transfer service remained reachable after source cleanup" >&2
+  exit 1
+fi
+
+# HTTP 子进程通过初始存活检查后若自行崩溃，源端必须返回非零并明确报告失败。
+mkdir -p "$http_failure_proxy_dir"
+cat >"${http_failure_proxy_dir}/python3" <<'SH'
+#!/bin/sh
+sleep 2
+exit 42
+SH
+chmod +x "${http_failure_proxy_dir}/python3"
+http_failure_rc=0
+(
+  cd "$source_work"
+  env PATH="${http_failure_proxy_dir}:$PATH" PORT=18881 ADVERTISE_HOST=127.0.0.1 \
+    STOP_SHARED_MOUNTS=1 \
+    DOCKER_MIGRATE_LOCK_BASE="${tmp}/source-locks" \
+    DOCKER_MIGRATE_IGNORE_CONTAINERS="$ignore_container" \
+    bash "$ROOT_DIR/docker_migrate_perfect.sh" --backup \
+    --include="$container_name"
+) <<<"Y" >"$http_failure_log" 2>&1 || http_failure_rc=$?
+[[ "$http_failure_rc" -ne 0 ]]
+[[ "$(grep -Fc 'Docker 迁移结果' "$http_failure_log")" -eq 1 ]]
+[[ "$(grep -Fc '结果：' "$http_failure_log")" -eq 1 ]]
+grep -Fq '结果：❌ 源端任务失败，清理流程已执行' "$http_failure_log"
+grep -Fq 'HTTP 服务：异常退出' "$http_failure_log"
+grep -Fq '源容器：已恢复 2/2' "$http_failure_log"
+grep -Fq '清理：临时迁移文件已删除' "$http_failure_log"
+! grep -Fq '结果：✅ 源端任务已安全结束' "$http_failure_log"
+[[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]
 [[ "$(docker inspect -f '{{.State.Paused}}' "$paused_shared_name")" == "true" ]]
 
 echo "End-to-end encrypted backup, HTTP transfer, and restore test passed"

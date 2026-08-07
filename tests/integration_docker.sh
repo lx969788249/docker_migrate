@@ -52,6 +52,11 @@ cleanup() {
     docker compose -f "${compose_work}/_resolved_config.yml" down -v >/dev/null 2>&1 || true
   fi
   docker rm -f "$container_name" >/dev/null 2>&1 || true
+  while IFS= read -r rollback_container; do
+    [[ -n "$rollback_container" ]] || continue
+    docker rm -f "$rollback_container" >/dev/null 2>&1 || true
+  done < <(docker ps -a --format '{{.Names}}' | awk -v prefix="${container_name}.docker-migrate-backup-" \
+    'index($0, prefix) == 1')
   docker rm -f "$stopped_container_name" >/dev/null 2>&1 || true
   docker rm -f "$crash_container_name" >/dev/null 2>&1 || true
   docker rm -f "$blocker_name" >/dev/null 2>&1 || true
@@ -140,7 +145,12 @@ fi
 [[ "$(docker inspect -f "{{with index .NetworkSettings.Networks \"${network_name}\"}}{{.IPAddress}}{{end}}" "$container_name")" == "$container_ip" ]]
 docker rm -f "$blocker_name" >/dev/null
 
-(cd "$bundle" && bash restore.sh >/dev/null)
+initial_restore_output="$(cd "$bundle" && bash restore.sh 2>&1)"
+[[ "$(grep -Fc 'Docker 迁移结果' <<<"$initial_restore_output")" -eq 1 ]]
+[[ "$(grep -Fc '结果：' <<<"$initial_restore_output")" -eq 1 ]]
+grep -Fq '结果：✅ 恢复成功' <<<"$initial_restore_output"
+grep -Fq '容器：1 个（运行 1 / 暂停 0 / 停止 0）' <<<"$initial_restore_output"
+! grep -Fq '若端口被占用' <<<"$initial_restore_output"
 
 [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]
 [[ "$(docker exec "$container_name" cat /writable-state.txt)" == "writable-layer-state" ]]
@@ -307,6 +317,11 @@ docker run --rm -v "${standalone_tx_volume_name}:/to:ro" alpine:3.20 sh -ec \
   'test "$(cat /to/old.txt)" = old-standalone-volume; test ! -e /to/source.txt'
 [[ "$(cat "${standalone_tx_bind}/old.txt")" == "old-standalone-bind" ]]
 [[ ! -e "${standalone_tx_bind}/source.txt" ]]
+[[ "$(grep -Fc 'Docker 迁移结果' <<<"$standalone_restore_output")" -eq 1 ]]
+[[ "$(grep -Fc '结果：' <<<"$standalone_restore_output")" -eq 1 ]]
+grep -Fq '结果：❌ 恢复失败，已安全回滚' <<<"$standalone_restore_output"
+grep -Fq '已确认宿主机端口绑定冲突' <<<"$standalone_restore_output"
+! grep -Fq '结果：✅ 恢复成功' <<<"$standalone_restore_output"
 docker rm -f "$blocker_name" >/dev/null
 
 # 原本停止的独立容器必须只创建，不能在目标端短暂启动。
@@ -653,7 +668,12 @@ YAML
   [[ ! -e "${compose_bind_target}/source.txt" ]]
   [[ "$(docker inspect -f '{{.State.Running}}' "$compose_shared_writer_name")" == "true" ]]
 
-  (cd "$compose_bundle" && bash restore.sh >/dev/null)
+  compose_restore_output="$(cd "$compose_bundle" && bash restore.sh 2>&1)"
+  [[ "$(grep -Fc 'Docker 迁移结果' <<<"$compose_restore_output")" -eq 1 ]]
+  [[ "$(grep -Fc '结果：' <<<"$compose_restore_output")" -eq 1 ]]
+  grep -Fq '结果：✅ 恢复成功' <<<"$compose_restore_output"
+  grep -Fq '容器：2 个（运行 1 / 暂停 0 / 停止 1）' <<<"$compose_restore_output"
+  ! grep -Fq '若端口被占用' <<<"$compose_restore_output"
   docker inspect "${compose_project}-first-1" |
     jq -e '.[0].Config.Env | index("MIGRATION_TEST=merged-config") != null' >/dev/null
   grep -Fq 'MIGRATION_TEST: merged-config' "${compose_work}/_resolved_config.yml"
@@ -666,6 +686,96 @@ YAML
   [[ "$(docker inspect -f '{{.State.Running}}' "$compose_shared_writer_name")" == "true" ]]
 else
   echo "skip: Docker Compose integration subtest is unavailable"
+fi
+
+# 确定性阻断 volume 回滚，验证最终摘要不会把不完整回滚误报成安全回滚。
+rollback_proxy_dir="${tmp}/rollback-failure-proxy"
+mkdir -p "$rollback_proxy_dir"
+export REAL_DOCKER
+REAL_DOCKER="$(command -v docker)"
+export CLEANUP_CONTAINER="$container_name"
+export DOCKER_PROXY_LOG="${tmp}/docker-proxy.log"
+: >"$DOCKER_PROXY_LOG"
+cat >"${rollback_proxy_dir}/docker" <<'SH'
+#!/bin/sh
+printf '%s:%s:%s\n' "$1" "$2" "$*" >>"${DOCKER_PROXY_LOG}"
+rollback_mount="${6:-}"
+if [ "$1" = "run" ] && [ "${2:-}" = "--rm" ] &&
+  [ "$rollback_mount" != "${rollback_mount%/volume_data:/from:ro}" ]; then
+  exit 97
+fi
+if [ "$1" = "rm" ] && [ "${2:-}" = "-f" ]; then
+  case "${3:-}" in
+    "${CLEANUP_CONTAINER}.docker-migrate-backup-"*) exit 96 ;;
+  esac
+fi
+exec "$REAL_DOCKER" "$@"
+SH
+chmod +x "${rollback_proxy_dir}/docker"
+proxy_probe_rc=0
+"${rollback_proxy_dir}/docker" run --rm \
+  -v probe:/to -v "${tmp}/probe/volume_data:/from:ro" alpine:3.20 true \
+  >/dev/null 2>&1 || proxy_probe_rc=$?
+[[ "$proxy_probe_rc" -eq 97 ]]
+: >"$DOCKER_PROXY_LOG"
+
+docker run -d --name "$blocker_name" -p "${host_port}:80" alpine:3.20 sleep 300 >/dev/null
+incomplete_rollback_output=""
+if incomplete_rollback_output="$(
+  cd "$standalone_tx_bundle" &&
+    PATH="${rollback_proxy_dir}:$PATH" RESTORE_HEALTH_TIMEOUT=5 bash restore.sh 2>&1
+)"; then
+  echo "rollback failure injection unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ "$(grep -Fc 'Docker 迁移结果' <<<"$incomplete_rollback_output")" -eq 1 ]]
+[[ "$(grep -Fc '结果：' <<<"$incomplete_rollback_output")" -eq 1 ]]
+if ! grep -Fq '结果：⚠️ 恢复失败，自动回滚未完全成功' \
+  <<<"$incomplete_rollback_output"; then
+  echo "rollback failure injection produced an unexpected final status" >&2
+  printf '%s\n' "$incomplete_rollback_output" >&2
+  grep -F 'volume_data' "$DOCKER_PROXY_LOG" >&2 || true
+  exit 1
+fi
+grep -Fq '请勿直接启动相关容器' <<<"$incomplete_rollback_output"
+incomplete_rollback_dir="$(sed -n 's/^回滚资料：//p' <<<"$incomplete_rollback_output" | tail -n 1)"
+if [[ -z "$incomplete_rollback_dir" || ! -d "$incomplete_rollback_dir" ]]; then
+  echo "rollback failure did not preserve the reported transaction directory" >&2
+  printf '%s\n' "$incomplete_rollback_output" >&2
+  exit 1
+fi
+! grep -Fq '结果：❌ 恢复失败，已安全回滚' <<<"$incomplete_rollback_output"
+docker rm -f "$blocker_name" >/dev/null
+
+# 新服务已经验证后若旧回滚点清理失败，不能误报 SUCCESS，也不能回滚已提交数据。
+post_commit_output=""
+if post_commit_output="$(
+  cd "$standalone_tx_bundle" &&
+    PATH="${rollback_proxy_dir}:$PATH" RESTORE_HEALTH_TIMEOUT=15 bash restore.sh 2>&1
+)"; then
+  echo "post-commit cleanup failure injection unexpectedly succeeded" >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'Docker 迁移结果' <<<"$post_commit_output")" -ne 1 ||
+"$(grep -Fc '结果：' <<<"$post_commit_output")" -ne 1 ]] ||
+  ! grep -Fq '结果：⚠️ 服务与数据已恢复，但提交后的清理未完成' \
+    <<<"$post_commit_output"; then
+  echo "post-commit cleanup failure produced an unexpected final status" >&2
+  printf '%s\n' "$post_commit_output" >&2
+  grep -F 'docker-migrate-backup-' "$DOCKER_PROXY_LOG" >&2 || true
+  exit 1
+fi
+! grep -Fq '结果：✅ 恢复成功' <<<"$post_commit_output"
+post_commit_dir="$(sed -n 's/^待清理资料：//p' <<<"$post_commit_output" | tail -n 1)"
+if [[ -z "$post_commit_dir" || ! -d "$post_commit_dir" ]]; then
+  echo "post-commit cleanup failure did not preserve its transaction manifest" >&2
+  printf '%s\n' "$post_commit_output" >&2
+  exit 1
+fi
+if [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" != "true" ]]; then
+  echo "post-commit cleanup failure rolled back or stopped the verified new container" >&2
+  printf '%s\n' "$post_commit_output" >&2
+  exit 1
 fi
 
 echo "Docker integration test passed"

@@ -56,6 +56,151 @@ RED() { echo -e "\033[1;31m$*\033[0m"; }
 OK() { echo -e "\033[1;32m$*\033[0m"; }
 CYA() { echo -e "\033[1;36m$*\033[0m"; }
 
+format_elapsed() {
+  local seconds="${1:-0}"
+  ((seconds < 0)) && seconds=0
+  if ((seconds >= 3600)); then
+    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+  elif ((seconds >= 60)); then
+    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
+  else
+    printf '%d 秒\n' "$seconds"
+  fi
+}
+
+result_rule() {
+  printf '%s\n' '━━━━━━━━━━ Docker 迁移结果 ━━━━━━━━━━'
+}
+
+result_end_rule() {
+  printf '%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+}
+
+print_restore_result_summary() {
+  local status="$1" stage="$2" container_line="$3" data_line="$4"
+  local cleanup_line="$5" diagnostic_dir="$6" rollback_dir="$7" elapsed="$8"
+
+  printf '\n'
+  result_rule
+  case "$status" in
+    SUCCESS)
+      printf '结果：✅ 恢复成功\n'
+      [[ -z "$container_line" ]] || printf '%s\n' "$container_line"
+      [[ -z "$data_line" ]] || printf '%s\n' "$data_line"
+      printf '验证：完整性校验、服务启动与健康检查均已通过\n'
+      ;;
+    FAILED_ROLLED_BACK)
+      printf '结果：❌ 恢复失败，已安全回滚\n'
+      printf '失败阶段：%s\n' "${stage:-未知阶段}"
+      printf '目标端状态：旧服务与原数据已恢复\n'
+      ;;
+    INTERRUPTED_ROLLED_BACK)
+      printf '结果：⚠️ 恢复已中断，已安全回滚\n'
+      printf '中断阶段：%s\n' "${stage:-未知阶段}"
+      printf '目标端状态：旧服务与原数据已恢复\n'
+      ;;
+    FAILED_ROLLBACK_INCOMPLETE | INTERRUPTED_ROLLBACK_INCOMPLETE)
+      if [[ "$status" == INTERRUPTED_* ]]; then
+        printf '结果：⚠️ 恢复已中断，自动回滚未完全成功\n'
+        printf '中断阶段：%s\n' "${stage:-未知阶段}"
+      else
+        printf '结果：⚠️ 恢复失败，自动回滚未完全成功\n'
+        printf '失败阶段：%s\n' "${stage:-未知阶段}"
+      fi
+      printf '重要：请勿直接启动相关容器，请根据保留的回滚资料人工处理\n'
+      [[ -z "$rollback_dir" ]] || printf '回滚资料：%s\n' "$rollback_dir"
+      ;;
+    FAILED_POST_COMMIT)
+      printf '结果：⚠️ 服务与数据已恢复，但提交后的清理未完成\n'
+      printf '失败阶段：%s\n' "${stage:-提交清理}"
+      [[ -z "$rollback_dir" ]] || printf '待清理资料：%s\n' "$rollback_dir"
+      ;;
+    INTERRUPTED)
+      printf '结果：⚠️ 恢复已中断\n'
+      printf '中断阶段：%s\n' "${stage:-未知阶段}"
+      ;;
+    *)
+      printf '结果：❌ 恢复失败\n'
+      printf '失败阶段：%s\n' "${stage:-未知阶段}"
+      ;;
+  esac
+  [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
+  [[ -z "$diagnostic_dir" ]] || printf '诊断目录：%s\n' "$diagnostic_dir"
+  [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+  result_end_rule
+}
+
+print_source_result_summary() {
+  local status="$1" package_line="$2" http_line="$3" source_line="$4"
+  local cleanup_line="$5" elapsed="$6"
+
+  printf '\n'
+  result_rule
+  case "$status" in
+    SUCCESS) printf '结果：✅ 源端任务已安全结束\n' ;;
+    INTERRUPTED) printf '结果：⚠️ 源端任务已中断，清理流程已执行\n' ;;
+    *) printf '结果：❌ 源端任务失败，清理流程已执行\n' ;;
+  esac
+  [[ -z "$package_line" ]] || printf '迁移包：%s\n' "$package_line"
+  [[ -z "$http_line" ]] || printf 'HTTP 服务：%s\n' "$http_line"
+  [[ -z "$source_line" ]] || printf '源容器：%s\n' "$source_line"
+  [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
+  [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+  result_end_rule
+}
+
+restore_target_container_names() {
+  local bundle_dir="$1" run project service found_service inspect_file
+  [[ -f "${bundle_dir}/manifest.json" ]] || return 0
+  while IFS= read -r run; do
+    [[ -n "$run" ]] || continue
+    basename "${run%.sh}"
+  done < <(jq -r '.runs[]?' "${bundle_dir}/manifest.json" 2>/dev/null || true)
+  while IFS= read -r project; do
+    [[ -n "$project" ]] || continue
+    found_service=0
+    for inspect_file in "${bundle_dir}"/meta/*.inspect.json; do
+      [[ -f "$inspect_file" ]] || continue
+      service="$(jq -r --arg project "$project" '
+        if (.[0].Config.Labels["com.docker.compose.project"] // "") == $project
+        then .[0].Config.Labels["com.docker.compose.service"] // empty
+        else empty end
+      ' "$inspect_file" 2>/dev/null || true)"
+      [[ -n "$service" ]] || continue
+      found_service=1
+      docker ps -a --filter "label=com.docker.compose.project=${project}" \
+        --filter "label=com.docker.compose.service=${service}" \
+        --format '{{.Names}}' 2>/dev/null || true
+    done
+    if ((found_service == 0)); then
+      docker ps -a --filter "label=com.docker.compose.project=${project}" \
+        --format '{{.Names}}' 2>/dev/null || true
+    fi
+  done < <(jq -r '.projects[]?.name' "${bundle_dir}/manifest.json" 2>/dev/null || true)
+}
+
+collect_restore_result_metrics() {
+  local bundle_dir="$1" name state
+  local total=0 running=0 paused=0 stopped=0 missing=0 volumes=0 binds=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    total=$((total + 1))
+    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    case "$state" in
+      running | restarting) running=$((running + 1)) ;;
+      paused) paused=$((paused + 1)) ;;
+      created | exited | dead | removing) stopped=$((stopped + 1)) ;;
+      *) missing=$((missing + 1)) ;;
+    esac
+  done < <(restore_target_container_names "$bundle_dir" | awk 'NF && !seen[$0]++')
+  if [[ -f "${bundle_dir}/manifest.json" ]]; then
+    volumes="$(jq -r '.volumes | length' "${bundle_dir}/manifest.json" 2>/dev/null || echo 0)"
+    binds="$(jq -r '.binds | length' "${bundle_dir}/manifest.json" 2>/dev/null || echo 0)"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$total" "$running" "$paused" "$stopped" "$missing" "$volumes" "$binds"
+}
+
 show_banner() {
   echo -e "\033[1;36m"
   cat <<'BANNER'
@@ -222,7 +367,11 @@ progress_docker_save() {
     fi
     local cur
     cur=$(stat -c %s "$outfile" 2>/dev/null || stat -f%z "$outfile" 2>/dev/null || echo 0)
-    echo "[进度] images.tar 完成：$(human "$cur")"
+    if ((rc == 0)); then
+      echo "[进度] images.tar 完成：$(human "$cur")"
+    else
+      echo "[进度] images.tar 失败（已写入：$(human "$cur")）"
+    fi
   else
     BLUE "[INFO] 保存镜像 images.tar（此步骤可能较久，请耐心等待）..."
     "$@" >"$outfile" &
@@ -259,7 +408,11 @@ progress_docker_save() {
     wait "$spinner_pid" 2>/dev/null || true
     cur=$(stat -c %s "$outfile" 2>/dev/null || stat -f%z "$outfile" 2>/dev/null || echo 0)
     printf "\r%-80s\r" ""
-    echo "[进度] images.tar 完成：$(human "$cur")"
+    if ((rc == 0)); then
+      echo "[进度] images.tar 完成：$(human "$cur")"
+    else
+      echo "[进度] images.tar 失败（已写入：$(human "$cur")）"
+    fi
   fi
   return "$rc"
 }
@@ -623,11 +776,23 @@ write_compose_snapshot_override() {
 }
 
 cleanup_snapshot_images() {
-  local image
+  local image rc=0
+  local -a remaining=()
   for image in "${TEMP_IMAGES[@]}"; do
-    docker image rm "$image" >/dev/null 2>&1 || true
+    if docker image rm "$image" >/dev/null 2>&1; then
+      continue
+    fi
+    # rm 失败后，只有在 Docker daemon 可用且明确查不到镜像时才视为已清理；
+    # daemon/权限异常必须保留记录，供退出清理重试并反映在最终结果中。
+    if docker info >/dev/null 2>&1 &&
+      ! docker image inspect "$image" >/dev/null 2>&1; then
+      continue
+    fi
+    remaining+=("$image")
+    rc=1
   done
-  TEMP_IMAGES=()
+  TEMP_IMAGES=("${remaining[@]}")
+  return "$rc"
 }
 
 generate_bundle_checksums() {
@@ -1168,6 +1333,7 @@ fi
 # 关键修复：稳健还原 PortBindings。
 # 旧脚本在 HostPort 为空或 IPv6 HostIp 场景下容易生成无效 -p；这里跳过空 HostPort，并给 IPv6 加 []。
 mapfile -t port_bindings < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[]? | .key as $c | .value[]? | "\(.HostIp // "")|\(.HostPort // "")|\($c)"' "$META")
+published_ports=()
 for p in "${port_bindings[@]}"; do
   host_ip="${p%%|*}"
   rest="${p#*|}"
@@ -1184,13 +1350,15 @@ for p in "${port_bindings[@]}"; do
 
   if [[ -n "$host_ip" && "$host_ip" != "0.0.0.0" ]]; then
     if [[ "$host_ip" == *:* ]]; then
-      args+=(-p "[${host_ip}]:${host_port}:${cont_port}")
+      port_binding="[${host_ip}]:${host_port}:${cont_port}"
     else
-      args+=(-p "${host_ip}:${host_port}:${cont_port}")
+      port_binding="${host_ip}:${host_port}:${cont_port}"
     fi
   else
-    args+=(-p "${host_port}:${cont_port}")
+    port_binding="${host_port}:${cont_port}"
   fi
+  args+=(-p "$port_binding")
+  published_ports+=("$port_binding")
   echo "[INFO] restore port: ${host_ip:-0.0.0.0}:${host_port}->${cont_port}"
 done
 
@@ -1252,32 +1420,27 @@ if ((${#cmd_args[@]})); then
   args+=("${cmd_args[@]}")
 fi
 
+run_output=""
 set +e
-"${args[@]}"
+run_output="$("${args[@]}" 2>&1)"
 run_rc=$?
 set -e
 
-# 端口冲突检测：宿主机端口已被占用时给出明确提示
 if [[ $run_rc -ne 0 ]]; then
-  # 回显 docker run 的所有 -p 参数便于排查
-  failed_ports=()
-  for a in "${args[@]}"; do
-    [[ "$a" == -p ]] && continue
-    [[ "$a" == -* ]] && { last_opt="$a"; continue; }
-    if [[ -n "${last_opt:-}" ]]; then last_opt=""; fi
-    if [[ "$a" == *:* ]]; then
-      failed_ports+=("$a")
+  echo "[ERR] 容器创建或启动失败：$name" >&2
+  [[ -z "$run_output" ]] || printf '%s\n' "$run_output" >&2
+  if grep -Eqi 'port is already allocated|address already in use|Bind for .* failed|failed to bind host port' \
+    <<<"$run_output"; then
+    echo "[ERR] 已确认宿主机端口绑定冲突。" >&2
+    if ((${#published_ports[@]})); then
+      echo "[INFO] 本次尝试绑定的端口：" >&2
+      for p in "${published_ports[@]}"; do
+        echo "[INFO]   - $p" >&2
+      done
     fi
-  done
-  if ((${#failed_ports[@]})); then
-    echo "[WARN] 容器启动失败，可能是端口冲突。" >&2
-    echo "[WARN] 尝试绑定的端口：" >&2
-    for p in "${failed_ports[@]}"; do
-      echo "[WARN]   - $p" >&2
-    done
-    echo "[WARN] 请检查占用端口的进程并释放：sudo ss -lntp | grep <PORT>" >&2
+    echo "[INFO] 可执行 sudo ss -lntp 检查占用端口的进程。" >&2
   fi
-  exit $run_rc
+  exit "$run_rc"
 fi
 
 # 连接额外网络。
@@ -1423,6 +1586,161 @@ TRANSACTION_ACTIVE=0
 RESTORE_LOCK_METHOD=""
 RESTORE_LOCK_FILE=""
 RESTORE_LOCK_DIR=""
+RESTORE_STAGE="初始化"
+RESTORE_STARTED_AT=$SECONDS
+RESTORE_COMMIT_STARTED=0
+
+restore_format_elapsed() {
+  local seconds="${1:-0}"
+  ((seconds < 0)) && seconds=0
+  if ((seconds >= 3600)); then
+    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+  elif ((seconds >= 60)); then
+    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
+  else
+    printf '%d 秒\n' "$seconds"
+  fi
+}
+
+restore_target_container_names() {
+  local run project service found_service inspect_file
+  while IFS= read -r run; do
+    [[ -n "$run" ]] || continue
+    basename "${run%.sh}"
+  done < <(jq -r '.runs[]?' manifest.json 2>/dev/null || true)
+  while IFS= read -r project; do
+    [[ -n "$project" ]] || continue
+    found_service=0
+    for inspect_file in meta/*.inspect.json; do
+      [[ -f "$inspect_file" ]] || continue
+      service="$(jq -r --arg project "$project" '
+        if (.[0].Config.Labels["com.docker.compose.project"] // "") == $project
+        then .[0].Config.Labels["com.docker.compose.service"] // empty
+        else empty end
+      ' "$inspect_file" 2>/dev/null || true)"
+      [[ -n "$service" ]] || continue
+      found_service=1
+      docker ps -a --filter "label=com.docker.compose.project=${project}" \
+        --filter "label=com.docker.compose.service=${service}" \
+        --format '{{.Names}}' 2>/dev/null || true
+    done
+    if ((found_service == 0)); then
+      docker ps -a --filter "label=com.docker.compose.project=${project}" \
+        --format '{{.Names}}' 2>/dev/null || true
+    fi
+  done < <(jq -r '.projects[]?.name' manifest.json 2>/dev/null || true)
+}
+
+restore_result_metrics() {
+  local name state total=0 running=0 paused=0 stopped=0 missing=0 volumes=0 binds=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    total=$((total + 1))
+    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    case "$state" in
+      running | restarting) running=$((running + 1)) ;;
+      paused) paused=$((paused + 1)) ;;
+      created | exited | dead | removing) stopped=$((stopped + 1)) ;;
+      *) missing=$((missing + 1)) ;;
+    esac
+  done < <(restore_target_container_names | awk 'NF && !seen[$0]++')
+  volumes="$(jq -r '.volumes | length' manifest.json 2>/dev/null || echo 0)"
+  binds="$(jq -r '.binds | length' manifest.json 2>/dev/null || echo 0)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$total" "$running" "$paused" "$stopped" "$missing" "$volumes" "$binds"
+}
+
+restore_record_result() {
+  local status="$1" rollback_dir="${2:-}" result_file="${RESTORE_RESULT_FILE:-}" tmp
+  [[ -n "$result_file" ]] || return 0
+  tmp="${result_file}.tmp.$$"
+  if jq -n --arg status "$status" --arg stage "$RESTORE_STAGE" \
+    --arg rollback_dir "$rollback_dir" \
+    '{status:$status,stage:$stage,rollback_dir:$rollback_dir}' >"$tmp"; then
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$result_file"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+restore_print_final_result() {
+  local status="$1" rollback_dir="${2:-}" metrics total running paused stopped missing volumes binds
+  local elapsed container_line data_line
+  elapsed="$(restore_format_elapsed "$((SECONDS - RESTORE_STARTED_AT))")"
+  container_line=""
+  data_line=""
+  if [[ "$status" == "SUCCESS" ]]; then
+    metrics="$(restore_result_metrics)"
+    IFS=$'\t' read -r total running paused stopped missing volumes binds <<<"$metrics"
+    container_line="容器：${total} 个（运行 ${running} / 暂停 ${paused} / 停止 ${stopped}"
+    ((missing == 0)) || container_line+=" / 缺失 ${missing}"
+    container_line+="）"
+    data_line="数据：${volumes} 个 volume、${binds} 个 bind 目录"
+  fi
+
+  printf '\n%s\n' '━━━━━━━━━━ Docker 迁移结果 ━━━━━━━━━━'
+  case "$status" in
+    SUCCESS)
+      printf '结果：✅ 恢复成功\n%s\n%s\n' "$container_line" "$data_line"
+      printf '验证：完整性校验、服务启动与健康检查均已通过\n'
+      printf '清理：迁移包目录保持不变（手动恢复模式）\n'
+      ;;
+    FAILED_ROLLED_BACK)
+      printf '结果：❌ 恢复失败，已安全回滚\n失败阶段：%s\n' "$RESTORE_STAGE"
+      printf '目标端状态：旧服务与原数据已恢复\n诊断目录：%s\n' "$BUNDLE_DIR"
+      ;;
+    INTERRUPTED_ROLLED_BACK)
+      printf '结果：⚠️ 恢复已中断，已安全回滚\n中断阶段：%s\n' "$RESTORE_STAGE"
+      printf '目标端状态：旧服务与原数据已恢复\n诊断目录：%s\n' "$BUNDLE_DIR"
+      ;;
+    FAILED_ROLLBACK_INCOMPLETE | INTERRUPTED_ROLLBACK_INCOMPLETE)
+      if [[ "$status" == INTERRUPTED_* ]]; then
+        printf '结果：⚠️ 恢复已中断，自动回滚未完全成功\n中断阶段：%s\n' "$RESTORE_STAGE"
+      else
+        printf '结果：⚠️ 恢复失败，自动回滚未完全成功\n失败阶段：%s\n' "$RESTORE_STAGE"
+      fi
+      printf '重要：请勿直接启动相关容器，请根据保留的回滚资料人工处理\n'
+      [[ -z "$rollback_dir" ]] || printf '回滚资料：%s\n' "$rollback_dir"
+      printf '诊断目录：%s\n' "$BUNDLE_DIR"
+      ;;
+    FAILED_POST_COMMIT)
+      printf '结果：⚠️ 服务与数据已恢复，但提交后的清理未完成\n'
+      printf '失败阶段：%s\n' "$RESTORE_STAGE"
+      [[ -z "$rollback_dir" ]] || printf '待清理资料：%s\n' "$rollback_dir"
+      ;;
+    INTERRUPTED)
+      printf '结果：⚠️ 恢复已中断\n中断阶段：%s\n诊断目录：%s\n' "$RESTORE_STAGE" "$BUNDLE_DIR"
+      ;;
+    *)
+      printf '结果：❌ 恢复失败\n失败阶段：%s\n诊断目录：%s\n' "$RESTORE_STAGE" "$BUNDLE_DIR"
+      ;;
+  esac
+  printf '耗时：%s\n%s\n' "$elapsed" '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+}
+
+restore_finish_result() {
+  local status="$1" rollback_dir="${2:-}"
+  restore_record_result "$status" "$rollback_dir" || true
+  if [[ "${RESTORE_DEFER_FINAL_SUMMARY:-0}" != "1" ]]; then
+    restore_print_final_result "$status" "$rollback_dir"
+  fi
+}
+
+restore_nontransaction_exit_handler() {
+  local rc=$? status="FAILED" rollback_dir="${RESTORE_TRANSACTION_DIR:-}"
+  trap - EXIT INT TERM
+  transaction_release_lock || true
+  if ((rc == 0)); then
+    status="SUCCESS"
+  elif ((RESTORE_COMMIT_STARTED == 1)); then
+    status="FAILED_POST_COMMIT"
+  elif [[ "$rc" == "129" || "$rc" == "130" || "$rc" == "143" ]]; then
+    status="INTERRUPTED"
+  fi
+  restore_finish_result "$status" "$rollback_dir"
+  exit "$rc"
+}
 
 restore_has_failures() {
   (( ${#FAILED_VOLUMES[@]} > 0 ||
@@ -1831,16 +2149,19 @@ tree_links_stay_within_root() {
 
 volume_clear_and_extract() {
   local volume="$1" archive_dir="$2" archive_file="$3" validate_links="${4:-1}"
-  docker run --rm \
+  if ! docker run --rm \
     -v "${volume}:/to" \
     -v "${archive_dir}:/from:ro" \
     alpine:3.20 sh -eu -c '
       find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} \;
       tar -xzf "/from/$1" -C /to
-    ' sh "$archive_file"
-  if [[ "$validate_links" == "1" ]]; then
-    tree_links_stay_within_root "$volume"
+    ' sh "$archive_file"; then
+    return 1
   fi
+  if [[ "$validate_links" == "1" ]]; then
+    tree_links_stay_within_root "$volume" || return 1
+  fi
+  return 0
 }
 
 restore_volume_exact() {
@@ -2502,7 +2823,9 @@ transaction_discard_prepared() {
   RESTORE_TRANSACTION_DIR=""
   export RESTORE_TRANSACTION_DIR
   transaction_release_lock
-  trap - EXIT INT TERM
+  trap restore_nontransaction_exit_handler EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 }
 
 transaction_remove_new_services() {
@@ -2694,34 +3017,62 @@ transaction_restore_shared() {
 
 transaction_cleanup_artifacts() {
   local preserve_compose="${1:-0}"
-  local name backup state project had_old rollback_dir volume existed rollback_file host old
+  local name backup state project had_old rollback_dir volume existed rollback_file host old image
+  local rc=0
   if [[ -f "${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv" ]]; then
     while IFS=$'\t' read -r name backup state; do
       [[ -n "$backup" ]] || continue
-      docker rm -f "$backup" >/dev/null 2>&1 || true
+      if ! docker rm -f "$backup" >/dev/null 2>&1; then
+        if ! docker info >/dev/null 2>&1 || transaction_container_exists "$backup"; then
+          warn " · 无法清理旧单容器回滚点：$backup"
+          rc=1
+        fi
+      fi
     done <"${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv"
   fi
   if [[ "$preserve_compose" != "1" && -f "${RESTORE_TRANSACTION_DIR}/compose.tsv" ]]; then
     while IFS=$'\t' read -r project had_old; do
       [[ "$had_old" == "1" ]] || continue
       rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
-      compose_rollback_image_cleanup "$rollback_dir"
+      [[ -f "${rollback_dir}/images.list" ]] || continue
+      while IFS= read -r image; do
+        [[ -n "$image" ]] || continue
+        if ! docker image rm "$image" >/dev/null 2>&1; then
+          if ! docker info >/dev/null 2>&1 ||
+            docker image inspect "$image" >/dev/null 2>&1; then
+            warn " · 无法清理 Compose 回滚镜像：$image"
+            rc=1
+          fi
+        fi
+      done <"${rollback_dir}/images.list"
     done <"${RESTORE_TRANSACTION_DIR}/compose.tsv"
   fi
   if [[ -f "${RESTORE_TRANSACTION_DIR}/volumes.tsv" ]]; then
     while IFS=$'\t' read -r volume existed rollback_file; do
       [[ "$existed" == "1" ]] || continue
-      rm -f "$rollback_file" || true
+      if ! rm -f "$rollback_file"; then
+        warn " · 无法清理命名卷回滚包：$rollback_file"
+        rc=1
+      fi
     done <"${RESTORE_TRANSACTION_DIR}/volumes.tsv"
   fi
   if [[ -f "${RESTORE_TRANSACTION_DIR}/binds.tsv" ]]; then
     while IFS=$'\t' read -r host had_old old; do
       [[ "$had_old" == "1" ]] || continue
-      root_exec rm -rf "$old" || true
+      if ! root_exec rm -rf "$old"; then
+        warn " · 无法清理绑定目录回滚点：$old"
+        rc=1
+      fi
     done <"${RESTORE_TRANSACTION_DIR}/binds.tsv"
   fi
-  rm -rf "${RESTORE_TRANSACTION_DIR}/file_backups" || true
-  : >"${RESTORE_TRANSACTION_DIR}/files.tsv"
+  if ! root_exec rm -rf "${RESTORE_TRANSACTION_DIR}/file_backups"; then
+    warn " · 无法清理文件回滚点：${RESTORE_TRANSACTION_DIR}/file_backups"
+    rc=1
+  fi
+
+  # 清理失败时保留所有事务清单。提交后的 EXIT handler 会将该目录报告为
+  # FAILED_POST_COMMIT 的待清理资料，便于定位尚未删除的回滚点。
+  return "$rc"
 }
 
 transaction_rollback() {
@@ -2770,12 +3121,18 @@ transaction_rollback() {
     if ((preserve_compose == 1)); then
       # Compose 会把实际配置文件路径写入容器 labels。回滚后的容器仍引用这里的
       # config.yml/images.yml，因此保留这些小文件，后续迁移才能再次建立回滚点。
-      transaction_cleanup_artifacts 1
+      if ! transaction_cleanup_artifacts 1; then
+        warn "部分无用回滚资料未能清理，事务清单已保留：$RESTORE_TRANSACTION_DIR"
+      fi
       warn "目标端旧服务、volume 与 bind 数据已统一恢复。"
       warn "Compose 回滚配置需随旧容器保留：$RESTORE_TRANSACTION_DIR"
     else
-      transaction_cleanup_artifacts
-      rm -rf "$RESTORE_TRANSACTION_DIR"
+      if transaction_cleanup_artifacts; then
+        rm -rf "$RESTORE_TRANSACTION_DIR" ||
+          warn "回滚已完成，但事务目录未能删除：$RESTORE_TRANSACTION_DIR"
+      else
+        warn "回滚已完成，但部分无用回滚资料未能清理：$RESTORE_TRANSACTION_DIR"
+      fi
       warn "目标端旧服务、volume 与 bind 数据已统一恢复。"
     fi
   else
@@ -2787,17 +3144,43 @@ transaction_rollback() {
 }
 
 transaction_exit_handler() {
-  local rc=$? rollback_rc=0
+  local original_rc=$? exit_rc rollback_rc=0 rollback_dir="${RESTORE_TRANSACTION_DIR:-}" status
+  exit_rc=$original_rc
   trap - EXIT INT TERM
+
+  # RESTORE_COMMIT_STARTED 是唯一的不可逆提交点。它置位后绝不再回滚，即使
+  # TRANSACTION_ACTIVE 尚未来得及清零或清理过程中收到 INT/TERM。
+  if ((RESTORE_COMMIT_STARTED == 1)); then
+    transaction_release_lock || true
+    if ((original_rc == 0)); then
+      status="SUCCESS"
+    else
+      status="FAILED_POST_COMMIT"
+    fi
+    restore_finish_result "$status" "$rollback_dir"
+    exit "$exit_rc"
+  fi
+
   if ((TRANSACTION_ACTIVE == 1)); then
     set +e
     transaction_rollback
     rollback_rc=$?
     set -e
-    ((rollback_rc == 0)) || rc=1
-    ((rc != 0)) || rc=1
+    ((exit_rc != 0)) || exit_rc=1
   fi
-  exit "$rc"
+  if [[ "$original_rc" == "129" || "$original_rc" == "130" || "$original_rc" == "143" ]]; then
+    if ((rollback_rc == 0)); then
+      status="INTERRUPTED_ROLLED_BACK"
+    else
+      status="INTERRUPTED_ROLLBACK_INCOMPLETE"
+    fi
+  elif ((rollback_rc == 0)); then
+    status="FAILED_ROLLED_BACK"
+  else
+    status="FAILED_ROLLBACK_INCOMPLETE"
+  fi
+  restore_finish_result "$status" "$rollback_dir"
+  exit "$exit_rc"
 }
 
 transaction_prepare() {
@@ -2819,7 +3202,7 @@ transaction_prepare() {
   mkdir -p "$lock_base"
   chmod 700 "$lock_base" 2>/dev/null || true
   transaction_acquire_lock "$lock_base" || return 1
-  trap transaction_release_lock EXIT
+  trap restore_nontransaction_exit_handler EXIT
 
   if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null; then
     has_data=1
@@ -2839,13 +3222,13 @@ transaction_prepare() {
   if [[ "$policy" == "fail" && "$existing_targets" -gt 0 ]]; then
     warn "目标端已存在待恢复服务，RESTORE_EXISTING=fail 在修改任何数据前终止。"
     transaction_release_lock
-    trap - EXIT
+    trap restore_nontransaction_exit_handler EXIT
     return 1
   fi
   if [[ "$policy" == "skip" && "$has_data" == "1" && "$existing_targets" -gt 0 ]]; then
     warn "RESTORE_EXISTING=skip 无法安全区分共享数据归属；存在 volume/bind 时拒绝部分覆盖。"
     transaction_release_lock
-    trap - EXIT
+    trap restore_nontransaction_exit_handler EXIT
     return 1
   fi
 
@@ -2857,7 +3240,7 @@ transaction_prepare() {
     else
       warn "新机未安装 docker compose/docker-compose，恢复尚未修改目标端。"
       transaction_release_lock
-      trap - EXIT
+      trap restore_nontransaction_exit_handler EXIT
       return 1
     fi
   fi
@@ -2865,7 +3248,7 @@ transaction_prepare() {
   RESTORE_TRANSACTION_DIR="$(mktemp -d \
     "${rollback_base}/transaction.XXXXXX")" || {
     transaction_release_lock
-    trap - EXIT
+    trap restore_nontransaction_exit_handler EXIT
     return 1
   }
   export RESTORE_TRANSACTION_DIR
@@ -3024,22 +3407,32 @@ transaction_commit() {
   fi
   ((shared_ok == 1)) || return 1
 
-  # 这是不可逆提交点：新服务及数据已验证，共享写入者也已恢复。先关闭
-  # rollback trap，再清理旧回滚点；此后收到 TERM 最多留下备份，绝不能
-  # 再删除新服务并尝试使用已经部分清掉的回滚内容。
+  # 这是不可逆提交点：新服务及数据已验证，共享写入者也已恢复。
+  # EXIT handler 始终保持不变，只用这一条赋值区分“可回滚”与“已提交”；
+  # 因此 INT/TERM 不会落入 trap 切换或两个状态变量之间的竞态窗口。
+  RESTORE_STAGE="提交与清理回滚点"
+  RESTORE_COMMIT_STARTED=1
   TRANSACTION_ACTIVE=0
-  trap transaction_release_lock EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  transaction_cleanup_artifacts
-  rm -rf "$RESTORE_TRANSACTION_DIR"
+  if ! transaction_cleanup_artifacts; then
+    warn "服务与数据已恢复，但部分旧回滚资料清理失败：$RESTORE_TRANSACTION_DIR"
+    return 1
+  fi
+  if ! rm -rf "$RESTORE_TRANSACTION_DIR"; then
+    warn "服务与数据已恢复，但事务目录清理失败：$RESTORE_TRANSACTION_DIR"
+    return 1
+  fi
   RESTORE_TRANSACTION_DIR=""
   export RESTORE_TRANSACTION_DIR
   transaction_release_lock
-  trap - EXIT INT TERM
+  RESTORE_STAGE="完成"
   say "所有服务与数据已通过验证，恢复事务已提交。"
 }
 
+trap restore_nontransaction_exit_handler EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+RESTORE_STAGE="迁移包校验"
 if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" == "1" ]]; then
   :
 elif [[ -f checksums.sha256 ]]; then
@@ -3059,6 +3452,7 @@ if ! transaction_internal_paths_are_safe; then
   exit 1
 fi
 
+RESTORE_STAGE="加载镜像"
 say "[A] 加载镜像（如 images.tar 存在）"
 if [[ -f images.tar ]]; then
   docker load -i images.tar || warn "部分镜像加载失败，将尝试在线拉取"
@@ -3066,6 +3460,7 @@ else
   warn "images.tar 不存在，将按需在线拉取镜像。"
 fi
 
+RESTORE_STAGE="建立统一回滚事务"
 say "[A.1] 建立目标端服务与数据统一回滚事务"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
@@ -3076,6 +3471,7 @@ if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/
 fi
 transaction_prepare
 
+RESTORE_STAGE="回灌命名卷"
 say "[B] 回灌命名卷"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p volumes
@@ -3129,6 +3525,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   done < <(jq -c '.volumes[]' manifest.json)
 fi
 
+RESTORE_STAGE="回灌绑定目录"
 say "[C] 回灌绑定目录"
 if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p binds
@@ -3160,6 +3557,7 @@ if ((${#FAILED_VOLUMES[@]} > 0 || ${#FAILED_BINDS[@]} > 0)); then
   exit 1
 fi
 
+RESTORE_STAGE="恢复 Compose 项目"
 say "[D] 恢复 Compose 项目"
 if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
   COMPOSE_RESTORE_ROOT="${RESTORE_TRANSACTION_DIR}/incoming_compose"
@@ -3281,6 +3679,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
   done < <(jq -c '.projects[]' manifest.json)
 fi
 
+RESTORE_STAGE="创建独立容器网络"
 say "[E] 创建独立容器自定义网络（非 Compose）"
 declare -A COMPOSE_NETS=()
 while IFS= read -r n; do
@@ -3310,6 +3709,7 @@ if ((${#FAILED_NETWORKS[@]} > 0)); then
   exit 1
 fi
 
+RESTORE_STAGE="恢复独立容器"
 say "[F] 恢复单容器（非 Compose）"
 if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r r; do
@@ -3336,10 +3736,6 @@ if restore_has_failures; then
 fi
 
 transaction_commit
-
-say "[G] 完成，当前容器："
-docker ps --format ' {{.Names}}\t{{.Status}}\t{{.Ports}}'
-echo "提示：若端口被占用，请释放端口后重新执行 restore.sh；本版会在端口绑定不一致时重建同名容器。"
 REST_SH
   chmod +x "$out"
 }
@@ -3412,6 +3808,7 @@ restore_ensure_deps() {
 restore_main() {
   local URL DOWNLOAD_URL EXPECTED_SHA256 ENCRYPTION_SCHEME ENCRYPTION_SECRET
   local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY encrypted=0
+  local restore_started=$SECONDS
   URL="$(restore_prompt_url "${1:-}")"
   DOWNLOAD_URL="$(bundle_download_url "$URL")"
   EXPECTED_SHA256="$(bundle_expected_sha256 "$URL")"
@@ -3556,32 +3953,69 @@ restore_main() {
 
   BLUE "[INFO] 执行恢复脚本：${BUNDLE_DIR}/restore.sh"
   BLUE "[INFO] 该步骤会加载镜像、回灌卷和绑定目录，并启动容器，可能需要数分钟，请耐心等待..."
-  local rc
+  local rc result_file="${SESSION_DIR}/restore-result.json" result_status result_stage rollback_dir
+  local metrics total running paused stopped missing volumes binds
+  local container_line="" data_line="" cleanup_line="" diagnostic_dir="" elapsed
   set +e
   RESTORE_CHECKSUM_VERIFIED=1 RESTORE_SESSION_DIR="$SESSION_DIR" \
+    RESTORE_RESULT_FILE="$result_file" RESTORE_DEFER_FINAL_SUMMARY=1 \
     bash "${BUNDLE_DIR}/restore.sh"
   rc=$?
   set -e
-  if [[ $rc -eq 0 ]]; then
-    OK "[OK] 恢复完成！当前容器："
-    docker ps --format ' {{.Names}}\t{{.Status}}\t{{.Ports}}'
-    if [[ "${RESTORE_KEEP:-0}" == "1" ]]; then
-      YEL "[INFO] 已按 RESTORE_KEEP=1 保留恢复文件：$SESSION_DIR"
-    else
-      rm -rf "$SESSION_DIR" 2>/dev/null || true
-      OK "[OK] 已清理下载文件与临时目录"
-    fi
-    exit 0
-  else
-    RED "[ERR] 恢复脚本返回非零：$rc"
-    YEL "[INFO] 为便于排查，默认保留恢复文件：$SESSION_DIR"
-    if [[ "${RESTORE_CLEAN_ALL:-0}" == "1" ]]; then
-      YEL "[WARN] RESTORE_CLEAN_ALL=1：仍将强制删除文件"
-      rm -rf "$SESSION_DIR" 2>/dev/null || true
-      OK "[OK] 已清理下载文件与临时目录"
-    fi
-    exit "$rc"
+
+  result_status=""
+  result_stage="执行恢复脚本"
+  rollback_dir=""
+  if [[ -s "$result_file" ]]; then
+    result_status="$(jq -r '.status // empty' "$result_file" 2>/dev/null || true)"
+    result_stage="$(jq -r '.stage // "执行恢复脚本"' "$result_file" 2>/dev/null || true)"
+    rollback_dir="$(jq -r '.rollback_dir // empty' "$result_file" 2>/dev/null || true)"
   fi
+  if [[ -z "$result_status" ]]; then
+    if ((rc == 0)); then
+      result_status="SUCCESS"
+    elif [[ "$rc" == "129" || "$rc" == "130" || "$rc" == "143" ]]; then
+      result_status="INTERRUPTED"
+    else
+      result_status="FAILED"
+    fi
+  fi
+
+  if [[ "$result_status" == "SUCCESS" ]]; then
+    metrics="$(collect_restore_result_metrics "$BUNDLE_DIR")"
+    IFS=$'\t' read -r total running paused stopped missing volumes binds <<<"$metrics"
+    container_line="容器：${total} 个（运行 ${running} / 暂停 ${paused} / 停止 ${stopped}"
+    ((missing == 0)) || container_line+=" / 缺失 ${missing}"
+    container_line+="）"
+    data_line="数据：${volumes} 个 volume、${binds} 个 bind 目录"
+    if [[ "${RESTORE_KEEP:-0}" == "1" ]]; then
+      cleanup_line="恢复文件已按 RESTORE_KEEP=1 保留：$SESSION_DIR"
+    else
+      if rm -rf "$SESSION_DIR" 2>/dev/null; then
+        cleanup_line="下载文件与临时目录已删除"
+      else
+        cleanup_line="恢复成功，但部分下载文件或临时目录未能删除，请人工检查"
+        diagnostic_dir="$SESSION_DIR"
+      fi
+    fi
+  else
+    if [[ "${RESTORE_CLEAN_ALL:-0}" == "1" ]]; then
+      if rm -rf "$SESSION_DIR" 2>/dev/null; then
+        cleanup_line="已按 RESTORE_CLEAN_ALL=1 删除下载文件与临时目录"
+      else
+        cleanup_line="RESTORE_CLEAN_ALL=1 清理未完成，请人工检查"
+        diagnostic_dir="$SESSION_DIR"
+      fi
+    else
+      cleanup_line="恢复文件已保留，便于排查"
+      diagnostic_dir="$SESSION_DIR"
+    fi
+  fi
+
+  elapsed="$(format_elapsed "$((SECONDS - restore_started))")"
+  print_restore_result_summary "$result_status" "$result_stage" "$container_line" "$data_line" \
+    "$cleanup_line" "$diagnostic_dir" "$rollback_dir" "$elapsed"
+  exit "$rc"
 }
 
 if [[ "${DOCKER_MIGRATE_LIB_ONLY:-0}" == "1" ]]; then
@@ -3764,32 +4198,72 @@ fi
 
 SHPID=""
 CLEANUP_DONE=0
+SOURCE_TASK_STARTED_AT=$SECONDS
+SOURCE_PACKAGE_READY=0
+SOURCE_TRANSFER_PUBLISHED=0
+SOURCE_RESTORE_EXPECTED=0
+SOURCE_RESTORED_COUNT=0
+HTTP_WAS_STARTED=0
+HTTP_EXIT_UNEXPECTED=0
+HTTP_CLEANUP_STATUS="未启动"
+CLEANUP_STATUS="未执行"
 
 cleanup_http() {
-  if [[ -n "${SHPID:-}" ]]; then
-    kill "${SHPID}" 2>/dev/null || true
-    wait "${SHPID}" 2>/dev/null || true
+  if ((HTTP_WAS_STARTED == 0)); then
+    HTTP_CLEANUP_STATUS="未启动"
+    return 0
   fi
+  if ((HTTP_EXIT_UNEXPECTED == 1)); then
+    SHPID=""
+    HTTP_CLEANUP_STATUS="异常退出（请查看上方 HTTP 服务日志）"
+    return 1
+  fi
+  if [[ -n "${SHPID:-}" ]] && kill -0 "${SHPID}" 2>/dev/null; then
+    if ! kill "${SHPID}" 2>/dev/null; then
+      if kill -0 "${SHPID}" 2>/dev/null; then
+        HTTP_CLEANUP_STATUS="未能停止，请人工检查进程 ${SHPID}"
+        return 1
+      fi
+    else
+      wait "${SHPID}" 2>/dev/null || true
+    fi
+  fi
+  SHPID=""
+  HTTP_CLEANUP_STATUS="已停止"
 }
 
 hard_clean() {
-  cleanup_snapshot_images
-  [[ -z "${BUNDLE:-}" ]] || rm -rf "${BUNDLE}" 2>/dev/null || true
-  [[ -z "${SINGLE_TAR_PATH:-}" ]] || rm -f "${SINGLE_TAR_PATH}" 2>/dev/null || true
-  [[ -z "${ENCRYPTED_TAR_PATH:-}" ]] || rm -f "${ENCRYPTED_TAR_PATH}" 2>/dev/null || true
-  [[ -z "${BUNDLE_ROOT:-}" ]] || rm -rf "${BUNDLE_ROOT}/_bb_http_serve" 2>/dev/null || true
-  [[ -z "${BUNDLE_ROOT:-}" ]] || rm -f "${BUNDLE_ROOT}/nc_http_response.http" 2>/dev/null || true
+  local failed=0
+  cleanup_snapshot_images || failed=1
+  [[ -z "${BUNDLE:-}" ]] || rm -rf "${BUNDLE}" 2>/dev/null || failed=1
+  [[ -z "${SINGLE_TAR_PATH:-}" ]] || rm -f "${SINGLE_TAR_PATH}" 2>/dev/null || failed=1
+  [[ -z "${ENCRYPTED_TAR_PATH:-}" ]] || rm -f "${ENCRYPTED_TAR_PATH}" 2>/dev/null || failed=1
+  [[ -z "${BUNDLE_ROOT:-}" ]] || rm -rf "${BUNDLE_ROOT}/_bb_http_serve" 2>/dev/null || failed=1
+  [[ -z "${BUNDLE_ROOT:-}" ]] || rm -f "${BUNDLE_ROOT}/nc_http_response.http" 2>/dev/null || failed=1
+  if ((failed == 0)); then
+    CLEANUP_STATUS="临时迁移文件已删除"
+  else
+    CLEANUP_STATUS="部分临时文件未能删除，请人工检查"
+  fi
+  return "$failed"
 }
 
 restart_source_containers() {
   if ((${#STOPPED_ON_BACKUP[@]} == 0)); then
     return 0
   fi
+  local observed_total attempted
+  attempted=${#STOPPED_ON_BACKUP[@]}
+  observed_total=$((SOURCE_RESTORED_COUNT + attempted))
+  if ((observed_total > SOURCE_RESTORE_EXPECTED)); then
+    SOURCE_RESTORE_EXPECTED=$observed_total
+  fi
   BLUE "[INFO] 恢复源服务器容器原始运行状态（共 ${#STOPPED_ON_BACKUP[@]} 个）..."
   local ok=0 fail=0 record n original_state current_state restore_ok
+  local -a remaining=()
   for record in "${STOPPED_ON_BACKUP[@]}"; do
     IFS=$'\t' read -r n original_state <<<"$record"
-    printf " - restoring: %s (%s) ... " "$n" "$original_state"
+    printf " [恢复源状态] %s (%s) ... " "$n" "$original_state"
     current_state="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo missing)"
     restore_ok=1
     case "$original_state" in
@@ -3816,31 +4290,75 @@ restart_source_containers() {
     else
       printf "fail\n"
       fail=$((fail + 1))
+      remaining+=("$record")
     fi
   done
+  STOPPED_ON_BACKUP=("${remaining[@]}")
+  SOURCE_RESTORED_COUNT=$((SOURCE_RESTORE_EXPECTED - ${#STOPPED_ON_BACKUP[@]}))
   if ((fail > 0)); then
     RED "[ERR] 有 ${fail} 个源容器未能重启，请立即人工检查。"
     return 1
   fi
-  OK "[OK] 源容器已恢复：${ok}/${#STOPPED_ON_BACKUP[@]}"
+  OK "[OK] 源容器已恢复：${ok}/${attempted}"
 }
 
 graceful_exit() {
-  local rc="${1:-0}"
+  local rc="${1:-0}" initial_rc status package_line source_line elapsed final_rc
   ((CLEANUP_DONE == 0)) || return "$rc"
+  initial_rc="$rc"
   CLEANUP_DONE=1
   trap - EXIT INT TERM HUP
-  cleanup_http
+  if ! cleanup_http; then
+    ((rc != 0)) || rc=1
+  fi
   if ! restart_source_containers; then
     ((rc != 0)) || rc=1
   fi
-  hard_clean
+  # 由仍待恢复的 write-ahead 记录推导结果，避免信号落在两次账本赋值之间
+  # 时出现重复计数或明明已恢复却少计数。
+  SOURCE_RESTORED_COUNT=$((SOURCE_RESTORE_EXPECTED - ${#STOPPED_ON_BACKUP[@]}))
+  if ! hard_clean; then
+    ((rc != 0)) || rc=1
+  fi
   if [[ "$LOCK_METHOD" == "flock" ]]; then
     flock -u 200 2>/dev/null || true
   else
     rmdir "$LOCKDIR" 2>/dev/null || true
   fi
-  exit "$rc"
+
+  if ((SOURCE_TRANSFER_PUBLISHED == 1)); then
+    package_line="已生成、完成加密并提供下载"
+  elif ((SOURCE_PACKAGE_READY == 1)); then
+    package_line="已生成并完成加密，但未成功发布下载"
+  else
+    package_line="未完成"
+  fi
+  if ((SOURCE_RESTORE_EXPECTED == 0)); then
+    source_line="无需恢复（本次未改变源容器状态）"
+  elif ((SOURCE_RESTORED_COUNT == SOURCE_RESTORE_EXPECTED)); then
+    source_line="已恢复 ${SOURCE_RESTORED_COUNT}/${SOURCE_RESTORE_EXPECTED}"
+  else
+    source_line="恢复不完整 ${SOURCE_RESTORED_COUNT}/${SOURCE_RESTORE_EXPECTED}，请立即人工检查"
+  fi
+  final_rc="$rc"
+  if ((rc == 0)) || {
+    [[ "$initial_rc" == "129" || "$initial_rc" == "130" || "$initial_rc" == "143" ]] &&
+      ((SOURCE_TRANSFER_PUBLISHED == 1)) &&
+      ((SOURCE_RESTORED_COUNT == SOURCE_RESTORE_EXPECTED)) &&
+      [[ "$HTTP_CLEANUP_STATUS" == "已停止" ]] &&
+      [[ "$CLEANUP_STATUS" == "临时迁移文件已删除" ]]
+  }; then
+    status="SUCCESS"
+    final_rc=0
+  elif [[ "$initial_rc" == "129" || "$initial_rc" == "130" || "$initial_rc" == "143" ]]; then
+    status="INTERRUPTED"
+  else
+    status="FAILED"
+  fi
+  elapsed="$(format_elapsed "$((SECONDS - SOURCE_TASK_STARTED_AT))")"
+  print_source_result_summary "$status" "$package_line" "$HTTP_CLEANUP_STATUS" \
+    "$source_line" "$CLEANUP_STATUS" "$elapsed"
+  exit "$final_rc"
 }
 
 # 从获得锁开始，任何正常退出、错误或信号都会恢复源容器并清理临时包。
@@ -4258,6 +4776,12 @@ if ((${#COMPOSE_GROUP[@]})); then
 fi
 
 #####################################
+# 预拉取卷操作镜像，避免把下载时间计入后面的停机快照窗口
+#####################################
+BLUE "[INFO] 预拉取 alpine:3.20 镜像（用于卷操作）..."
+docker pull alpine:3.20 >/dev/null 2>&1 || YEL "[WARN] 无法拉取 alpine:3.20，卷操作可能失败"
+
+#####################################
 # 检查未选中容器是否仍在写共享挂载
 #####################################
 declare -a SHARED_MOUNT_ROWS=()
@@ -4404,8 +4928,6 @@ fi
 # 备份卷与绑定目录
 #####################################
 BLUE "[INFO] 备份卷与绑定目录 ..."
-BLUE "[INFO] 预拉取 alpine:3.20 镜像（用于卷操作）..."
-docker pull alpine:3.20 >/dev/null 2>&1 || YEL "[WARN] 无法拉取 alpine:3.20，卷操作可能失败"
 declare -a MAN_VOL=()
 declare -a MAN_BIND=()
 declare -A BACKED_VOLUMES=()
@@ -4491,6 +5013,17 @@ if ((${#BACKUP_FAILURES[@]} > 0)); then
   exit 1
 fi
 
+# 容器可写层、volume 与 bind 数据现在都已经真正归档为同一停机快照；后续
+# 镜像保存、压缩、加密和下载不再需要业务保持停止，立即恢复源端状态。
+SOURCE_RESTORE_EXPECTED=${#STOPPED_ON_BACKUP[@]}
+if ((SOURCE_RESTORE_EXPECTED > 0)); then
+  BLUE "[INFO] 数据快照已完成，立即恢复源服务器容器状态 ..."
+  if ! restart_source_containers; then
+    RED "[ERR] 源容器未能全部恢复，已停止后续打包，请立即人工检查。"
+    exit 1
+  fi
+fi
+
 #####################################
 # 生成独立容器 run 脚本
 #####################################
@@ -4515,7 +5048,9 @@ if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
   if progress_docker_save "${OUT_IMG}" docker image save "${IMAGES[@]}"; then
     OK "[OK] images.tar 已生成，大小：$(du -h "${OUT_IMG}" | awk '{print $1}')"
-    cleanup_snapshot_images
+    if ! cleanup_snapshot_images; then
+      YEL "[WARN] 部分临时 snapshot image 暂未删除，退出清理时会自动重试。"
+    fi
   else
     RED "[ERR] docker image save 失败，请检查磁盘空间或 Docker 状态。"
     rm -f "${OUT_IMG}" 2>/dev/null || true
@@ -4681,6 +5216,7 @@ BUNDLE_ENCRYPTION_KEY=""
 BUNDLE_MAC_KEY=""
 BUNDLE_SECRET=""
 OK "[OK] 加密迁移包已生成，大小：$(du -h "$TRANSFER_PATH" | awk '{print $1}')"
+SOURCE_PACKAGE_READY=1
 
 #####################################
 # HTTP 下载服务
@@ -4815,6 +5351,7 @@ else
   RED "[ERR] 未找到可用的 HTTP 服务方式（python3 / busybox httpd / nc），请手动安装其一后重试。"
   exit 1
 fi
+HTTP_WAS_STARTED=1
 
 cd "$WORKDIR"
 sleep 1
@@ -4824,16 +5361,35 @@ if ! kill -0 "$SHPID" 2>/dev/null; then
   if [[ -f "${HTTP_LOG}" ]]; then tail -n 20 "${HTTP_LOG}" || true; fi
   graceful_exit 1
 fi
+SOURCE_TRANSFER_PUBLISHED=1
 
 OK "[OK] 一键迁移包下载链接：${FINAL_URL}"
 YEL "[INFO] HTTP 仅传输加密后的迁移包；完整链接包含解密凭据，请只通过可信渠道传递。"
 YEL "[INFO] HTTP 服务日志：${HTTP_LOG}"
 
 if [[ -t 0 ]]; then
-  read -rp $' 按回车键停止 HTTP 并退出（将自动重启停机容器并清理产物）...' _
-  graceful_exit 0
+  printf '%s' ' 按回车键停止 HTTP 并退出（源容器已恢复，退出时清理临时产物）...'
+  while kill -0 "$SHPID" 2>/dev/null; do
+    if read -r -t 1 _; then
+      graceful_exit 0
+    fi
+  done
+  http_wait_rc=0
+  wait "$SHPID" || http_wait_rc=$?
+  HTTP_EXIT_UNEXPECTED=1
+  SHPID=""
+  printf '\n'
+  RED "[ERR] HTTP 服务在用户确认退出前意外停止（rc=${http_wait_rc}）：${HTTP_LOG}"
+  if [[ -f "${HTTP_LOG}" ]]; then tail -n 20 "${HTTP_LOG}" || true; fi
+  graceful_exit 1
 else
-  YEL "[INFO] 当前为非交互模式，HTTP 服务将保持运行；请在下载完成后手动结束本脚本。"
-  wait "$SHPID" || true
-  graceful_exit 0
+  YEL "[INFO] 源容器已经恢复；当前为非交互模式，HTTP 服务将保持运行。"
+  YEL "[INFO] 下载完成后请执行：kill -TERM $$"
+  http_wait_rc=0
+  wait "$SHPID" || http_wait_rc=$?
+  HTTP_EXIT_UNEXPECTED=1
+  SHPID=""
+  RED "[ERR] HTTP 服务在收到停止指令前意外退出（rc=${http_wait_rc}）：${HTTP_LOG}"
+  if [[ -f "${HTTP_LOG}" ]]; then tail -n 20 "${HTTP_LOG}" || true; fi
+  graceful_exit 1
 fi
