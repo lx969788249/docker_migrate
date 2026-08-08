@@ -137,7 +137,13 @@ print_source_result_summary() {
   printf '\n'
   result_rule
   case "$status" in
-    SUCCESS) printf '结果：✅ 源端任务已安全结束\n' ;;
+    SUCCESS)
+      printf '结果：✅ 源端任务已安全结束\n'
+      [[ -z "$source_line" ]] || printf '源容器：%s\n' "$source_line"
+      [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+      result_end_rule
+      return 0
+      ;;
     INTERRUPTED) printf '结果：⚠️ 源端任务已中断，清理流程已执行\n' ;;
     *) printf '结果：❌ 源端任务失败，清理流程已执行\n' ;;
   esac
@@ -147,6 +153,68 @@ print_source_result_summary() {
   [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
   [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
   result_end_rule
+}
+
+print_transfer_instructions() {
+  local url="$1" mode="${2:-interactive}" source_pid="${3:-}"
+  printf '\n%s\n' '━━━━━━━━━━ 迁移包已就绪 ━━━━━━━━━━'
+  printf '下载链接（请完整复制）：\n%s\n\n' "$url"
+  printf '使用方法：在新服务器运行同一脚本 → 选择「2) 下载备份并恢复」→ 粘贴上面的完整链接。\n'
+  if [[ "$mode" == "interactive" ]]; then
+    printf '目标端恢复成功后，回到此窗口按回车停止传输服务并清理临时文件。\n'
+  else
+    printf '传输服务将保持运行；目标端恢复完成后执行：kill -TERM %s\n' "$source_pid"
+  fi
+  printf '%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+}
+
+http_log_event() {
+  local message="$1"
+  [[ -n "${HTTP_LOG:-}" ]] || return 0
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$message" >>"$HTTP_LOG"
+}
+
+print_http_diagnostics() {
+  local log_file="${1:-}"
+  printf 'HTTP 服务诊断（最后 20 行）：\n' >&2
+  if [[ -n "$log_file" && -s "$log_file" ]]; then
+    tail -n 20 "$log_file" >&2 || true
+  else
+    printf 'HTTP 服务未提供额外日志。\n' >&2
+  fi
+  [[ -z "$log_file" ]] || printf '完整日志：%s\n' "$log_file" >&2
+}
+
+print_http_diagnostics_once() {
+  local log_file="${1:-}"
+  ((${HTTP_DIAGNOSTICS_SHOWN:-0} == 0)) || return 0
+  HTTP_DIAGNOSTICS_SHOWN=1
+  print_http_diagnostics "$log_file"
+}
+
+netcat_http_serve() {
+  local port="$1" response_file="$2" transfer_file="$3"
+  while true; do
+    if {
+      cat "$response_file"
+      cat "$transfer_file"
+    } | nc -l -p "$port" -q 0; then
+      continue
+    fi
+    if {
+      cat "$response_file"
+      cat "$transfer_file"
+    } | nc -l -p "$port"; then
+      continue
+    fi
+    if {
+      cat "$response_file"
+      cat "$transfer_file"
+    } | nc -l "$port"; then
+      continue
+    fi
+    return 1
+  done
 }
 
 restore_target_container_names() {
@@ -362,12 +430,6 @@ progress_file_size() {
   stat -c %s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
 }
 
-progress_start() {
-  local label="$1"
-  printf '[进度] %s：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键，请耐心等待。\n' \
-    "$label" >&2
-}
-
 # 只在确实知道总字节数时显示百分比；未知总量时仅报告已处理字节和耗时，
 # 避免用“假进度条”误导用户。该函数保持纯输出，便于单元测试。
 progress_render() {
@@ -385,28 +447,24 @@ progress_render() {
     bar=${bar// /#}
     printf -v empty '%*s' "$empty" ''
     empty=${empty// /-}
-    printf '[进度] %s [%s%s] %d%%（%s/%s，已用 %s）' \
+    printf '[进度] %s [%s%s] %d%% · %s/%s · %s' \
       "$label" "$bar" "$empty" "$percent" "$(human "$current")" \
       "$(human "$total")" "$(format_elapsed "$elapsed")"
   elif ((current > 0)); then
-    printf '[进度] %s：仍在执行，已处理 %s，已用 %s；无需按键' \
+    printf '[进度] %s · %s · %s' \
       "$label" "$(human "$current")" "$(format_elapsed "$elapsed")"
   else
-    printf '[进度] %s：仍在执行，已用 %s；无需按键' \
-      "$label" "$(format_elapsed "$elapsed")"
+    printf '[进度] %s · %s' "$label" "$(format_elapsed "$elapsed")"
   fi
 }
 
 progress_finish() {
   local label="$1" rc="$2" elapsed="$3" current="${4:-0}"
   local suffix=""
+  ((rc != 0)) || return 0
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
-  ((current == 0)) || suffix="，已处理 $(human "$current")"
-  if ((rc == 0)); then
-    printf '[进度] %s：完成（耗时 %s%s）\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
-  else
-    printf '[进度] %s：失败（耗时 %s%s）\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
-  fi
+  ((current == 0)) || suffix=" · $(human "$current")"
+  printf '[失败] %s · %s%s\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
 }
 
 progress_count() {
@@ -470,7 +528,6 @@ run_with_progress() {
   shift 3
   local started=$SECONDS watcher_pid rc current=0 restore_errexit=0
   case $- in *e*) restore_errexit=1 ;; esac
-  progress_start "$label"
   progress_watch "$label" "$file" "$total" "$started" "$$" &
   watcher_pid=$!
   set +e
@@ -508,7 +565,6 @@ progress_docker_save() {
   shift
   local rc=0 started=$SECONDS current=0 restore_errexit=0
   if command -v pv >/dev/null 2>&1; then
-    progress_start "保存镜像 images.tar"
     case $- in *e*) restore_errexit=1 ;; esac
     set +e
     # -f 保证日志被重定向时也持续输出；pipefail 保留 docker save 的失败状态。
@@ -1233,8 +1289,8 @@ dm_format_elapsed() {
 
 dm_progress_watch() {
   local label="$1" started="$2" owner_pid="$3"
-  local interval elapsed timer_pid=""
-  [[ "${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" != "plain" ]] || return 0
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval elapsed timer_pid=""
+  [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
   elif [[ -t 2 ]]; then
@@ -1260,10 +1316,10 @@ dm_progress_watch() {
     kill -0 "$owner_pid" 2>/dev/null || break
     elapsed=$((SECONDS - started))
     if [[ -t 2 ]]; then
-      printf '\r%-120s\r[进度] %s：仍在执行，已用 %s；无需按键' \
+      printf '\r%-120s\r[进度] %s · %s' \
         "" "$label" "$(dm_format_elapsed "$elapsed")" >&2
     else
-      printf '[进度] %s：仍在执行，已用 %s；无需按键\n' \
+      printf '[进度] %s · %s\n' \
         "$label" "$(dm_format_elapsed "$elapsed")" >&2
     fi
   done
@@ -1275,8 +1331,6 @@ dm_run_with_activity() {
   shift
   local started=$SECONDS watcher_pid rc restore_errexit=0
   case $- in *e*) restore_errexit=1 ;; esac
-  printf '[进度] %s：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键，请耐心等待。\n' \
-    "$label" >&2
   dm_progress_watch "$label" "$started" "$$" &
   watcher_pid=$!
   set +e
@@ -1286,10 +1340,8 @@ dm_run_with_activity() {
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
   [[ ! -t 2 ]] || printf '\r%-120s\r' "" >&2
-  if ((rc == 0)); then
-    printf '[进度] %s：完成（耗时 %s）\n' "$label" "$(dm_format_elapsed "$((SECONDS - started))")" >&2
-  else
-    printf '[进度] %s：失败（耗时 %s）\n' "$label" "$(dm_format_elapsed "$((SECONDS - started))")" >&2
+  if ((rc != 0)); then
+    printf '[失败] %s · %s\n' "$label" "$(dm_format_elapsed "$((SECONDS - started))")" >&2
   fi
   return "$rc"
 }
@@ -1874,18 +1926,12 @@ if [[ "$original_running" == "true" &&
   health_started=$SECONDS
   health_next_report=0
   health_last_status=""
-  echo "[进度] 等待容器健康检查：$name（最长 ${health_timeout}s；脚本正在正常执行，无需按键）" >&2
   while ((SECONDS < health_deadline)); do
     health_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$name" 2>/dev/null || true)"
     health_elapsed=$((SECONDS - health_started))
-    if [[ "$health_status" != "$health_last_status" ]] || ((health_elapsed >= health_next_report)); then
-      echo "[进度] 等待容器健康检查：$name（当前 ${health_status:-未知}，已等待 ${health_elapsed}/${health_timeout}s；无需按键）" >&2
-      health_last_status="$health_status"
-      health_next_report=$((health_elapsed + 5))
-    fi
     case "$health_status" in
       healthy)
-        echo "[进度] 容器健康检查通过：$name（耗时 ${health_elapsed}s）" >&2
+        echo "[完成] 容器健康检查：$name · ${health_elapsed}秒" >&2
         break
         ;;
       unhealthy | exited | dead)
@@ -1893,6 +1939,11 @@ if [[ "$original_running" == "true" &&
         exit 1
         ;;
     esac
+    if [[ "$health_status" != "$health_last_status" ]] || ((health_elapsed >= health_next_report)); then
+      echo "[进度] 容器健康检查：$name · ${health_status:-未知} · ${health_elapsed}/${health_timeout}秒" >&2
+      health_last_status="$health_status"
+      health_next_report=$((health_elapsed + 5))
+    fi
     sleep 1
   done
   if [[ "${health_status:-}" != "healthy" ]]; then
@@ -1907,7 +1958,7 @@ elif [[ "$original_running" == "true" ]]; then
   fi
   startup_deadline=$((SECONDS + startup_grace))
   startup_started=$SECONDS
-  echo "[进度] 验证容器持续运行：$name（需要 ${startup_grace}s；无需按键）" >&2
+  startup_next_report=5
   while :; do
     startup_status="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
     case "$startup_status" in
@@ -1917,10 +1968,15 @@ elif [[ "$original_running" == "true" ]]; then
         exit 1
         ;;
     esac
+    startup_elapsed=$((SECONDS - startup_started))
+    if ((startup_elapsed >= startup_next_report)); then
+      echo "[进度] 容器启动验证：$name · running · ${startup_elapsed}/${startup_grace}秒" >&2
+      startup_next_report=$((startup_elapsed + 5))
+    fi
     ((SECONDS >= startup_deadline)) && break
     sleep 1
   done
-  echo "[进度] 容器启动验证通过：$name（耗时 $((SECONDS - startup_started))s）" >&2
+  echo "[完成] 容器启动验证：$name · $((SECONDS - startup_started))秒" >&2
 fi
 
 if [[ "$original_paused" == "true" ]]; then
@@ -2005,8 +2061,8 @@ restore_load_images() {
 
 dm_progress_watch() {
   local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
-  local interval current elapsed percent message timer_pid=""
-  [[ "${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" != "plain" ]] || return 0
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed percent message timer_pid=""
+  [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
   elif [[ -t 2 ]]; then
@@ -2036,11 +2092,11 @@ dm_progress_watch() {
     if ((total > 0)); then
       ((current <= total)) || current=$total
       percent=$((current * 100 / total))
-      message="[进度] ${label}：${percent}%（$(dm_human "$current")/$(dm_human "$total")，已用 $(dm_format_elapsed "$elapsed")）"
+      message="[进度] ${label} · ${percent}% · $(dm_human "$current")/$(dm_human "$total") · $(dm_format_elapsed "$elapsed")"
     elif ((current > 0)); then
-      message="[进度] ${label}：仍在执行，已处理 $(dm_human "$current")，已用 $(dm_format_elapsed "$elapsed")；无需按键"
+      message="[进度] ${label} · $(dm_human "$current") · $(dm_format_elapsed "$elapsed")"
     else
-      message="[进度] ${label}：仍在执行，已用 $(dm_format_elapsed "$elapsed")；无需按键"
+      message="[进度] ${label} · $(dm_format_elapsed "$elapsed")"
     fi
     if [[ -t 2 ]]; then
       printf '\r%-120s\r%s' "" "$message" >&2
@@ -2056,8 +2112,6 @@ dm_run_with_progress() {
   shift 3
   local started=$SECONDS watcher_pid rc current=0 restore_errexit=0 suffix=""
   case $- in *e*) restore_errexit=1 ;; esac
-  printf '[进度] %s：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键，请耐心等待。\n' \
-    "$label" >&2
   dm_progress_watch "$label" "$file" "$total" "$started" "$$" &
   watcher_pid=$!
   set +e
@@ -2068,13 +2122,10 @@ dm_run_with_progress() {
   wait "$watcher_pid" 2>/dev/null || true
   [[ ! -t 2 ]] || printf '\r%-120s\r' "" >&2
   [[ -z "$file" ]] || current="$(dm_file_size "$file")"
-  ((current == 0)) || suffix="，已处理 $(dm_human "$current")"
-  if ((rc == 0)); then
-    printf '[进度] %s：完成（耗时 %s%s）\n' "$label" \
+  ((current == 0)) || suffix=" · $(dm_human "$current")"
+  if ((rc != 0)); then
+    printf '[失败] %s · %s%s\n' "$label" \
       "$(dm_format_elapsed "$((SECONDS - started))")" "$suffix" >&2
-  else
-    printf '[进度] %s：失败（耗时 %s）\n' "$label" \
-      "$(dm_format_elapsed "$((SECONDS - started))")" >&2
   fi
   return "$rc"
 }
@@ -2483,8 +2534,6 @@ compose_wait_services() {
   (($# == 0)) || shift
   local -a services=("$@")
 
-  echo "[进度] 等待 Compose 服务健康检查：${services[*]}（最长 ${timeout}s；脚本正在正常执行，无需按键）" >&2
-
   while ((SECONDS < deadline)); do
     all_ready=1
     pending=0
@@ -2522,11 +2571,11 @@ compose_wait_services() {
     if ((all_ready == 0)); then
       elapsed=$((SECONDS - started))
       if ((elapsed >= next_report)); then
-        echo "[进度] 等待 Compose 服务健康检查：${services[*]}（待就绪 ${pending} 个，首个 ${first_pending:-未知}，已等待 ${elapsed}/${timeout}s；无需按键）" >&2
+        echo "[进度] Compose 服务健康检查：${services[*]} · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒" >&2
         next_report=$((elapsed + 5))
       fi
     else
-      echo "[进度] Compose 服务健康检查通过：${services[*]}（耗时 $((SECONDS - started))s）" >&2
+      echo "[完成] Compose 服务健康检查：${services[*]} · $((SECONDS - started))秒" >&2
       return 0
     fi
     sleep 1
@@ -2538,7 +2587,6 @@ compose_wait_project_health() {
   local project="$1" timeout="$2"
   local deadline=$((SECONDS + timeout)) started=$SECONDS next_report=0
   local id running health all_ready found elapsed pending first_pending
-  echo "[进度] 等待 Compose 项目健康检查：$project（最长 ${timeout}s；脚本正在正常执行，无需按键）" >&2
   while ((SECONDS < deadline)); do
     all_ready=1
     found=0
@@ -2572,11 +2620,11 @@ compose_wait_project_health() {
     if ((all_ready == 0)); then
       elapsed=$((SECONDS - started))
       if ((elapsed >= next_report)); then
-        echo "[进度] 等待 Compose 项目健康检查：$project（待就绪 ${pending} 个，首个 ${first_pending:-未知}，已等待 ${elapsed}/${timeout}s；无需按键）" >&2
+        echo "[进度] Compose 项目健康检查：$project · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒" >&2
         next_report=$((elapsed + 5))
       fi
     else
-      echo "[进度] Compose 项目健康检查通过：$project（耗时 $((SECONDS - started))s）" >&2
+      echo "[完成] Compose 项目健康检查：$project · $((SECONDS - started))秒" >&2
       return 0
     fi
     sleep 1
@@ -4545,7 +4593,6 @@ restore_main() {
   if ((encrypted == 1)); then
     ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
     MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
-    BLUE "[INFO] 一次读取验证加密包 SHA-256 与 HMAC ..."
     if ! run_with_activity "验证加密迁移包完整性" verify_bundle_digests \
       "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" \
       "$EXPECTED_SHA256" "$ENCRYPTION_MAC"; then
@@ -4553,7 +4600,6 @@ restore_main() {
       exit 1
     fi
     OK "[OK] 加密迁移包来源摘要与认证均通过"
-    BLUE "[INFO] 正在解密迁移包 ..."
     if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
       "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
       "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
@@ -4566,7 +4612,6 @@ restore_main() {
     MAC_KEY=""
     OK "[OK] 迁移包解密完成"
   elif [[ -n "$EXPECTED_SHA256" ]]; then
-    BLUE "[INFO] 验证下载包的外部 SHA-256 摘要 ..."
     if ! run_with_activity "校验下载包 SHA-256" \
       verify_archive_sha256 "$DOWNLOAD_FILE" "$EXPECTED_SHA256"; then
       RED "[ERR] 下载包与源服务器提供的 SHA-256 摘要不一致，拒绝解压。"
@@ -4580,9 +4625,7 @@ restore_main() {
     RED "[ERR] 迁移包结构不安全或已损坏，拒绝解压。"
     exit 1
   fi
-  BLUE "[INFO] 解压到：$OUTDIR"
   mkdir -p "$OUTDIR"
-  BLUE "[INFO] 正在解压压缩包（根据文件大小可能需要一段时间，请不要中断）..."
   if ! run_with_activity "解压迁移包" tar -xzf "$TGZ" -C "$OUTDIR"; then
     RED "[ERR] 解压失败，请检查磁盘空间或确认文件是否完整。"
     exit 1
@@ -4598,7 +4641,6 @@ restore_main() {
     exit 1
   fi
   if [[ -f "${BUNDLE_DIR}/checksums.sha256" ]]; then
-    BLUE "[INFO] 验证迁移包完整性 ..."
     if ! run_with_activity "校验迁移包内全部文件" \
       verify_bundle_checksums "$BUNDLE_DIR"; then
       RED "[ERR] 完整性校验未通过，拒绝恢复。"
@@ -4616,8 +4658,6 @@ restore_main() {
   # 使用当前脚本内置的修复版 restore.sh 覆盖包内旧 restore.sh。
   write_bundle_restore_script "${BUNDLE_DIR}/restore.sh"
 
-  BLUE "[INFO] 执行恢复脚本：${BUNDLE_DIR}/restore.sh"
-  BLUE "[INFO] 该步骤会加载镜像、回灌卷和绑定目录，并启动容器，可能需要数分钟，请耐心等待..."
   local rc result_file="${SESSION_DIR}/restore-result.json" result_status result_stage rollback_dir
   local metrics total running paused stopped missing volumes binds
   local container_line="" data_line="" cleanup_line="" diagnostic_dir="" elapsed
@@ -4874,6 +4914,7 @@ SOURCE_RESTORE_EXPECTED=0
 SOURCE_RESTORED_COUNT=0
 HTTP_WAS_STARTED=0
 HTTP_EXIT_UNEXPECTED=0
+HTTP_DIAGNOSTICS_SHOWN=0
 HTTP_CLEANUP_STATUS="未启动"
 CLEANUP_STATUS="未执行"
 
@@ -4884,12 +4925,13 @@ cleanup_http() {
   fi
   if ((HTTP_EXIT_UNEXPECTED == 1)); then
     SHPID=""
-    HTTP_CLEANUP_STATUS="异常退出（请查看上方 HTTP 服务日志）"
+    HTTP_CLEANUP_STATUS="异常退出"
     return 1
   fi
   if [[ -n "${SHPID:-}" ]] && kill -0 "${SHPID}" 2>/dev/null; then
     if ! kill "${SHPID}" 2>/dev/null; then
       if kill -0 "${SHPID}" 2>/dev/null; then
+        HTTP_EXIT_UNEXPECTED=1
         HTTP_CLEANUP_STATUS="未能停止，请人工检查进程 ${SHPID}"
         return 1
       fi
@@ -4902,7 +4944,7 @@ cleanup_http() {
 }
 
 hard_clean() {
-  local failed=0
+  local preserve_http_log="${1:-0}" failed=0
   cleanup_snapshot_images || failed=1
   [[ -z "${BUNDLE:-}" ]] || rm -rf "${BUNDLE}" 2>/dev/null || failed=1
   [[ -z "${SINGLE_TAR_PATH:-}" ]] || rm -f "${SINGLE_TAR_PATH}" 2>/dev/null || failed=1
@@ -4910,6 +4952,9 @@ hard_clean() {
   [[ -z "${ENCRYPTED_PARTIAL_PATH:-}" ]] || rm -f "${ENCRYPTED_PARTIAL_PATH}" 2>/dev/null || failed=1
   [[ -z "${BUNDLE_ROOT:-}" ]] || rm -rf "${BUNDLE_ROOT}/_bb_http_serve" 2>/dev/null || failed=1
   [[ -z "${BUNDLE_ROOT:-}" ]] || rm -f "${BUNDLE_ROOT}/nc_http_response.http" 2>/dev/null || failed=1
+  if [[ "$preserve_http_log" != "1" && -n "${HTTP_LOG:-}" ]]; then
+    rm -f "$HTTP_LOG" 2>/dev/null || failed=1
+  fi
   if ((failed == 0)); then
     CLEANUP_STATUS="临时迁移文件已删除"
   else
@@ -4985,6 +5030,7 @@ graceful_exit() {
   CLEANUP_DONE=1
   trap - EXIT INT TERM HUP
   if ! cleanup_http; then
+    print_http_diagnostics_once "${HTTP_LOG:-}"
     ((rc != 0)) || rc=1
   fi
   if ! restart_source_containers; then
@@ -4993,7 +5039,7 @@ graceful_exit() {
   # 由仍待恢复的 write-ahead 记录推导结果，避免信号落在两次账本赋值之间
   # 时出现重复计数或明明已恢复却少计数。
   SOURCE_RESTORED_COUNT=$((SOURCE_RESTORE_EXPECTED - ${#STOPPED_ON_BACKUP[@]}))
-  if ! run_with_activity "清理源端临时文件与快照" hard_clean; then
+  if ! run_with_activity "清理源端临时文件与快照" hard_clean "$HTTP_EXIT_UNEXPECTED"; then
     ((rc != 0)) || rc=1
   fi
   if [[ "$LOCK_METHOD" == "flock" ]]; then
@@ -5433,7 +5479,7 @@ if ((${#COMPOSE_GROUP[@]})); then
     # 使用全部 -f 文件生成规范配置，合并覆盖文件并解析 env_file。
     if ((${#CFG_SOURCE_ARGS[@]} > 0)); then
       resolved_tmp="${dest}/.resolved_config.yml.tmp"
-      BLUE "[INFO] 解析 Compose 配置：$proj（复杂项目可能需要一段时间，无需按键）..."
+      BLUE "[INFO] 解析 Compose 配置：$proj"
       if docker compose version >/dev/null 2>&1 &&
         { docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>/dev/null ||
           docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>/dev/null; }; then
@@ -5871,7 +5917,6 @@ README
 }
 
 generate_manifest_and_restore
-BLUE "[INFO] 生成迁移包完整性校验 ..."
 run_with_activity "计算迁移包内文件校验值" generate_bundle_checksums "$BUNDLE"
 
 #####################################
@@ -5895,7 +5940,6 @@ BUNDLE_ENCRYPTION_KEY="$(bundle_secret_encryption_key "$BUNDLE_SECRET")"
 BUNDLE_MAC_KEY="$(bundle_secret_mac_key "$BUNDLE_SECRET")"
 ENCRYPTED_TAR_PATH="${SINGLE_TAR_PATH}.enc"
 ENCRYPTED_PARTIAL_PATH="${ENCRYPTED_TAR_PATH}.partial.$$"
-BLUE "[INFO] 流式压缩并加密迁移包（AES-256-CTR + HMAC-SHA256）..."
 if ! BUNDLE_DIGESTS="$(run_with_file_progress "压缩并加密迁移包" \
   "$ENCRYPTED_PARTIAL_PATH" 0 bundle_pack_encrypt_directory \
   "$BUNDLE_ROOT" "$RID" "$ENCRYPTED_PARTIAL_PATH" \
@@ -5945,10 +5989,10 @@ SECRET_TOKEN="$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 
 BASE_URL="$(pick_advertise_url "$PORT")"
 FINAL_URL="" # will be set below by the chosen HTTP server
 
-BLUE "[INFO] 启动加密 HTTP 传输服务（端口 ${PORT}，仅提供密文文件）"
 SHPID=""
 
 HTTP_LOG="${BUNDLE_ROOT}/http_server_${RID}.log"
+: >"$HTTP_LOG"
 cd "${BUNDLE_ROOT}" || exit 1
 
 # start_http_server: multi-fallback — python3 > busybox httpd > netcat
@@ -5956,8 +6000,8 @@ TRANSFER_SIZE="$(stat -c%s "$TRANSFER_PATH" 2>/dev/null || stat -f%z "$TRANSFER_
 
 if command -v python3 >/dev/null 2>&1; then
   # --- Fallback 1: Python3 HTTP server (best — supports secret token + proper headers) ---
-  YEL "[INFO] 使用 Python3 HTTP 服务 ..."
-  python3 - "$PORT" "$SECRET_TOKEN" "$TRANSFER_NAME" >"${HTTP_LOG}" 2>&1 <<'PY' &
+  http_log_event "启动 backend=python3 port=${PORT} file=${TRANSFER_NAME} size=${TRANSFER_SIZE}"
+  python3 - "$PORT" "$SECRET_TOKEN" "$TRANSFER_NAME" >>"${HTTP_LOG}" 2>&1 <<'PY' &
 import http.server
 import os
 from socketserver import ThreadingTCPServer
@@ -5998,7 +6042,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
 
     def log_message(self, format, *args):
-        return
+        message = format % args
+        message = message.replace(secret, "<token>")
+        sys.stderr.write(
+            "%s client=%s %s\n"
+            % (self.log_date_time_string(), self.client_address[0], message)
+        )
+        sys.stderr.flush()
 
 from socketserver import ThreadingTCPServer
 
@@ -6011,18 +6061,18 @@ PY
 elif command -v busybox >/dev/null 2>&1; then
   # --- Fallback 2: Busybox httpd (widespread on minimal/embedded systems) ---
   # 通过子目录隔离：创建一个符号链接，只暴露 tar.gz 文件而不暴露整个 bundle_root
-  YEL "[INFO] 使用 Busybox HTTP 服务 ..."
+  http_log_event "启动 backend=busybox-httpd port=${PORT} file=${TRANSFER_NAME} size=${TRANSFER_SIZE}"
   BUSYBOX_WEB="${BUNDLE_ROOT}/_bb_http_serve"
   mkdir -p "$BUSYBOX_WEB/$SECRET_TOKEN"
   printf 'Not found\n' >"$BUSYBOX_WEB/index.html"
   ln -sf "$TRANSFER_PATH" "$BUSYBOX_WEB/$SECRET_TOKEN/$TRANSFER_NAME"
-  busybox httpd -f -p "$PORT" -h "$BUSYBOX_WEB" >"${HTTP_LOG}" 2>&1 &
+  busybox httpd -f -p "$PORT" -h "$BUSYBOX_WEB" >>"${HTTP_LOG}" 2>&1 &
   SHPID=$!
   FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${TRANSFER_NAME}${TRANSFER_FRAGMENT}"
 
 elif command -v nc >/dev/null 2>&1; then
   # --- Fallback 3: Netcat one-shot HTTP (virtually universal) ---
-  YEL "[INFO] 使用 Netcat HTTP 服务 ..."
+  http_log_event "启动 backend=netcat port=${PORT} file=${TRANSFER_NAME} size=${TRANSFER_SIZE}"
   # Build a raw HTTP response; serve the same file for any path
   cat >"${BUNDLE_ROOT}/nc_http_response.http" <<NCEOF
 HTTP/1.1 200 OK
@@ -6034,19 +6084,10 @@ X-Content-Type-Options: nosniff
 Connection: close
 
 NCEOF
-  (
-    while true; do
-      # Ncat (modern nmap) uses --send-only; traditional nc uses -N or relies on client closing
-      (
-        cat "${BUNDLE_ROOT}/nc_http_response.http"
-        cat "$TRANSFER_PATH"
-      ) | nc -l -p "$PORT" -q 0 2>/dev/null ||
-        (
-          cat "${BUNDLE_ROOT}/nc_http_response.http"
-          cat "$TRANSFER_PATH"
-        ) | nc -l -p "$PORT" 2>/dev/null || true
-    done
-  ) >"${HTTP_LOG}" 2>&1 &
+  # 兼容常见 nc/ncat/BSD 参数；若全部不支持必须退出，让启动检查报告失败，
+  # 不能留下一个空转但永远无法下载的后台进程。
+  netcat_http_serve "$PORT" "${BUNDLE_ROOT}/nc_http_response.http" \
+    "$TRANSFER_PATH" >>"${HTTP_LOG}" 2>&1 &
   SHPID=$!
   # nc fallback: no secret token — URL is just http://host:port/<file>
   FINAL_URL="${BASE_URL}/${TRANSFER_NAME}${TRANSFER_FRAGMENT}"
@@ -6061,18 +6102,15 @@ cd "$WORKDIR"
 sleep 1
 
 if ! kill -0 "$SHPID" 2>/dev/null; then
-  RED "[ERR] HTTP 服务启动失败，请检查端口 ${PORT}、防火墙或运行日志：${HTTP_LOG}"
-  if [[ -f "${HTTP_LOG}" ]]; then tail -n 20 "${HTTP_LOG}" || true; fi
+  HTTP_EXIT_UNEXPECTED=1
+  RED "[ERR] HTTP 服务启动失败，请检查端口 ${PORT} 或防火墙设置。"
+  print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 fi
 SOURCE_TRANSFER_PUBLISHED=1
 
-OK "[OK] 一键迁移包下载链接：${FINAL_URL}"
-YEL "[INFO] HTTP 仅传输加密后的迁移包；完整链接包含解密凭据，请只通过可信渠道传递。"
-YEL "[INFO] HTTP 服务日志：${HTTP_LOG}"
-
 if [[ -t 0 ]]; then
-  printf '%s' ' 按回车键停止 HTTP 并退出（源容器已恢复，退出时清理临时产物）...'
+  print_transfer_instructions "$FINAL_URL" interactive
   while kill -0 "$SHPID" 2>/dev/null; do
     if read -r -t 1 _; then
       graceful_exit 0
@@ -6082,18 +6120,16 @@ if [[ -t 0 ]]; then
   wait "$SHPID" || http_wait_rc=$?
   HTTP_EXIT_UNEXPECTED=1
   SHPID=""
-  printf '\n'
-  RED "[ERR] HTTP 服务在用户确认退出前意外停止（rc=${http_wait_rc}）：${HTTP_LOG}"
-  if [[ -f "${HTTP_LOG}" ]]; then tail -n 20 "${HTTP_LOG}" || true; fi
+  RED "[ERR] HTTP 服务在用户确认退出前意外停止（rc=${http_wait_rc}）。"
+  print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 else
-  YEL "[INFO] 源容器已经恢复；当前为非交互模式，HTTP 服务将保持运行。"
-  YEL "[INFO] 下载完成后请执行：kill -TERM $$"
+  print_transfer_instructions "$FINAL_URL" noninteractive "$$"
   http_wait_rc=0
   wait "$SHPID" || http_wait_rc=$?
   HTTP_EXIT_UNEXPECTED=1
   SHPID=""
-  RED "[ERR] HTTP 服务在收到停止指令前意外退出（rc=${http_wait_rc}）：${HTTP_LOG}"
-  if [[ -f "${HTTP_LOG}" ]]; then tail -n 20 "${HTTP_LOG}" || true; fi
+  RED "[ERR] HTTP 服务在收到停止指令前意外退出（rc=${http_wait_rc}）。"
+  print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 fi

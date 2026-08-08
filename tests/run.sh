@@ -37,8 +37,8 @@ test_progress_propagates_failure() {
   rc=$?
   set -e
   [[ "$rc" -eq 7 ]]
-  grep -Fq '保存镜像 images.tar：失败' <<<"$output"
-  ! grep -Fq '保存镜像 images.tar：完成' <<<"$output"
+  [[ "$(grep -Fc '[失败] 保存镜像 images.tar' <<<"$output")" -eq 1 ]]
+  ! grep -Fq '完成' <<<"$output"
 }
 
 test_activity_progress_plain_failure_contract() {
@@ -50,9 +50,9 @@ test_activity_progress_plain_failure_contract() {
   set -e
 
   [[ "$rc" -eq 7 ]]
-  [[ "$(grep -Fc "[进度] ${label}：开始" <<<"$output")" -eq 1 ]]
-  [[ "$(grep -Fc "[进度] ${label}：失败" <<<"$output")" -eq 1 ]]
-  ! grep -Fq "[进度] ${label}：完成" <<<"$output"
+  [[ "$(grep -Fc "[失败] ${label}" <<<"$output")" -eq 1 ]]
+  ! grep -Fq '开始' <<<"$output"
+  ! grep -Fq '完成' <<<"$output"
 }
 
 test_progress_render_reports_only_real_percentages() {
@@ -61,7 +61,7 @@ test_progress_render_reports_only_real_percentages() {
   grep -Fq '50%' <<<"$known"
 
   unknown="$(progress_render '未知总量' 2048 0 0)"
-  grep -Fq '已处理 2KB' <<<"$unknown"
+  grep -Fq '· 2KB ·' <<<"$unknown"
   [[ "$unknown" != *%* ]]
 
   clamped="$(progress_render '超出总量' 150 100 0)"
@@ -69,7 +69,7 @@ test_progress_render_reports_only_real_percentages() {
   grep -Fq '100B/100B' <<<"$clamped"
 }
 
-test_file_progress_plain_reports_written_bytes() {
+test_quick_file_progress_is_silent() {
   local tmp output label='测试文件写入'
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
@@ -79,19 +79,17 @@ test_file_progress_plain_reports_written_bytes() {
     bash -c 'printf data >"$1"' _ "${tmp}/output.bin" 2>&1)"
 
   [[ "$(<"${tmp}/output.bin")" == 'data' ]]
-  [[ "$(grep -Fc "[进度] ${label}：开始" <<<"$output")" -eq 1 ]]
-  [[ "$(grep -Fc "[进度] ${label}：完成" <<<"$output")" -eq 1 ]]
-  grep -Fq '已处理 4B' <<<"$output"
-  ! grep -Fq "[进度] ${label}：失败" <<<"$output"
+  [[ -z "$output" ]]
 }
 
 test_activity_progress_emits_heartbeat() {
   local output label='测试运行心跳'
   output="$(DOCKER_MIGRATE_PROGRESS_INTERVAL=1 \
     run_with_activity "$label" bash -c 'sleep 2' 2>&1)"
-  grep -Fq "[进度] ${label}：仍在执行" <<<"$output"
-  grep -Fq '无需按键' <<<"$output"
-  grep -Fq "[进度] ${label}：完成" <<<"$output"
+  grep -Eq "^\[进度\] ${label} · [12] 秒$" <<<"$output"
+  ! grep -Fq '开始' <<<"$output"
+  ! grep -Fq '无需按键' <<<"$output"
+  ! grep -Fq '完成' <<<"$output"
 }
 
 test_activity_progress_preserves_shell_state_and_stdin() {
@@ -132,8 +130,7 @@ progress_command_substitution_probe() {
   local output label='测试命令替换及时结束'
   output="$(DOCKER_MIGRATE_PROGRESS_INTERVAL=30 \
     run_with_activity "$label" bash -c 'printf sentinel' 2>&1)"
-  grep -Fq 'sentinel' <<<"$output"
-  grep -Fq "[进度] ${label}：完成" <<<"$output"
+  [[ "$output" == 'sentinel' ]]
 }
 
 test_activity_progress_does_not_hold_command_substitution_open() {
@@ -175,7 +172,7 @@ SH
 }
 
 test_final_result_summaries_are_unambiguous() {
-  local success rolled_back incomplete source
+  local success rolled_back incomplete source source_failure
   success="$(print_restore_result_summary SUCCESS 完成 \
     '容器：2 个（运行 1 / 暂停 0 / 停止 1）' \
     '数据：1 个 volume、1 个 bind 目录' \
@@ -205,6 +202,72 @@ test_final_result_summaries_are_unambiguous() {
   [[ "$(grep -Fc '结果：' <<<"$source")" -eq 1 ]]
   grep -Fq '结果：✅ 源端任务已安全结束' <<<"$source"
   grep -Fq '源容器：已恢复 2/2' <<<"$source"
+  grep -Fq '耗时：15 秒' <<<"$source"
+  ! grep -Fq '迁移包：' <<<"$source"
+  ! grep -Fq 'HTTP 服务：' <<<"$source"
+  ! grep -Fq '清理：' <<<"$source"
+
+  source_failure="$(print_source_result_summary FAILED '未完成' \
+    '异常退出' '已恢复 2/2' '临时迁移文件已删除' '16 秒')"
+  grep -Fq '结果：❌ 源端任务失败' <<<"$source_failure"
+  grep -Fq '迁移包：未完成' <<<"$source_failure"
+  grep -Fq 'HTTP 服务：异常退出' <<<"$source_failure"
+  grep -Fq '清理：临时迁移文件已删除' <<<"$source_failure"
+}
+
+test_transfer_instructions_are_concise() {
+  local url output
+  url='http://127.0.0.1:8080/token/bundle.tar.gz.enc#sha256=abc'
+  output="$(print_transfer_instructions "$url" interactive)"
+  [[ "$(grep -Fc "$url" <<<"$output")" -eq 1 ]]
+  [[ "$(grep -Fc '选择「2) 下载备份并恢复」' <<<"$output")" -eq 1 ]]
+  grep -Fq '按回车停止传输服务并清理临时文件' <<<"$output"
+  ! grep -Fq '可信渠道' <<<"$output"
+  ! grep -Fq 'HTTP 服务日志' <<<"$output"
+}
+
+test_http_diagnostics_show_details_once() {
+  local tmp output empty_output
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  printf 'backend=python3\nsynthetic failure detail\n' >"${tmp}/http.log"
+
+  export HTTP_DIAGNOSTICS_SHOWN=0
+  output="$({
+    print_http_diagnostics_once "${tmp}/http.log"
+    print_http_diagnostics_once "${tmp}/http.log"
+  } 2>&1)"
+  [[ "$(grep -Fc 'HTTP 服务诊断（最后 20 行）' <<<"$output")" -eq 1 ]]
+  [[ "$(grep -Fc 'synthetic failure detail' <<<"$output")" -eq 1 ]]
+  [[ "$(grep -Fc "完整日志：${tmp}/http.log" <<<"$output")" -eq 1 ]]
+
+  : >"${tmp}/empty.log"
+  export HTTP_DIAGNOSTICS_SHOWN=0
+  empty_output="$(print_http_diagnostics_once "${tmp}/empty.log" 2>&1)"
+  grep -Fq 'HTTP 服务未提供额外日志' <<<"$empty_output"
+}
+
+test_netcat_fallback_rejects_unsupported_cli() {
+  local tmp rc=0 calls
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin"
+  cat >"${tmp}/bin/nc" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >>"$NC_CALL_LOG"
+exit 42
+SH
+  chmod +x "${tmp}/bin/nc"
+  printf 'HTTP/1.1 200 OK\r\n\r\n' >"${tmp}/response"
+  printf 'payload\n' >"${tmp}/transfer"
+  : >"${tmp}/nc.calls"
+
+  PATH="${tmp}/bin:$PATH" NC_CALL_LOG="${tmp}/nc.calls" \
+    netcat_http_serve 8080 "${tmp}/response" "${tmp}/transfer" \
+    >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]]
+  calls="$(wc -l <"${tmp}/nc.calls")"
+  [[ "$calls" -eq 3 ]]
 }
 
 test_generated_scripts_are_valid_bash() {
@@ -225,6 +288,10 @@ test_generated_scripts_are_valid_bash() {
   grep -Fq 'kill "$timer_pid"' "${tmp}/bundle/restore.sh"
   grep -Fq 'sleep "$interval" </dev/null >/dev/null 2>&1 &' \
     "${tmp}/bundle/restore.sh"
+  ! grep -Fq '此步骤可能耗时较长' "${tmp}/bundle/runs/demo.sh"
+  ! grep -Fq '此步骤可能耗时较长' "${tmp}/bundle/restore.sh"
+  ! grep -Fq '无需按键' "${tmp}/bundle/runs/demo.sh"
+  ! grep -Fq '无需按键' "${tmp}/bundle/restore.sh"
 }
 
 test_generated_quiesce_list_rejects_partial_pipeline() {
@@ -621,13 +688,16 @@ test_manifest_validates_compose_working_directories() {
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
-run_test "plain file progress reports bytes written" test_file_progress_plain_reports_written_bytes
-run_test "activity progress emits a non-TTY heartbeat" test_activity_progress_emits_heartbeat
+run_test "quick successful progress operations stay silent" test_quick_file_progress_is_silent
+run_test "long activity emits only a numeric heartbeat" test_activity_progress_emits_heartbeat
 run_test "activity progress preserves errexit and command stdin" test_activity_progress_preserves_shell_state_and_stdin
 run_test "activity progress releases command substitution pipes" test_activity_progress_does_not_hold_command_substitution_open
 run_test "activity progress releases process substitution pipes" test_activity_progress_does_not_hold_process_substitution_open
 run_test "snapshot cleanup preserves records when Docker is unavailable" test_snapshot_cleanup_keeps_failed_records
 run_test "final result summaries expose one unambiguous status" test_final_result_summaries_are_unambiguous
+run_test "transfer instructions show one link and one clear workflow" test_transfer_instructions_are_concise
+run_test "HTTP diagnostics show useful details once" test_http_diagnostics_show_details_once
+run_test "Netcat fallback rejects unsupported CLI variants" test_netcat_fallback_rejects_unsupported_cli
 run_test "generated restore scripts parse as Bash" test_generated_scripts_are_valid_bash
 run_test "generated restore rejects an incomplete quiesce list" test_generated_quiesce_list_rejects_partial_pipeline
 run_test "bundle checksum detects tampering" test_checksums_detect_tampering

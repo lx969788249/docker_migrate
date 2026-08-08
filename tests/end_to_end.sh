@@ -123,6 +123,7 @@ chmod +x "${docker_proxy_dir}/tar"
     SOURCE_BIND_PATH="$bind_path" \
     PORT=18880 ADVERTISE_HOST=127.0.0.1 \
     STOP_SHARED_MOUNTS=1 \
+    DOCKER_MIGRATE_PROGRESS_INTERVAL=1 \
     DOCKER_MIGRATE_LOCK_BASE="${tmp}/source-locks" \
     DOCKER_MIGRATE_IGNORE_CONTAINERS="$ignore_container" \
     bash "$ROOT_DIR/docker_migrate_perfect.sh" --backup \
@@ -135,17 +136,15 @@ backup_pid=$!
 volume_released=0
 bind_released=0
 for _ in $(seq 1 240); do
-  if ((volume_released == 0)) && [[ -e "$archive_started" ]]; then
-    grep -Fq "[进度] 打包命名卷：${volume_name}：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键" \
-      "$backup_log"
+  if ((volume_released == 0)) && [[ -e "$archive_started" ]] &&
+    grep -Fq "[进度] 打包命名卷：${volume_name} ·" "$backup_log"; then
     [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
     [[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
     touch "$archive_release"
     volume_released=1
   fi
-  if ((bind_released == 0)) && [[ -e "$bind_archive_started" ]]; then
-    grep -Fq "[进度] 打包绑定目录：${bind_path}：开始；此步骤可能耗时较长，脚本正在正常执行，无需按键" \
-      "$backup_log"
+  if ((bind_released == 0)) && [[ -e "$bind_archive_started" ]] &&
+    grep -Fq "[进度] 打包绑定目录：${bind_path} ·" "$backup_log"; then
     [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
     [[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
     touch "$bind_archive_release"
@@ -182,6 +181,14 @@ if [[ -z "$download_url" ]]; then
   tail -n 80 "$backup_log" >&2 || true
   exit 1
 fi
+[[ "$(grep -Fc '下载链接（请完整复制）：' "$backup_log")" -eq 1 ]]
+[[ "$(grep -Fc "$download_url" "$backup_log")" -eq 1 ]]
+[[ "$(grep -Fc '选择「2) 下载备份并恢复」' "$backup_log")" -eq 1 ]]
+! grep -Fq '可信渠道' "$backup_log"
+! grep -Fq 'HTTP 服务日志' "$backup_log"
+! grep -Fq 'http_server_' "$backup_log"
+! grep -Fq '此步骤可能耗时较长' "$backup_log"
+! grep -Fq '无需按键' "$backup_log"
 
 # 数据快照完成后源容器应立即恢复，不能为了等待下载而持续停机。
 [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]
@@ -239,9 +246,11 @@ backup_pid=""
 [[ "$(grep -Fc 'Docker 迁移结果' "$backup_log")" -eq 1 ]]
 [[ "$(grep -Fc '结果：' "$backup_log")" -eq 1 ]]
 grep -Fq '结果：✅ 源端任务已安全结束' "$backup_log"
-grep -Fq 'HTTP 服务：已停止' "$backup_log"
 grep -Fq '源容器：已恢复 2/2' "$backup_log"
-grep -Fq '清理：临时迁移文件已删除' "$backup_log"
+! grep -Fq '迁移包：' "$backup_log"
+! grep -Fq 'HTTP 服务：' "$backup_log"
+! grep -Fq '清理：' "$backup_log"
+[[ -z "$(find "${source_work}/bundle" -maxdepth 1 -name 'http_server_*.log' -print -quit)" ]]
 if curl -fsS --max-time 2 "$wire_url" -o /dev/null 2>/dev/null; then
   echo "HTTP transfer service remained reachable after source cleanup" >&2
   exit 1
@@ -252,6 +261,7 @@ mkdir -p "$http_failure_proxy_dir"
 cat >"${http_failure_proxy_dir}/python3" <<'SH'
 #!/bin/sh
 if [ "${1:-}" = "-" ]; then
+  printf 'synthetic http failure detail\n' >&2
   sleep 2
   exit 42
 fi
@@ -277,6 +287,12 @@ grep -Fq '结果：❌ 源端任务失败，清理流程已执行' "$http_failur
 grep -Fq 'HTTP 服务：异常退出' "$http_failure_log"
 grep -Fq '源容器：已恢复 2/2' "$http_failure_log"
 grep -Fq '清理：临时迁移文件已删除' "$http_failure_log"
+[[ "$(grep -Fc 'HTTP 服务诊断（最后 20 行）：' "$http_failure_log")" -eq 1 ]]
+[[ "$(grep -Fc 'synthetic http failure detail' "$http_failure_log")" -eq 1 ]]
+[[ "$(grep -Fc '完整日志：' "$http_failure_log")" -eq 1 ]]
+failure_http_log="$(sed -n 's/^完整日志：//p' "$http_failure_log" | tail -n1)"
+[[ -f "$failure_http_log" ]]
+grep -Fq 'synthetic http failure detail' "$failure_http_log"
 ! grep -Fq '结果：✅ 源端任务已安全结束' "$http_failure_log"
 [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]
 [[ "$(docker inspect -f '{{.State.Paused}}' "$paused_shared_name")" == "true" ]]
