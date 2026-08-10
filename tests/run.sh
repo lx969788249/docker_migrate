@@ -69,6 +69,18 @@ test_progress_render_reports_only_real_percentages() {
   grep -Fq '100B/100B' <<<"$clamped"
 }
 
+test_tty_progress_redraw_has_no_blank_frame() {
+  local output expected
+  output="$({
+    progress_tty_draw '较长的进度内容 · 1 秒'
+    progress_tty_draw '短内容 · 2 秒'
+    progress_tty_clear
+  } 2>&1)"
+  expected=$'\r较长的进度内容 · 1 秒\033[K\r短内容 · 2 秒\033[K\r\033[K'
+  [[ "$output" == "$expected" ]]
+  [[ "$output" != *"$(printf '%120s' '')"* ]]
+}
+
 test_quick_file_progress_is_silent() {
   local tmp output label='测试文件写入'
   tmp="$(mktemp -d)"
@@ -292,6 +304,15 @@ test_generated_scripts_are_valid_bash() {
   ! grep -Fq '此步骤可能耗时较长' "${tmp}/bundle/restore.sh"
   ! grep -Fq '无需按键' "${tmp}/bundle/runs/demo.sh"
   ! grep -Fq '无需按键' "${tmp}/bundle/restore.sh"
+  # TTY 更新必须一次覆盖并清除行尾，不能先输出 120 个空格制造空白帧。
+  grep -Fq "printf '\\r%s\\033[K'" "${tmp}/bundle/runs/demo.sh"
+  grep -Fq "printf '\\r%s\\033[K'" "${tmp}/bundle/restore.sh"
+  grep -Fq "printf '\\r\\033[K'" "${tmp}/bundle/runs/demo.sh"
+  grep -Fq "printf '\\r\\033[K'" "${tmp}/bundle/restore.sh"
+  [[ "$(grep -Fc 'dm_tty_clear' "${tmp}/bundle/runs/demo.sh")" -ge 2 ]]
+  [[ "$(grep -Fc 'dm_tty_clear' "${tmp}/bundle/restore.sh")" -ge 2 ]]
+  ! grep -Fq '%-120s' "${tmp}/bundle/runs/demo.sh"
+  ! grep -Fq '%-120s' "${tmp}/bundle/restore.sh"
 }
 
 test_generated_quiesce_list_rejects_partial_pipeline() {
@@ -755,6 +776,7 @@ test_manifest_validates_compose_working_directories() {
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
+run_test "TTY progress redraw avoids intermediate blank frames" test_tty_progress_redraw_has_no_blank_frame
 run_test "quick successful progress operations stay silent" test_quick_file_progress_is_silent
 run_test "long activity emits only a numeric heartbeat" test_activity_progress_emits_heartbeat
 run_test "activity progress preserves errexit and command stdin" test_activity_progress_preserves_shell_state_and_stdin

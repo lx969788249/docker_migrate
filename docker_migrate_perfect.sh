@@ -458,6 +458,16 @@ progress_render() {
   fi
 }
 
+progress_tty_draw() {
+  # 用一次写入覆盖旧内容，再清除新内容右侧的残留；不要先输出一整行空格，
+  # 否则 SSH 或刷新较慢的终端会把中间空帧显示成闪烁。
+  printf '\r%s\033[K' "$1" >&2
+}
+
+progress_tty_clear() {
+  printf '\r\033[K' >&2
+}
+
 progress_finish() {
   local label="$1" rc="$2" elapsed="$3" current="${4:-0}"
   local suffix=""
@@ -469,10 +479,11 @@ progress_finish() {
 
 progress_count() {
   local label="$1" current="$2" total="$3" item="${4:-}"
-  local suffix=""
+  local suffix="" line
   [[ -z "$item" ]] || suffix="（${item}）"
   if [[ -t 2 ]]; then
-    printf '\r%-120s\r[进度] %s：%d/%d%s' "" "$label" "$current" "$total" "$suffix" >&2
+    printf -v line '[进度] %s：%d/%d%s' "$label" "$current" "$total" "$suffix"
+    progress_tty_draw "$line"
     ((current < total)) || printf '\n' >&2
   elif ((current == 1 || current == total || current % 10 == 0)); then
     printf '[进度] %s：%d/%d%s\n' "$label" "$current" "$total" "$suffix" >&2
@@ -481,7 +492,7 @@ progress_count() {
 
 progress_watch() {
   local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed timer_pid=""
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed line timer_pid=""
   [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -513,8 +524,8 @@ progress_watch() {
     [[ -z "$file" ]] || current="$(progress_file_size "$file")"
     elapsed=$((SECONDS - started))
     if [[ -t 2 ]]; then
-      printf '\r%-120s\r' "" >&2
-      progress_render "$label" "$current" "$total" "$elapsed" >&2
+      line="$(progress_render "$label" "$current" "$total" "$elapsed")"
+      progress_tty_draw "$line"
     else
       progress_render "$label" "$current" "$total" "$elapsed" >&2
       printf '\n' >&2
@@ -536,7 +547,7 @@ run_with_progress() {
   ((restore_errexit == 0)) || set -e
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || printf '\r%-120s\r' "" >&2
+  [[ ! -t 2 ]] || progress_tty_clear
   [[ -z "$file" ]] || current="$(progress_file_size "$file")"
   progress_finish "$label" "$rc" "$((SECONDS - started))" "$current"
   return "$rc"
@@ -1287,9 +1298,17 @@ dm_format_elapsed() {
   fi
 }
 
+dm_tty_draw() {
+  printf '\r%s\033[K' "$1" >&2
+}
+
+dm_tty_clear() {
+  printf '\r\033[K' >&2
+}
+
 dm_progress_watch() {
   local label="$1" started="$2" owner_pid="$3"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval elapsed timer_pid=""
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval elapsed line timer_pid=""
   [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -1316,8 +1335,8 @@ dm_progress_watch() {
     kill -0 "$owner_pid" 2>/dev/null || break
     elapsed=$((SECONDS - started))
     if [[ -t 2 ]]; then
-      printf '\r%-120s\r[进度] %s · %s' \
-        "" "$label" "$(dm_format_elapsed "$elapsed")" >&2
+      printf -v line '[进度] %s · %s' "$label" "$(dm_format_elapsed "$elapsed")"
+      dm_tty_draw "$line"
     else
       printf '[进度] %s · %s\n' \
         "$label" "$(dm_format_elapsed "$elapsed")" >&2
@@ -1339,7 +1358,7 @@ dm_run_with_activity() {
   ((restore_errexit == 0)) || set -e
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || printf '\r%-120s\r' "" >&2
+  [[ ! -t 2 ]] || dm_tty_clear
   if ((rc != 0)); then
     printf '[失败] %s · %s\n' "$label" "$(dm_format_elapsed "$((SECONDS - started))")" >&2
   fi
@@ -2035,6 +2054,14 @@ dm_format_elapsed() {
   fi
 }
 
+dm_tty_draw() {
+  printf '\r%s\033[K' "$1" >&2
+}
+
+dm_tty_clear() {
+  printf '\r\033[K' >&2
+}
+
 dm_human() {
   local bytes="${1:-0}" unit=0
   local -a units=(B KB MB GB TB)
@@ -2099,7 +2126,7 @@ dm_progress_watch() {
       message="[进度] ${label} · $(dm_format_elapsed "$elapsed")"
     fi
     if [[ -t 2 ]]; then
-      printf '\r%-120s\r%s' "" "$message" >&2
+      dm_tty_draw "$message"
     else
       printf '%s\n' "$message" >&2
     fi
@@ -2120,7 +2147,7 @@ dm_run_with_progress() {
   ((restore_errexit == 0)) || set -e
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || printf '\r%-120s\r' "" >&2
+  [[ ! -t 2 ]] || dm_tty_clear
   [[ -z "$file" ]] || current="$(dm_file_size "$file")"
   ((current == 0)) || suffix=" · $(dm_human "$current")"
   if ((rc != 0)); then
