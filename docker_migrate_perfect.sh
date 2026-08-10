@@ -4451,6 +4451,101 @@ REST_SH
 #####################################
 # 恢复模式
 #####################################
+RESTORE_CLIENT_SESSION_BASE=""
+RESTORE_CLIENT_SESSION_DIR=""
+RESTORE_CLIENT_PHASE="idle"
+
+restore_client_session_path_is_safe() {
+  local base="${1:-}" session="${2:-}" prefix suffix
+  [[ -n "$base" && -n "$session" && "$session" != "/" ]] || return 1
+  if [[ "$base" == "/" ]]; then
+    prefix="/restore."
+  else
+    prefix="${base%/}/restore."
+  fi
+  [[ "$session" == "$prefix"* ]] || return 1
+  suffix="${session#"$prefix"}"
+  [[ "$suffix" =~ ^[A-Za-z0-9]+$ ]]
+}
+
+restore_client_remove_session() {
+  local base="${RESTORE_CLIENT_SESSION_BASE:-}"
+  local session="${RESTORE_CLIENT_SESSION_DIR:-}"
+  if ! restore_client_session_path_is_safe "$base" "$session"; then
+    RED "[ERR] 拒绝清理不安全的恢复临时目录：${session:-<空>}"
+    return 1
+  fi
+  [[ -e "$session" || -L "$session" ]] || return 0
+  rm -rf -- "$session"
+}
+
+restore_client_exit_handler() {
+  local rc="${1:-$?}"
+  trap - EXIT
+  # 首次中断已确定退出结果；清理期间忽略后续信号，避免连续按 Ctrl+C
+  # 又把 rm 打断，反而留下正在清理的半成品。
+  trap '' INT TERM HUP
+  set +e
+  case "${RESTORE_CLIENT_PHASE:-idle}" in
+    preparing | cleanup)
+      if restore_client_remove_session; then
+        if ((rc != 0)); then
+          case "$rc" in
+            129 | 130 | 143) YEL "[INFO] 已清理中断产生的下载与临时文件。" ;;
+            *) YEL "[INFO] 已清理未完成的下载与临时文件。" ;;
+          esac
+        fi
+      else
+        RED "[ERR] 自动清理失败，请检查：${RESTORE_CLIENT_SESSION_DIR:-未知目录}"
+      fi
+      ;;
+  esac
+  RESTORE_CLIENT_PHASE="finished"
+  # 清理失败不能覆盖原始信号或错误退出码；诊断信息已在上面明确给出。
+  exit "$rc"
+}
+
+restore_client_arm_session_cleanup() {
+  local base="$1" session="$2"
+  if ! restore_client_session_path_is_safe "$base" "$session"; then
+    RED "[ERR] 无法保护不安全的恢复临时目录：$session"
+    return 1
+  fi
+  RESTORE_CLIENT_SESSION_BASE="$base"
+  RESTORE_CLIENT_SESSION_DIR="$session"
+  RESTORE_CLIENT_PHASE="preparing"
+  trap 'restore_client_exit_handler $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+
+restore_client_begin_restore() {
+  RESTORE_CLIENT_PHASE="restoring"
+  # 包内 restore.sh 有自己的信号回滚处理。外层继续保留 EXIT handler，
+  # 但恢复阶段只保留诊断目录，不能抢先退出或删除回滚资料。
+  trap - INT TERM HUP
+}
+
+restore_client_begin_cleanup() {
+  RESTORE_CLIENT_PHASE="cleanup"
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+
+restore_client_preserve_session() {
+  RESTORE_CLIENT_PHASE="preserve"
+  trap - EXIT INT TERM HUP
+}
+
+restore_client_finish_session() {
+  RESTORE_CLIENT_PHASE="finished"
+  RESTORE_CLIENT_SESSION_BASE=""
+  RESTORE_CLIENT_SESSION_DIR=""
+  trap - EXIT INT TERM HUP
+}
+
 restore_prompt_url() {
   local restore_url="${1:-}"
   if [[ -z "$restore_url" ]]; then
@@ -4566,11 +4661,19 @@ restore_main() {
   restore_ensure_deps "$encrypted"
   local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
   mkdir -p "$BASE"
+  BASE="$(cd "$BASE" && pwd -P)" || {
+    RED "[ERR] 无法访问恢复目录：$BASE"
+    exit 1
+  }
   local SESSION_DIR
   SESSION_DIR="$(mktemp -d "${BASE}/restore.XXXXXX")" || {
     RED "[ERR] 无法创建独立恢复工作目录：$BASE"
     exit 1
   }
+  if ! restore_client_arm_session_cleanup "$BASE" "$SESSION_DIR"; then
+    rmdir "$SESSION_DIR" 2>/dev/null || true
+    exit 1
+  fi
   local RID
   RID="$(basename "$DOWNLOAD_URL" | sed 's/\.tar\.gz.*$//' | tr -dc 'A-Za-z0-9_-')"
   [[ -n "$RID" ]] || RID="$(date +%s)"
@@ -4580,12 +4683,17 @@ restore_main() {
   if ((encrypted == 1)); then
     DOWNLOAD_FILE="$ENCRYPTED_BUNDLE"
   fi
+  local DOWNLOAD_PARTIAL="${DOWNLOAD_FILE}.partial"
   local OUTDIR="${SESSION_DIR}/unpacked"
 
   BLUE "[INFO] 下载：$DOWNLOAD_URL"
   if ! curl -fL --progress-bar --retry 5 --retry-delay 10 --retry-max-time 300 \
-    --connect-timeout 30 --output "$DOWNLOAD_FILE" --url "$DOWNLOAD_URL"; then
+    --connect-timeout 30 --output "$DOWNLOAD_PARTIAL" --url "$DOWNLOAD_URL"; then
     RED "[ERR] 下载失败：$DOWNLOAD_URL"
+    exit 1
+  fi
+  if ! mv "$DOWNLOAD_PARTIAL" "$DOWNLOAD_FILE"; then
+    RED "[ERR] 无法保存已下载的迁移包，请检查磁盘空间：$DOWNLOAD_FILE"
     exit 1
   fi
   OK "[OK] 保存路径：$DOWNLOAD_FILE"
@@ -4661,6 +4769,7 @@ restore_main() {
   local rc result_file="${SESSION_DIR}/restore-result.json" result_status result_stage rollback_dir
   local metrics total running paused stopped missing volumes binds
   local container_line="" data_line="" cleanup_line="" diagnostic_dir="" elapsed
+  restore_client_begin_restore
   set +e
   RESTORE_CHECKSUM_VERIFIED=1 RESTORE_SESSION_DIR="$SESSION_DIR" \
     RESTORE_RESULT_FILE="$result_file" RESTORE_DEFER_FINAL_SUMMARY=1 \
@@ -4687,6 +4796,18 @@ restore_main() {
   fi
 
   if [[ "$result_status" == "SUCCESS" ]]; then
+    if [[ "${RESTORE_KEEP:-0}" == "1" ]]; then
+      restore_client_preserve_session
+    else
+      restore_client_begin_cleanup
+    fi
+  elif [[ "${RESTORE_CLEAN_ALL:-0}" == "1" ]]; then
+    restore_client_begin_cleanup
+  else
+    restore_client_preserve_session
+  fi
+
+  if [[ "$result_status" == "SUCCESS" ]]; then
     metrics="$(collect_restore_result_metrics "$BUNDLE_DIR")"
     IFS=$'\t' read -r total running paused stopped missing volumes binds <<<"$metrics"
     container_line="容器：${total} 个（运行 ${running} / 暂停 ${paused} / 停止 ${stopped}"
@@ -4696,20 +4817,24 @@ restore_main() {
     if [[ "${RESTORE_KEEP:-0}" == "1" ]]; then
       cleanup_line="恢复文件已按 RESTORE_KEEP=1 保留：$SESSION_DIR"
     else
-      if run_with_activity "清理恢复临时文件" rm -rf "$SESSION_DIR"; then
+      if run_with_activity "清理恢复临时文件" restore_client_remove_session; then
         cleanup_line="下载文件与临时目录已删除"
+        restore_client_finish_session
       else
         cleanup_line="恢复成功，但部分下载文件或临时目录未能删除，请人工检查"
         diagnostic_dir="$SESSION_DIR"
+        restore_client_preserve_session
       fi
     fi
   else
     if [[ "${RESTORE_CLEAN_ALL:-0}" == "1" ]]; then
-      if run_with_activity "清理恢复临时文件" rm -rf "$SESSION_DIR"; then
+      if run_with_activity "清理恢复临时文件" restore_client_remove_session; then
         cleanup_line="已按 RESTORE_CLEAN_ALL=1 删除下载文件与临时目录"
+        restore_client_finish_session
       else
         cleanup_line="RESTORE_CLEAN_ALL=1 清理未完成，请人工检查"
         diagnostic_dir="$SESSION_DIR"
+        restore_client_preserve_session
       fi
     else
       cleanup_line="恢复文件已保留，便于排查"
@@ -4720,6 +4845,7 @@ restore_main() {
   elapsed="$(format_elapsed "$((SECONDS - restore_started))")"
   print_restore_result_summary "$result_status" "$result_stage" "$container_line" "$data_line" \
     "$cleanup_line" "$diagnostic_dir" "$rollback_dir" "$elapsed"
+  restore_client_finish_session
   exit "$rc"
 }
 

@@ -19,6 +19,8 @@ restore_base="${tmp}/restore"
 backup_log="${tmp}/backup.log"
 restore_log="${tmp}/restore.log"
 http_failure_log="${tmp}/http-failure.log"
+interrupt_restore_log="${tmp}/interrupt-restore.log"
+interrupt_download_record="${tmp}/interrupt-download-path"
 backup_pid=""
 ignore_container=""
 confidential_marker="docker-migrate-e2e-confidential-${suffix}"
@@ -29,6 +31,8 @@ archive_release="${tmp}/archive-release"
 bind_archive_started="${tmp}/bind-archive-started"
 bind_archive_release="${tmp}/bind-archive-release"
 http_failure_proxy_dir="${tmp}/http-failure-proxy"
+interrupt_curl_proxy_dir="${tmp}/interrupt-curl-proxy"
+interrupt_restore_base="${tmp}/restore interrupted"
 
 cleanup() {
   touch "$archive_release" 2>/dev/null || true
@@ -189,6 +193,48 @@ fi
 ! grep -Fq 'http_server_' "$backup_log"
 ! grep -Fq '此步骤可能耗时较长' "$backup_log"
 ! grep -Fq '无需按键' "$backup_log"
+
+# 下载尚未完成时 Ctrl+C 必须清理本次 session，不能在 VPS 上累积半成品。
+mkdir -p "$interrupt_curl_proxy_dir" "$interrupt_restore_base"
+printf 'keep\n' >"${interrupt_restore_base}/keep.txt"
+cat >"${interrupt_curl_proxy_dir}/curl" <<'SH'
+#!/bin/sh
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      output="${2:-}"
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+[ -n "$output" ] || exit 97
+printf '%s\n' "$output" >"$INTERRUPT_DOWNLOAD_RECORD"
+dd if=/dev/zero of="$output" bs=1024 count=64 >/dev/null 2>&1
+kill -INT "$PPID"
+exit 130
+SH
+chmod +x "${interrupt_curl_proxy_dir}/curl"
+interrupt_restore_rc=0
+set +e
+PATH="${interrupt_curl_proxy_dir}:$PATH" \
+  INTERRUPT_DOWNLOAD_RECORD="$interrupt_download_record" \
+  RESTORE_BASE="$interrupt_restore_base" \
+  bash "$ROOT_DIR/docker_migrate_perfect.sh" \
+  --restore="$download_url" >"$interrupt_restore_log" 2>&1
+interrupt_restore_rc=$?
+set -e
+if [[ "$interrupt_restore_rc" -ne 130 ]]; then
+  echo "interrupted restore returned ${interrupt_restore_rc}, expected 130" >&2
+  cat "$interrupt_restore_log" >&2
+  exit 1
+fi
+grep -Fq '已清理中断产生的下载与临时文件' "$interrupt_restore_log"
+[[ "$(<"$interrupt_download_record")" == *.partial ]]
+[[ "$(<"${interrupt_restore_base}/keep.txt")" == "keep" ]]
+[[ -z "$(find "$interrupt_restore_base" -mindepth 1 -maxdepth 1 \
+  -type d -name 'restore.*' -print -quit)" ]]
 
 # 数据快照完成后源容器应立即恢复，不能为了等待下载而持续停机。
 [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]

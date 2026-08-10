@@ -441,6 +441,73 @@ YAML
   [[ "${actual[*]}" == "${expected[*]}" ]]
 }
 
+test_restore_client_cleanup_on_interrupts_and_errors() {
+  local tmp base sentinel spec signal expected session output rc
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  base="${tmp}/restore base"
+  mkdir -p "$base"
+  sentinel="${base}/keep.txt"
+  printf 'keep\n' >"$sentinel"
+
+  for spec in INT:130 TERM:143 HUP:129; do
+    signal="${spec%%:*}"
+    expected="${spec##*:}"
+    session="$(mktemp -d "${base}/restore.XXXXXX")"
+    set +e
+    output="$(
+      (
+        restore_client_arm_session_cleanup "$base" "$session"
+        printf 'partial download\n' >"${session}/bundle.tar.gz.enc.partial"
+        kill -s "$signal" "$BASHPID"
+        sleep 5
+      ) 2>&1
+    )"
+    rc=$?
+    set -e
+
+    [[ "$rc" -eq "$expected" ]]
+    [[ ! -e "$session" ]]
+    [[ "$(grep -Fc '已清理中断产生的下载与临时文件' <<<"$output")" -eq 1 ]]
+  done
+
+  session="$(mktemp -d "${base}/restore.XXXXXX")"
+  set +e
+  (
+    restore_client_arm_session_cleanup "$base" "$session"
+    printf 'partial download\n' >"${session}/bundle.tar.gz.partial"
+    exit 56
+  ) >/dev/null 2>&1
+  rc=$?
+  set -e
+  [[ "$rc" -eq 56 ]]
+  [[ ! -e "$session" ]]
+  [[ "$(<"$sentinel")" == "keep" ]]
+  [[ -z "$(find "$base" -mindepth 1 -maxdepth 1 -type d -name 'restore.*' -print -quit)" ]]
+}
+
+test_restore_client_cleanup_preserves_transaction_diagnostics() {
+  local tmp base session rc
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  base="${tmp}/restore base"
+  mkdir -p "$base"
+  session="$(mktemp -d "${base}/restore.XXXXXX")"
+
+  set +e
+  (
+    restore_client_arm_session_cleanup "$base" "$session"
+    printf 'rollback diagnostics\n' >"${session}/restore-result.json"
+    restore_client_begin_restore
+    exit 23
+  ) >/dev/null 2>&1
+  rc=$?
+  set -e
+
+  [[ "$rc" -eq 23 ]]
+  [[ "$(<"${session}/restore-result.json")" == "rollback diagnostics" ]]
+}
+
 test_external_bundle_digest() {
   local tmp digest url legacy_url secret iv mac
   tmp="$(mktemp -d)"
@@ -704,6 +771,8 @@ run_test "bundle checksum detects tampering" test_checksums_detect_tampering
 run_test "top-level archive rejects unsafe members in two scans" test_archive_layout_rejects_unsafe_members_in_two_scans
 run_test "inner archive member check preserves links in one scan" test_inner_archive_member_check_uses_one_scan
 run_test "Compose env_file parser handles scalar/list/long syntax" test_compose_env_file_parser
+run_test "restore client cleans interrupted and failed preparation sessions" test_restore_client_cleanup_on_interrupts_and_errors
+run_test "restore client preserves diagnostics after transaction handoff" test_restore_client_cleanup_preserves_transaction_diagnostics
 run_test "encrypted and legacy URL fragments are parsed safely" test_external_bundle_digest
 run_test "encrypted bundle round-trips without exposing plaintext" test_encrypted_bundle_round_trip
 run_test "streaming compression and encryption preserves bundle and digests" test_streaming_pack_encrypt_round_trip
