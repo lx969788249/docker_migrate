@@ -2,11 +2,11 @@
 
 [![自动化测试](https://github.com/lx969788249/docker_migrate/actions/workflows/ci.yml/badge.svg)](https://github.com/lx969788249/docker_migrate/actions/workflows/ci.yml)
 
-## Docker 迁移，最怕配置和数据没带全
+## 相信你在迁移docker的时候也遇到过下面的问题
 
 端口怎么映射的？环境变量改过哪些？数据卷和挂载目录有没有漏？容器里临时改过、却没有挂载出来的文件还能不能带走？
 
-Docker Migrate 把这些事合成一条迁移流程：
+而这些，在使用本脚本进行迁移docker的时候，你都完全不需要考虑，程序会自动帮你解决。心动了吗，快来试试吧
 
 > **旧服务器选择容器 → 复制迁移链接 → 新服务器粘贴恢复**
 
