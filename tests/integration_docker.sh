@@ -367,6 +367,9 @@ mkdir -p "${data_bundle}/volumes" "${data_bundle}/binds" "${data_bundle}/meta" \
   "${tmp}/volume-source" "$bind_target" "${bind_archive_root}${bind_target}"
 printf 'new-volume-data\n' >"${tmp}/volume-source/new.txt"
 ln -s new.txt "${tmp}/volume-source/safe-link"
+# MySQL 镜像会留下指向容器运行时目录的 socket 链接；它不是数据库文件，
+# 普通命名卷应保留此精确链接，但不能据此放开其他外部链接。
+ln -s /var/run/mysqld/mysqld.sock "${tmp}/volume-source/mysql.sock"
 tar -czf "${data_bundle}/volumes/vol_${data_volume_name}.tgz" \
   -C "${tmp}/volume-source" .
 printf 'new-bind-data\n' >"${bind_archive_root}${bind_target}/new.txt"
@@ -395,16 +398,76 @@ write_bundle_restore_script "${data_bundle}/restore.sh"
 generate_bundle_checksums "$data_bundle"
 (cd "$data_bundle" && bash restore.sh >/dev/null)
 docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
-  'test "$(cat /to/new.txt)" = new-volume-data; test "$(readlink /to/safe-link)" = new.txt; test ! -e /to/old.txt; test ! -e /to/stale.txt'
+  'test "$(cat /to/new.txt)" = new-volume-data; test "$(readlink /to/safe-link)" = new.txt; test "$(readlink /to/mysql.sock)" = /var/run/mysqld/mysqld.sock; test ! -e /to/old.txt; test ! -e /to/stale.txt'
 [[ "$(cat "${bind_target}/new.txt")" == "new-bind-data" ]]
 [[ "$(readlink "${bind_target}/safe-link")" == "new.txt" ]]
 [[ ! -e "${bind_target}/old.txt" && ! -e "${bind_target}/stale.txt" ]]
 
 docker run --rm -v "${data_volume_name}:/to" alpine:3.20 sh -c 'printf stale >/to/stale.txt'
 printf 'stale-bind-data\n' >"${bind_target}/stale.txt"
+# /run 是同样常见的容器内 socket 路径，第二次恢复也必须兼容。
+rm "${tmp}/volume-source/mysql.sock"
+ln -s /run/mysqld/mysqld.sock "${tmp}/volume-source/mysql.sock"
+tar -czf "${data_bundle}/volumes/vol_${data_volume_name}.tgz" \
+  -C "${tmp}/volume-source" .
+generate_bundle_checksums "$data_bundle"
 (cd "$data_bundle" && bash restore.sh >/dev/null)
-docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 test ! -e /to/stale.txt
+docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
+  'test ! -e /to/stale.txt; test "$(readlink /to/mysql.sock)" = /run/mysqld/mysqld.sock'
 [[ ! -e "${bind_target}/stale.txt" ]]
+
+# 名称相同但目标不同、相对越界、以及子目录内同名 socket 均不得获得豁免。
+# 失败必须保留具体链接原因、在 volume 阶段中止，并还原原数据与原 socket。
+docker run --rm -v "${data_volume_name}:/to" alpine:3.20 sh -c \
+  'printf target-before-volume-failure >/to/new.txt; printf keep >/to/volume-failure-sentinel'
+printf 'target-before-volume-failure\n' >"${bind_target}/volume-failure-sentinel"
+for unsafe_volume_case in absolute relative nested-socket; do
+  unsafe_volume_bundle="${tmp}/data-bundle-volume-${unsafe_volume_case}"
+  unsafe_volume_root="${tmp}/volume-${unsafe_volume_case}-source"
+  cp -a "$data_bundle" "$unsafe_volume_bundle"
+  mkdir -p "$unsafe_volume_root"
+  printf 'incoming-volume-data\n' >"${unsafe_volume_root}/new.txt"
+  case "$unsafe_volume_case" in
+    absolute)
+      unsafe_volume_link="mysql.sock"
+      unsafe_volume_target="/etc/passwd"
+      ;;
+    relative)
+      unsafe_volume_link="escape-relative"
+      unsafe_volume_target="../outside"
+      ;;
+    nested-socket)
+      mkdir -p "${unsafe_volume_root}/nested"
+      unsafe_volume_link="nested/mysql.sock"
+      unsafe_volume_target="/var/run/mysqld/mysqld.sock"
+      ;;
+  esac
+  ln -s "$unsafe_volume_target" "${unsafe_volume_root}/${unsafe_volume_link}"
+  tar -czf "${unsafe_volume_bundle}/volumes/vol_${data_volume_name}.tgz" \
+    -C "$unsafe_volume_root" .
+  generate_bundle_checksums "$unsafe_volume_bundle"
+  unsafe_volume_result="${tmp}/volume-${unsafe_volume_case}-result.json"
+  unsafe_volume_output=""
+  if unsafe_volume_output="$(
+    cd "$unsafe_volume_bundle" && RESTORE_RESULT_FILE="$unsafe_volume_result" bash restore.sh 2>&1
+  )"; then
+    echo "unsafe volume link unexpectedly restored: $unsafe_volume_case" >&2
+    exit 1
+  fi
+  grep -Fq -- "$unsafe_volume_link" <<<"$unsafe_volume_output"
+  grep -Fq -- "$unsafe_volume_target" <<<"$unsafe_volume_output"
+  grep -Fq '失败阶段：回灌命名卷' <<<"$unsafe_volume_output"
+  if grep -Fq '[C] 回灌绑定目录' <<<"$unsafe_volume_output" ||
+    grep -Fq '[D] 恢复 Compose 项目' <<<"$unsafe_volume_output"; then
+    echo "volume failure continued into later restore stages" >&2
+    exit 1
+  fi
+  jq -e '.status == "FAILED_ROLLED_BACK" and .stage == "回灌命名卷"' \
+    "$unsafe_volume_result" >/dev/null
+  docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
+    'test "$(cat /to/new.txt)" = target-before-volume-failure; test "$(cat /to/volume-failure-sentinel)" = keep; test "$(readlink /to/mysql.sock)" = /run/mysqld/mysqld.sock'
+  [[ "$(cat "${bind_target}/volume-failure-sentinel")" == "target-before-volume-failure" ]]
+done
 
 # 同名卷后端不一致时必须在清空前失败，不能把数据写入错误的 local/NFS/plugin 后端。
 volume_mismatch_bundle="${tmp}/data-bundle-volume-mismatch"
@@ -438,6 +501,23 @@ tar -czf "${unsafe_link_bundle}/binds/bind_test.tgz" \
 generate_bundle_checksums "$unsafe_link_bundle"
 if (cd "$unsafe_link_bundle" && bash restore.sh >/dev/null 2>&1); then
   echo "unsafe inner symlink archive unexpectedly restored" >&2
+  exit 1
+fi
+docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 \
+  test -f /to/target-before-unsafe.txt
+[[ -f "${bind_target}/target-before-unsafe.txt" ]]
+
+# 相同 socket 链接若位于宿主机绑定目录，不能套用命名卷的兼容例外。
+unsafe_socket_bind_bundle="${tmp}/data-bundle-bind-socket"
+cp -a "$data_bundle" "$unsafe_socket_bind_bundle"
+unsafe_socket_bind_root="${tmp}/unsafe-socket-bind-root"
+mkdir -p "${unsafe_socket_bind_root}${bind_target}"
+ln -s /var/run/mysqld/mysqld.sock "${unsafe_socket_bind_root}${bind_target}/mysql.sock"
+tar -czf "${unsafe_socket_bind_bundle}/binds/bind_test.tgz" \
+  -C "$unsafe_socket_bind_root" "${bind_target#/}"
+generate_bundle_checksums "$unsafe_socket_bind_bundle"
+if (cd "$unsafe_socket_bind_bundle" && bash restore.sh >/dev/null 2>&1); then
+  echo "bind mount unexpectedly accepted the named-volume socket exception" >&2
   exit 1
 fi
 docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 \

@@ -442,6 +442,89 @@ SH
   [[ "$calls" -eq 1 ]]
 }
 
+test_restore_data_diagnostics_are_private_and_nonintrusive() {
+  local tmp BUNDLE_DIR output rc=0 logfile mode
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  BUNDLE_DIR="${tmp}/bundle"
+  mkdir -p "$BUNDLE_DIR"
+  printf 'manifest\n' >"${BUNDLE_DIR}/manifest.json"
+  write_bundle_restore_script "${BUNDLE_DIR}/restore.sh"
+  generate_bundle_checksums "$BUNDLE_DIR"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n '/^restore_data_with_diagnostics() {/,/^}/p' "${BUNDLE_DIR}/restore.sh")
+  trap 'rm -rf "$tmp"' RETURN
+
+  output="$(restore_data_with_diagnostics '命名卷：success' bash -c 'printf noisy; printf stderr >&2')"
+  [[ -z "$output" ]]
+  [[ -z "$(find "$tmp" -maxdepth 1 -type f -name 'docker-migrate-data.*' -print)" ]]
+
+  output="$(restore_data_with_diagnostics '命名卷：failure' bash -c \
+    'printf "first line retained only in the log\n"; for i in {1..25}; do printf "detail %s\n" "$i"; done; printf "tar: cannot extract file\n" >&2; exit 37' 2>&1)" || rc=$?
+  [[ "$rc" -eq 37 ]]
+  [[ "$output" == *'命名卷：failure'* && "$output" == *'退出码：37'* ]]
+  [[ "$output" == *'tar: cannot extract file'* ]]
+  [[ "$output" != *'first line retained only in the log'* ]]
+  logfile="$(sed -n 's/^详细日志：//p' <<<"$output")"
+  [[ -f "$logfile" && "$logfile" == "${BUNDLE_DIR}/../docker-migrate-data."* ]]
+  mode="$(stat -c '%a' "$logfile" 2>/dev/null || stat -f '%Lp' "$logfile")"
+  [[ "$mode" == 600 ]]
+  grep -Fq 'first line retained only in the log' "$logfile"
+  grep -Fq 'tar: cannot extract file' "$logfile"
+  verify_bundle_checksums "$BUNDLE_DIR" >/dev/null
+}
+
+test_restore_interruption_keeps_final_summary_visible() {
+  local tmp BUNDLE_DIR output rc logfile handler expected_status
+  # shellcheck disable=SC2034
+  local RESTORE_COMMIT_STARTED=0 TRANSACTION_ACTIVE=1 RESTORE_TRANSACTION_DIR=""
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  BUNDLE_DIR="${tmp}/bundle"
+  mkdir -p "$BUNDLE_DIR"
+  write_bundle_restore_script "${BUNDLE_DIR}/restore.sh"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n \
+    '/^restore_data_with_diagnostics() {/,/^}/p; /^restore_diagnostic_output() {/,/^}/p; /^restore_nontransaction_exit_handler() {/,/^}/p; /^transaction_exit_handler() {/,/^}/p' \
+    "${BUNDLE_DIR}/restore.sh")
+  trap 'rm -rf "$tmp"' RETURN
+
+  transaction_release_lock() { :; }
+  transaction_rollback() { printf '回滚进度可见\n'; }
+  restore_finish_result() { printf '最终摘要：%s\n' "$1"; }
+  interrupt_data_callback() {
+    printf 'callback-private-details\n'
+    exit 143
+  }
+
+  for handler in restore_nontransaction_exit_handler transaction_exit_handler; do
+    rc=0
+    expected_status="INTERRUPTED"
+    [[ "$handler" != transaction_exit_handler ]] || expected_status="INTERRUPTED_ROLLED_BACK"
+    output="$(
+      (
+        if [[ "$handler" == transaction_exit_handler ]]; then
+          trap transaction_exit_handler EXIT
+        else
+          trap restore_nontransaction_exit_handler EXIT
+        fi
+        restore_data_with_diagnostics '命名卷：interrupted' interrupt_data_callback
+      ) 2>&1
+    )" || rc=$?
+    [[ "$rc" -eq 143 ]]
+    [[ "$output" == *"最终摘要：${expected_status}"* ]]
+    [[ "$output" != *'callback-private-details'* ]]
+    if [[ "$handler" == transaction_exit_handler ]]; then
+      [[ "$output" == *'回滚进度可见'* ]]
+    fi
+    logfile="$(sed -n 's/^详细日志：//p' <<<"$output")"
+    [[ -f "$logfile" ]]
+    grep -Fq 'callback-private-details' "$logfile"
+  done
+}
+
 test_compose_env_file_parser() {
   local tmp
   local -a actual expected
@@ -792,6 +875,8 @@ run_test "generated restore rejects an incomplete quiesce list" test_generated_q
 run_test "bundle checksum detects tampering" test_checksums_detect_tampering
 run_test "top-level archive rejects unsafe members in two scans" test_archive_layout_rejects_unsafe_members_in_two_scans
 run_test "inner archive member check preserves links in one scan" test_inner_archive_member_check_uses_one_scan
+run_test "restore data diagnostics are private and preserve bundle checksums" test_restore_data_diagnostics_are_private_and_nonintrusive
+run_test "interrupted restore exposes final summary outside the data log" test_restore_interruption_keeps_final_summary_visible
 run_test "Compose env_file parser handles scalar/list/long syntax" test_compose_env_file_parser
 run_test "restore client cleans interrupted and failed preparation sessions" test_restore_client_cleanup_on_interrupts_and_errors
 run_test "restore client preserves diagnostics after transaction handoff" test_restore_client_cleanup_preserves_transaction_diagnostics

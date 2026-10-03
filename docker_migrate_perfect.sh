@@ -2188,6 +2188,7 @@ RESTORE_LOCK_DIR=""
 RESTORE_STAGE="初始化"
 RESTORE_STARTED_AT=$SECONDS
 RESTORE_COMMIT_STARTED=0
+RESTORE_ACTIVE_DATA_LOG=""
 
 restore_format_elapsed() {
   local seconds="${1:-0}"
@@ -2329,6 +2330,7 @@ restore_finish_result() {
 restore_nontransaction_exit_handler() {
   local rc=$? status="FAILED" rollback_dir="${RESTORE_TRANSACTION_DIR:-}"
   trap - EXIT INT TERM
+  restore_diagnostic_output
   transaction_release_lock || true
   if ((rc == 0)); then
     status="SUCCESS"
@@ -2761,18 +2763,30 @@ archive_members_safe() {
 }
 
 tree_links_stay_within_root() {
-  local mount_arg="$1"
+  local mount_arg="$1" link_policy="${2:-strict}"
   # 归档只在一次性容器中解压。即使 tar 先处理恶意链接，写入也只能逃到该
-  # 容器的临时根文件系统；随后再拒绝绝对链接和词法上越过挂载根的相对链接。
-  # 合法的内部符号链接和硬链接都会保留。硬链接无法跨文件系统逃出挂载点。
+  # 容器的临时根文件系统；随后拒绝绝对/越界链接（普通卷中的 MySQL socket
+  # 别名除外）。合法内部链接保留；硬链接无法跨文件系统逃出挂载点。
   docker run --rm -v "${mount_arg}:/tree:ro" alpine:3.20 sh -eu -c '
     find /tree -type l -exec sh -eu -c '\''
-      root="$1"
-      shift
+      root="$1" policy="$2"
+      shift 2
       for link in "$@"; do
         target="$(readlink "$link")"
-        case "$target" in /*) exit 1 ;; esac
         rel="${link#"${root}/"}"
+        # MySQL 镜像在数据卷根目录保存运行时 socket 的绝对链接。
+        # 仅保留这一精确别名，不访问目标，也不放宽绑定目录的边界。
+        if [ "$policy" = mysql-runtime-socket ] && [ "$rel" = mysql.sock ]; then
+          case "$target" in
+            /var/run/mysqld/mysqld.sock | /run/mysqld/mysqld.sock) continue ;;
+          esac
+        fi
+        case "$target" in
+          /*)
+            printf "拒绝绝对符号链接：%s -> %s\n" "$rel" "$target" >&2
+            exit 1
+            ;;
+        esac
         case "$rel" in
           */*) dir="${rel%/*}" ;;
           *) dir="" ;;
@@ -2787,19 +2801,24 @@ tree_links_stay_within_root() {
             "" | .) ;;
             ..)
               depth=$((depth - 1))
-              [ "$depth" -ge 0 ] || exit 1
+              if [ "$depth" -lt 0 ]; then
+                printf "拒绝越界符号链接：%s -> %s\n" "$rel" "$target" >&2
+                exit 1
+              fi
               ;;
             *) depth=$((depth + 1)) ;;
           esac
         done
         IFS="$old_ifs"
       done
-    '\'' sh /tree {} +
-  '
+    '\'' sh /tree "$1" {} +
+  ' sh "$link_policy"
 }
 
 volume_clear_and_extract() {
   local volume="$1" archive_dir="$2" archive_file="$3" validate_links="${4:-1}"
+  local link_policy="${5:-strict}"
+  printf '清空并解压命名卷：%s（归档：%s）\n' "$volume" "$archive_file" >&2
   if ! docker run --rm \
     -v "${volume}:/to" \
     -v "${archive_dir}:/from:ro" \
@@ -2810,16 +2829,19 @@ volume_clear_and_extract() {
     return 1
   fi
   if [[ "$validate_links" == "1" ]]; then
-    tree_links_stay_within_root "$volume" || return 1
+    printf '校验命名卷中的符号链接：%s\n' "$volume" >&2
+    tree_links_stay_within_root "$volume" "$link_policy" || return 1
   fi
   return 0
 }
 
 restore_volume_exact() {
   local volume="$1" archive_dir="$2" archive_file="$3" rollback_dir="$4" existed="$5"
+  local link_policy="${6:-strict}"
   local rollback_file="rollback_${volume}.tgz"
   mkdir -p "$rollback_dir"
   if ((existed == 1)); then
+    printf '备份目标端原卷数据：%s\n' "$volume" >&2
     if ! docker run --rm \
       -v "${volume}:/from:ro" \
       -v "${rollback_dir}:/rollback" \
@@ -2835,7 +2857,7 @@ restore_volume_exact() {
       >>"${RESTORE_TRANSACTION_DIR}/volumes.tsv" || return 1
   fi
 
-  if volume_clear_and_extract "$volume" "$archive_dir" "$archive_file" 1; then
+  if volume_clear_and_extract "$volume" "$archive_dir" "$archive_file" 1 "$link_policy"; then
     if [[ -z "${RESTORE_TRANSACTION_DIR:-}" ]]; then
       rm -f "${rollback_dir}/${rollback_file}"
     fi
@@ -2854,6 +2876,37 @@ restore_volume_exact() {
     docker volume rm "$volume" >/dev/null 2>&1 || true
   fi
   return 1
+}
+
+restore_data_with_diagnostics() {
+  local label="$1" logfile rc RESTORE_ACTIVE_DATA_LOG=""
+  shift
+  # 日志置于迁移包旁，不混入包内校验清单，也不随事务回滚点一起删除。
+  # mktemp + umask 077 防止覆盖已有路径或泄露数据库文件信息。
+  logfile="$(mktemp "${BUNDLE_DIR}/../docker-migrate-data.XXXXXX")" || {
+    warn "无法创建恢复诊断日志，尚未执行：$label"
+    return 1
+  }
+  RESTORE_ACTIVE_DATA_LOG="$logfile"
+  if "$@" >"$logfile" 2>&1; then
+    rm -f "$logfile" || true
+    return 0
+  else
+    rc=$?
+  fi
+  printf '\n[错误详情] %s（退出码：%s）\n' "$label" "$rc" >&2
+  tail -n 20 "$logfile" >&2
+  printf '详细日志：%s\n' "$logfile" >&2
+  return "$rc"
+} 202>&1 203>&2
+
+restore_diagnostic_output() {
+  # 数据操作中收到信号时，EXIT trap 仍处于日志重定向内。切回调用前的
+  # 输出，确保手动恢复模式下也能看见回滚进度和最终结果。
+  if [[ -n "${RESTORE_ACTIVE_DATA_LOG:-}" ]]; then
+    exec 1>&202 2>&203
+    printf '详细日志：%s\n' "$RESTORE_ACTIVE_DATA_LOG" >&2
+  fi
 }
 
 root_exec() {
@@ -2879,6 +2932,7 @@ restore_bind_exact() {
   root_exec rm -rf "$stage" "$old" || return 1
   root_exec mkdir -p "$stage" || return 1
   # 不在宿主机以高权限直接解压。链接若试图逃出 /stage，只会落入一次性容器。
+  printf '解压绑定目录：%s（归档：%s）\n' "$host" "$archive" >&2
   if ! docker run --rm \
     -v "${stage}:/stage" \
     -v "${archive}:/archive.tgz:ro" \
@@ -2888,11 +2942,13 @@ restore_bind_exact() {
   fi
   staged="${stage}/${host#/}"
   if ! root_exec test -e "$staged" && ! root_exec test -L "$staged"; then
+    warn "归档中缺少绑定目录：$host"
     root_exec rm -rf "$stage" || true
     return 1
   fi
   # bind 根本身若是链接，移动出 staging 后其相对语义会改变；拒绝这种歧义结构。
   if root_exec test -L "$staged"; then
+    warn "拒绝使用符号链接作为绑定目录根：$host"
     root_exec rm -rf "$stage" || true
     return 1
   fi
@@ -3849,6 +3905,7 @@ transaction_exit_handler() {
   local original_rc=$? exit_rc rollback_rc=0 rollback_dir="${RESTORE_TRANSACTION_DIR:-}" status
   exit_rc=$original_rc
   trap - EXIT INT TERM
+  restore_diagnostic_output
 
   # RESTORE_COMMIT_STARTED 是唯一的不可逆提交点。它置位后绝不再回滚，即使
   # TRANSACTION_ACTIVE 尚未来得及清零或清理过程中收到 INT/TERM。
@@ -4225,13 +4282,19 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
     if [[ ! -f "volumes/$file" ]]; then
       warn " 命名卷缺少备份文件：$vname（volumes/$file）"
       FAILED_VOLUMES+=("$vname")
-      continue
+      break
     fi
     echo " - ${vname}"
     # 使用备份时记录的 driver 和 options 创建卷；同名卷已存在时必须先
     # 核对后端，绝不能把 NFS/plugin 数据误写进碰巧同名的 local 卷。
     v_driver=$(jq -r '.driver // "local"' <<<"$row")
     desired_volume_opts="$(jq -cS '.opts // {}' <<<"$row")"
+    volume_link_policy="strict"
+    # 仅普通 Docker 管理卷兼容 MySQL socket；local bind/NFS/plugin 后端
+    # 可能直接映射宿主路径，继续使用严格链接边界。
+    if [[ "$v_driver" == "local" && "$desired_volume_opts" == "{}" ]]; then
+      volume_link_policy="mysql-runtime-socket"
+    fi
     volume_existed=0
     if docker volume inspect "$vname" >/dev/null 2>&1; then
       volume_existed=1
@@ -4241,7 +4304,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
             "$actual_volume_opts" != "$desired_volume_opts" ]]; then
         warn " 已存在同名但 driver/options 不同的卷，拒绝覆盖：$vname"
         FAILED_VOLUMES+=("$vname")
-        continue
+        break
       fi
     else
       volume_create_args=(docker volume create --driver "$v_driver")
@@ -4250,19 +4313,27 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
         volume_create_args+=(--opt "$volume_opt")
       done
       volume_create_args+=("$vname")
-      if ! "${volume_create_args[@]}" >/dev/null 2>&1; then
+      if ! "${volume_create_args[@]}" >/dev/null; then
         warn " 卷创建失败（driver=$v_driver）：$vname"
         FAILED_VOLUMES+=("$vname")
-        continue
+        break
       fi
     fi
     if ! dm_run_with_activity "回灌命名卷：$vname" \
+      restore_data_with_diagnostics "命名卷：$vname" \
       restore_volume_exact "$vname" "$PWD/volumes" "$file" \
-      "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed"; then
-      warn " 恢复卷 ${vname} 失败，跳过"
+      "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed" "$volume_link_policy"; then
+      warn " 恢复卷 ${vname} 失败，终止恢复"
       FAILED_VOLUMES+=("$vname")
+      break
     fi
   done < <(jq -c '.volumes[]' manifest.json)
+fi
+
+# 不覆盖后续绑定目录，也不让 RESTORE_STAGE 掩盖真正失败的数据卷阶段。
+if ((${#FAILED_VOLUMES[@]} > 0)); then
+  print_failure_summary
+  exit 1
 fi
 
 RESTORE_STAGE="回灌绑定目录"
@@ -4275,13 +4346,15 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     if [[ ! -f "binds/$file" ]]; then
       warn " 绑定目录缺少备份文件：$host（binds/$file）"
       FAILED_BINDS+=("$host")
-      continue
+      break
     fi
     echo " - ${host}"
     if ! dm_run_with_activity "回灌绑定目录：$host" \
+      restore_data_with_diagnostics "绑定目录：$host" \
       restore_bind_exact "$host" "$PWD/binds/${file}"; then
-      warn " 无法恢复绑定目录：$host（可能需要 root 权限）"
+      warn " 恢复绑定目录失败，终止恢复：$host"
       FAILED_BINDS+=("$host")
+      break
     fi
   done < <(jq -c '.binds[]' manifest.json)
 fi
