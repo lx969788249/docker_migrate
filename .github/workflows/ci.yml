@@ -33,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Archive parser compatibility
+        run: tests/archive_parser_compat.sh
       - name: Docker integration test
         run: tests/integration_docker.sh
       - name: End-to-end migration test

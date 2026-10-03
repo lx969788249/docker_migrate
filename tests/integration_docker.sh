@@ -6,7 +6,7 @@ export DOCKER_MIGRATE_LIB_ONLY=1
 # shellcheck source=../docker_migrate_perfect.sh
 source "${ROOT_DIR}/docker_migrate_perfect.sh"
 
-for bin in docker jq; do
+for bin in docker jq python3; do
   command -v "$bin" >/dev/null 2>&1 || {
     echo "skip: $bin is unavailable"
     exit 0
@@ -367,13 +367,26 @@ mkdir -p "${data_bundle}/volumes" "${data_bundle}/binds" "${data_bundle}/meta" \
   "${tmp}/volume-source" "$bind_target" "${bind_archive_root}${bind_target}"
 printf 'new-volume-data\n' >"${tmp}/volume-source/new.txt"
 ln -s new.txt "${tmp}/volume-source/safe-link"
-# MySQL 镜像会留下指向容器运行时目录的 socket 链接；它不是数据库文件，
-# 普通命名卷应保留此精确链接，但不能据此放开其他外部链接。
+# 链接文本属于原始数据：外部、悬空和循环链接都应保留，不能在恢复时跟随。
+printf 'outside-unchanged\n' >"${tmp}/outside-sentinel"
+ln "${tmp}/volume-source/new.txt" "${tmp}/volume-source/hard-link"
+ln -s "${tmp}/outside-sentinel" "${tmp}/volume-source/external-link"
+ln -s ../outside "${tmp}/volume-source/relative-link"
+ln -s missing "${tmp}/volume-source/dangling-link"
+ln -s cycle "${tmp}/volume-source/cycle"
+mkdir -p "${tmp}/volume-source/nested"
+ln -s /var/run/mysqld/mysqld.sock "${tmp}/volume-source/nested/mysql.sock"
 ln -s /var/run/mysqld/mysqld.sock "${tmp}/volume-source/mysql.sock"
 tar -czf "${data_bundle}/volumes/vol_${data_volume_name}.tgz" \
   -C "${tmp}/volume-source" .
 printf 'new-bind-data\n' >"${bind_archive_root}${bind_target}/new.txt"
 ln -s new.txt "${bind_archive_root}${bind_target}/safe-link"
+ln "${bind_archive_root}${bind_target}/new.txt" "${bind_archive_root}${bind_target}/hard-link"
+ln -s "${tmp}/outside-sentinel" "${bind_archive_root}${bind_target}/external-link"
+ln -s ../outside-sentinel "${bind_archive_root}${bind_target}/relative-link"
+ln -s missing "${bind_archive_root}${bind_target}/dangling-link"
+ln -s cycle "${bind_archive_root}${bind_target}/cycle"
+ln -s /var/run/mysqld/mysqld.sock "${bind_archive_root}${bind_target}/mysql.sock"
 tar -czf "${data_bundle}/binds/bind_test.tgz" -C "$bind_archive_root" "${bind_target#/}"
 printf 'old-bind-data\n' >"${bind_target}/old.txt"
 printf 'stale-bind-data\n' >"${bind_target}/stale.txt"
@@ -398,9 +411,24 @@ write_bundle_restore_script "${data_bundle}/restore.sh"
 generate_bundle_checksums "$data_bundle"
 (cd "$data_bundle" && bash restore.sh >/dev/null)
 docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
-  'test "$(cat /to/new.txt)" = new-volume-data; test "$(readlink /to/safe-link)" = new.txt; test "$(readlink /to/mysql.sock)" = /var/run/mysqld/mysqld.sock; test ! -e /to/old.txt; test ! -e /to/stale.txt'
+  'test "$(cat /to/new.txt)" = new-volume-data; test "$(readlink /to/safe-link)" = new.txt
+   test "$(readlink /to/mysql.sock)" = /var/run/mysqld/mysqld.sock
+   test "$(readlink /to/nested/mysql.sock)" = /var/run/mysqld/mysqld.sock
+   test "$(readlink /to/external-link)" = "$1"
+   test "$(readlink /to/relative-link)" = ../outside
+   test "$(readlink /to/dangling-link)" = missing; test "$(readlink /to/cycle)" = cycle
+   test "$(stat -c %i /to/new.txt)" = "$(stat -c %i /to/hard-link)"
+   test ! -e /to/old.txt; test ! -e /to/stale.txt' sh "${tmp}/outside-sentinel"
 [[ "$(cat "${bind_target}/new.txt")" == "new-bind-data" ]]
 [[ "$(readlink "${bind_target}/safe-link")" == "new.txt" ]]
+[[ "$(readlink "${bind_target}/external-link")" == "${tmp}/outside-sentinel" ]]
+[[ "$(readlink "${bind_target}/relative-link")" == ../outside-sentinel ]]
+[[ "$(readlink "${bind_target}/dangling-link")" == missing ]]
+[[ "$(readlink "${bind_target}/cycle")" == cycle ]]
+[[ "$(readlink "${bind_target}/mysql.sock")" == /var/run/mysqld/mysqld.sock ]]
+docker run --rm -v "${bind_target}:/to:ro" alpine:3.20 sh -ec \
+  'test "$(stat -c %i /to/new.txt)" = "$(stat -c %i /to/hard-link)"'
+[[ "$(cat "${tmp}/outside-sentinel")" == outside-unchanged ]]
 [[ ! -e "${bind_target}/old.txt" && ! -e "${bind_target}/stale.txt" ]]
 
 docker run --rm -v "${data_volume_name}:/to" alpine:3.20 sh -c 'printf stale >/to/stale.txt'
@@ -416,58 +444,67 @@ docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
   'test ! -e /to/stale.txt; test "$(readlink /to/mysql.sock)" = /run/mysqld/mysqld.sock'
 [[ ! -e "${bind_target}/stale.txt" ]]
 
-# 名称相同但目标不同、相对越界、以及子目录内同名 socket 均不得获得豁免。
-# 失败必须保留具体链接原因、在 volume 阶段中止，并还原原数据与原 socket。
+# 单文件绑定挂载也应兼容，不能因加强根路径校验被误拒绝。
+file_bind_bundle="${tmp}/file-bind-bundle"
+file_bind_target="${tmp}/file-bind-target"
+cp -a "$data_bundle" "$file_bind_bundle"
+printf 'single-file-data\n' >"${bind_archive_root}${file_bind_target}"
+tar -czf "${file_bind_bundle}/binds/bind_test.tgz" \
+  -C "$bind_archive_root" "${file_bind_target#/}"
+jq --arg host "$file_bind_target" '.volumes = [] | .binds[0].host = $host' \
+  "${file_bind_bundle}/manifest.json" >"${file_bind_bundle}/manifest.json.tmp"
+mv "${file_bind_bundle}/manifest.json.tmp" "${file_bind_bundle}/manifest.json"
+generate_bundle_checksums "$file_bind_bundle"
+(cd "$file_bind_bundle" && bash restore.sh >/dev/null)
+[[ -f "$file_bind_target" && "$(cat "$file_bind_target")" == single-file-data ]]
+
+# 注入实际数据写入失败：不能再把正常软链接当作故障，仍应准确报告并回滚。
 docker run --rm -v "${data_volume_name}:/to" alpine:3.20 sh -c \
   'printf target-before-volume-failure >/to/new.txt; printf keep >/to/volume-failure-sentinel'
 printf 'target-before-volume-failure\n' >"${bind_target}/volume-failure-sentinel"
-for unsafe_volume_case in absolute relative nested-socket; do
-  unsafe_volume_bundle="${tmp}/data-bundle-volume-${unsafe_volume_case}"
-  unsafe_volume_root="${tmp}/volume-${unsafe_volume_case}-source"
-  cp -a "$data_bundle" "$unsafe_volume_bundle"
-  mkdir -p "$unsafe_volume_root"
-  printf 'incoming-volume-data\n' >"${unsafe_volume_root}/new.txt"
-  case "$unsafe_volume_case" in
-    absolute)
-      unsafe_volume_link="mysql.sock"
-      unsafe_volume_target="/etc/passwd"
-      ;;
-    relative)
-      unsafe_volume_link="escape-relative"
-      unsafe_volume_target="../outside"
-      ;;
-    nested-socket)
-      mkdir -p "${unsafe_volume_root}/nested"
-      unsafe_volume_link="nested/mysql.sock"
-      unsafe_volume_target="/var/run/mysqld/mysqld.sock"
-      ;;
-  esac
-  ln -s "$unsafe_volume_target" "${unsafe_volume_root}/${unsafe_volume_link}"
-  tar -czf "${unsafe_volume_bundle}/volumes/vol_${data_volume_name}.tgz" \
-    -C "$unsafe_volume_root" .
-  generate_bundle_checksums "$unsafe_volume_bundle"
-  unsafe_volume_result="${tmp}/volume-${unsafe_volume_case}-result.json"
-  unsafe_volume_output=""
-  if unsafe_volume_output="$(
-    cd "$unsafe_volume_bundle" && RESTORE_RESULT_FILE="$unsafe_volume_result" bash restore.sh 2>&1
-  )"; then
-    echo "unsafe volume link unexpectedly restored: $unsafe_volume_case" >&2
-    exit 1
-  fi
-  grep -Fq -- "$unsafe_volume_link" <<<"$unsafe_volume_output"
-  grep -Fq -- "$unsafe_volume_target" <<<"$unsafe_volume_output"
-  grep -Fq '失败阶段：回灌命名卷' <<<"$unsafe_volume_output"
-  if grep -Fq '[C] 回灌绑定目录' <<<"$unsafe_volume_output" ||
-    grep -Fq '[D] 恢复 Compose 项目' <<<"$unsafe_volume_output"; then
-    echo "volume failure continued into later restore stages" >&2
-    exit 1
-  fi
-  jq -e '.status == "FAILED_ROLLED_BACK" and .stage == "回灌命名卷"' \
-    "$unsafe_volume_result" >/dev/null
-  docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
-    'test "$(cat /to/new.txt)" = target-before-volume-failure; test "$(cat /to/volume-failure-sentinel)" = keep; test "$(readlink /to/mysql.sock)" = /run/mysqld/mysqld.sock'
-  [[ "$(cat "${bind_target}/volume-failure-sentinel")" == "target-before-volume-failure" ]]
-done
+volume_failure_proxy="${tmp}/volume-failure-proxy"
+mkdir -p "$volume_failure_proxy"
+cat >"${volume_failure_proxy}/docker" <<'SH'
+#!/bin/sh
+if [ "$1" = run ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "$FAIL_VOLUME_ARCHIVE" ]; then
+      "$REAL_DOCKER" run --rm -v "$FAIL_VOLUME_NAME:/to" alpine:3.20 sh -ec \
+        'rm -f /to/new.txt; printf partial >/to/new.txt'
+      printf 'tar: injected extraction write failure\n' >&2
+      exit 37
+    fi
+  done
+fi
+exec "$REAL_DOCKER" "$@"
+SH
+chmod +x "${volume_failure_proxy}/docker"
+volume_failure_result="${tmp}/volume-failure-result.json"
+volume_failure_real_docker="$(command -v docker)"
+if volume_failure_output="$(
+  cd "$data_bundle" && PATH="${volume_failure_proxy}:$PATH" \
+    REAL_DOCKER="$volume_failure_real_docker" FAIL_VOLUME_NAME="$data_volume_name" \
+    FAIL_VOLUME_ARCHIVE="vol_${data_volume_name}.tgz" \
+    RESTORE_RESULT_FILE="$volume_failure_result" bash restore.sh 2>&1
+)"; then
+  echo "injected volume extraction failure unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -Fq 'tar: injected extraction write failure' <<<"$volume_failure_output"
+grep -Fq '详细日志：' <<<"$volume_failure_output"
+grep -Fq '失败阶段：回灌命名卷' <<<"$volume_failure_output"
+if grep -Fq '[C] 回灌绑定目录' <<<"$volume_failure_output" ||
+  grep -Fq '[D] 恢复 Compose 项目' <<<"$volume_failure_output"; then
+  echo "volume failure continued into later restore stages" >&2
+  exit 1
+fi
+jq -e '.status == "FAILED_ROLLED_BACK" and .stage == "回灌命名卷"' \
+  "$volume_failure_result" >/dev/null
+docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
+  'test "$(cat /to/new.txt)" = target-before-volume-failure
+   test "$(cat /to/volume-failure-sentinel)" = keep
+   test "$(readlink /to/mysql.sock)" = /run/mysqld/mysqld.sock'
+[[ "$(cat "${bind_target}/volume-failure-sentinel")" == target-before-volume-failure ]]
 
 # 同名卷后端不一致时必须在清空前失败，不能把数据写入错误的 local/NFS/plugin 后端。
 volume_mismatch_bundle="${tmp}/data-bundle-volume-mismatch"
@@ -485,98 +522,61 @@ fi
 docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 \
   test -f /to/driver.txt
 
-# 内层归档允许安全的相对链接，但绝对/越界符号链接与跨挂载硬链接必须失败；
-# 如果 bind 阶段失败，前一步已替换的 volume 也必须由全局事务恢复。
+# 真正危险的是写入路径穿过链接；无论成员顺序如何，都应在修改任何数据前拒绝。
 docker run --rm -v "${data_volume_name}:/to" alpine:3.20 sh -c \
   'printf target-before-unsafe >/to/target-before-unsafe.txt'
 printf 'target-before-unsafe\n' >"${bind_target}/target-before-unsafe.txt"
 
-unsafe_link_bundle="${tmp}/data-bundle-unsafe-link"
-cp -a "$data_bundle" "$unsafe_link_bundle"
-unsafe_link_root="${tmp}/unsafe-link-root"
-mkdir -p "${unsafe_link_root}${bind_target}"
-ln -s /etc/passwd "${unsafe_link_root}${bind_target}/escape"
-tar -czf "${unsafe_link_bundle}/binds/bind_test.tgz" \
-  -C "$unsafe_link_root" "${bind_target#/}"
-generate_bundle_checksums "$unsafe_link_bundle"
-if (cd "$unsafe_link_bundle" && bash restore.sh >/dev/null 2>&1); then
-  echo "unsafe inner symlink archive unexpectedly restored" >&2
-  exit 1
-fi
-docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 \
-  test -f /to/target-before-unsafe.txt
-[[ -f "${bind_target}/target-before-unsafe.txt" ]]
-
-# 相同 socket 链接若位于宿主机绑定目录，不能套用命名卷的兼容例外。
-unsafe_socket_bind_bundle="${tmp}/data-bundle-bind-socket"
-cp -a "$data_bundle" "$unsafe_socket_bind_bundle"
-unsafe_socket_bind_root="${tmp}/unsafe-socket-bind-root"
-mkdir -p "${unsafe_socket_bind_root}${bind_target}"
-ln -s /var/run/mysqld/mysqld.sock "${unsafe_socket_bind_root}${bind_target}/mysql.sock"
-tar -czf "${unsafe_socket_bind_bundle}/binds/bind_test.tgz" \
-  -C "$unsafe_socket_bind_root" "${bind_target#/}"
-generate_bundle_checksums "$unsafe_socket_bind_bundle"
-if (cd "$unsafe_socket_bind_bundle" && bash restore.sh >/dev/null 2>&1); then
-  echo "bind mount unexpectedly accepted the named-volume socket exception" >&2
-  exit 1
-fi
-docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 \
-  test -f /to/target-before-unsafe.txt
-[[ -f "${bind_target}/target-before-unsafe.txt" ]]
-
-unsafe_relative_bundle="${tmp}/data-bundle-unsafe-relative-link"
-cp -a "$data_bundle" "$unsafe_relative_bundle"
-unsafe_relative_root="${tmp}/unsafe-relative-root"
-mkdir -p "${unsafe_relative_root}${bind_target}"
-ln -s ../outside "${unsafe_relative_root}${bind_target}/escape-relative"
-tar -czf "${unsafe_relative_bundle}/binds/bind_test.tgz" \
-  -C "$unsafe_relative_root" "${bind_target#/}"
-generate_bundle_checksums "$unsafe_relative_bundle"
-if (cd "$unsafe_relative_bundle" && bash restore.sh >/dev/null 2>&1); then
-  echo "bind-relative symlink escape unexpectedly restored" >&2
-  exit 1
-fi
-docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 \
-  test -f /to/target-before-unsafe.txt
-[[ -f "${bind_target}/target-before-unsafe.txt" ]]
-
-if command -v python3 >/dev/null 2>&1; then
-  unsafe_hardlink_bundle="${tmp}/data-bundle-unsafe-hardlink"
-  cp -a "$data_bundle" "$unsafe_hardlink_bundle"
-  python3 - "${unsafe_hardlink_bundle}/binds/bind_test.tgz" "${bind_target#/}" <<'PY'
+for unsafe_case in link-first link-last hardlink root-symlink; do
+  unsafe_bundle="${tmp}/data-bundle-unsafe-${unsafe_case}"
+  cp -a "$data_bundle" "$unsafe_bundle"
+  python3 - "${unsafe_bundle}/binds/bind_test.tgz" "${bind_target#/}" "$unsafe_case" "$tmp" <<'PY'
 import io
 import sys
 import tarfile
 
-archive, prefix = sys.argv[1:]
+archive, prefix, case, outside = sys.argv[1:]
 with tarfile.open(archive, "w:gz") as bundle:
-    parts = prefix.split("/")
-    current = ""
-    for part in parts:
-        current = f"{current}/{part}" if current else part
-        info = tarfile.TarInfo(current)
-        info.type = tarfile.DIRTYPE
-        info.mode = 0o755
-        bundle.addfile(info)
-    payload = b"safe payload\n"
-    regular = tarfile.TarInfo(f"{prefix}/new.txt")
-    regular.size = len(payload)
-    regular.mode = 0o644
-    bundle.addfile(regular, io.BytesIO(payload))
-    hardlink = tarfile.TarInfo(f"{prefix}/escape-hardlink")
-    hardlink.type = tarfile.LNKTYPE
-    hardlink.linkname = "/etc/passwd"
-    bundle.addfile(hardlink)
+    if case != "root-symlink":
+        directory = tarfile.TarInfo(prefix)
+        directory.type = tarfile.DIRTYPE
+        bundle.addfile(directory)
+    if case == "root-symlink":
+        link = tarfile.TarInfo(prefix)
+        link.type = tarfile.SYMTYPE
+        link.linkname = outside
+        bundle.addfile(link)
+    elif case == "hardlink":
+        link = tarfile.TarInfo(f"{prefix}/escape-hardlink")
+        link.type = tarfile.LNKTYPE
+        link.linkname = "/etc/passwd"
+        bundle.addfile(link)
+    else:
+        link = tarfile.TarInfo(f"{prefix}/escape")
+        link.type = tarfile.SYMTYPE
+        link.linkname = outside
+        regular = tarfile.TarInfo(f"{prefix}/escape/outside-sentinel")
+        regular.size = 7
+        members = [link, regular] if case == "link-first" else [regular, link]
+        for member in members:
+            bundle.addfile(member, io.BytesIO(b"changed") if member.isreg() else None)
 PY
-  generate_bundle_checksums "$unsafe_hardlink_bundle"
-  if (cd "$unsafe_hardlink_bundle" && bash restore.sh >/dev/null 2>&1); then
-    echo "unsafe inner hardlink archive unexpectedly restored" >&2
+  generate_bundle_checksums "$unsafe_bundle"
+  unsafe_result="${tmp}/unsafe-${unsafe_case}-result.json"
+  if unsafe_output="$(cd "$unsafe_bundle" && RESTORE_RESULT_FILE="$unsafe_result" bash restore.sh 2>&1)"; then
+    echo "unsafe archive unexpectedly restored: $unsafe_case" >&2
     exit 1
   fi
+  if grep -Fq '[B] 回灌命名卷' <<<"$unsafe_output"; then
+    echo "unsafe archive reached the mutation stage: $unsafe_case" >&2
+    exit 1
+  fi
+  jq -e '.status == "FAILED" and .stage == "预检数据归档"' "$unsafe_result" >/dev/null
   docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 \
     test -f /to/target-before-unsafe.txt
   [[ -f "${bind_target}/target-before-unsafe.txt" ]]
-fi
+  [[ "$(cat "${tmp}/outside-sentinel")" == outside-unchanged ]]
+done
 
 if docker compose version >/dev/null 2>&1; then
   compose_bundle="${tmp}/compose-bundle"
@@ -794,10 +794,14 @@ export DOCKER_PROXY_LOG="${tmp}/docker-proxy.log"
 cat >"${rollback_proxy_dir}/docker" <<'SH'
 #!/bin/sh
 printf '%s:%s:%s\n' "$1" "$2" "$*" >>"${DOCKER_PROXY_LOG}"
-rollback_mount="${6:-}"
-if [ "$1" = "run" ] && [ "${2:-}" = "--rm" ] &&
-  [ "$rollback_mount" != "${rollback_mount%/volume_data:/from:ro}" ]; then
-  exit 97
+if [ "$1" = run ]; then
+  rollback_archive=0
+  extract_command=0
+  for arg in "$@"; do
+    case "$arg" in rollback_*.tgz) rollback_archive=1 ;; esac
+    case "$arg" in *'tar -xf -'*) extract_command=1 ;; esac
+  done
+  if [ "$rollback_archive" = 1 ] && [ "$extract_command" = 1 ]; then exit 97; fi
 fi
 if [ "$1" = "rm" ] && [ "${2:-}" = "-f" ]; then
   case "${3:-}" in
@@ -809,7 +813,7 @@ SH
 chmod +x "${rollback_proxy_dir}/docker"
 proxy_probe_rc=0
 "${rollback_proxy_dir}/docker" run --rm \
-  -v probe:/to -v "${tmp}/probe/volume_data:/from:ro" alpine:3.20 true \
+  -v probe:/to alpine:3.20 sh -c 'tar -xf - -C /to' sh rollback_probe.tgz \
   >/dev/null 2>&1 || proxy_probe_rc=$?
 [[ "$proxy_probe_rc" -eq 97 ]]
 : >"$DOCKER_PROXY_LOG"
@@ -829,7 +833,7 @@ if ! grep -Fq '结果：⚠️ 恢复失败，自动回滚未完全成功' \
   <<<"$incomplete_rollback_output"; then
   echo "rollback failure injection produced an unexpected final status" >&2
   printf '%s\n' "$incomplete_rollback_output" >&2
-  grep -F 'volume_data' "$DOCKER_PROXY_LOG" >&2 || true
+  grep -F 'rollback_' "$DOCKER_PROXY_LOG" >&2 || true
   exit 1
 fi
 grep -Fq '请勿直接启动相关容器' <<<"$incomplete_rollback_output"
