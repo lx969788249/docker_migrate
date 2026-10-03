@@ -2745,100 +2745,162 @@ restore_manifest_is_safe() {
 }
 
 archive_members_safe() {
-  local archive="$1"
-  local allowed_prefix="${2:-}"
-  local entry
-  # 单次列出成员即可同时验证 gzip/tar 完整性和成员路径；安全链接仍在解压到
-  # 一次性容器后由 tree_links_stay_within_root 校验，保持现有链接支持语义。
-  tar -tzf "$archive" 2>/dev/null |
-    while IFS= read -r entry; do
-      entry="${entry#./}"
-      case "$entry" in /*|..|../*|*/../*|*/..) exit 1 ;; esac
-      if [[ -n "$allowed_prefix" &&
-            "$entry" != "$allowed_prefix" &&
-            "$entry" != "${allowed_prefix}/"* ]]; then
-        exit 1
-      fi
-    done || return 1
+  # 只解析元数据，不访问软链接目标。完整建表后检查，避免归档通过成员顺序
+  # 或路径重名，让解压程序沿链接写出目标树。gzip 只解压扫描一次。
+  python3 - "$1" "${2:-}" <<'ARCHIVE_PY'
+import gzip
+import sys
+import tarfile
+import zlib
+
+
+def archive_path(raw):
+    parts = raw.split("/")
+    if raw.startswith("/") or ".." in parts or "\0" in raw:
+        raise ValueError("拒绝归档中的绝对或越界成员路径：" + repr(raw))
+    return "/".join(part for part in parts if part not in ("", "."))
+
+
+try:
+    prefix = archive_path(sys.argv[2])
+    members = {}
+
+    def scoped_path(raw):
+        name = archive_path(raw)
+        if prefix and name != prefix and not name.startswith(prefix + "/"):
+            raise ValueError("归档成员超出绑定路径：" + repr(raw))
+        return name
+
+    with gzip.open(sys.argv[1], "rb") as compressed:
+        with tarfile.open(fileobj=compressed, mode="r:") as archive:
+            for member in archive:
+                name = scoped_path(member.name)
+                if member.size < 0:
+                    raise ValueError("归档成员长度不能为负数：" + repr(name))
+                if member.isdir():
+                    kind, target = "dir", ""
+                elif member.issym():
+                    # 绝对、外部、悬空乃至循环软链接均可原样保存；不解引用。
+                    if not member.linkname or "\0" in member.linkname:
+                        raise ValueError("软链接目标为空或包含空字节：" + repr(name))
+                    kind, target = "symlink", member.linkname
+                elif member.islnk():
+                    kind, target = "hardlink", scoped_path(member.linkname)
+                elif member.isreg() and member.sparse is None:
+                    kind, target = "file", ""
+                elif member.isfifo():
+                    kind, target = "fifo", ""
+                else:
+                    raise ValueError("不支持的归档成员类型（设备或稀疏格式）：" + repr(name))
+                if not name and kind != "dir":
+                    raise ValueError("归档根必须是目录")
+                if name in members and not (kind == members[name][0] == "dir"):
+                    raise ValueError("拒绝重复或改变类型的归档成员：" + repr(name))
+                members[name] = (kind, target)
+                # 仅保留安全检查所需的信息，不重复缓存完整 TarInfo 对象。
+                archive.members.clear()
+            # tar 遇到结束块即停止，但 gzip 校验码在流末尾；必须读完尾部。
+            # 同时拒绝结束块后藏有另一个归档或非零记录，消除解析器歧义。
+            compressed.seek(archive.offset)
+            while True:
+                padding = compressed.read(1024 * 1024)
+                if not padding:
+                    break
+                if padding.strip(b"\0"):
+                    raise ValueError("归档结束标记后存在额外数据")
+
+    for name in members:
+        parent = name.rpartition("/")[0]
+        while parent:
+            if parent in members and members[parent][0] != "dir":
+                raise ValueError("拒绝通过链接或非目录写入：%r（父路径：%r）" % (name, parent))
+            parent = parent.rpartition("/")[0]
+
+    # 硬链接会访问目标 inode，与只保存目标字符串的软链接不同。
+    # 允许内部硬链接链，但最终必须指向同一归档内的普通文件。
+    resolved = {name for name, (kind, _) in members.items() if kind == "file"}
+    for name, (kind, _) in members.items():
+        if kind != "hardlink":
+            continue
+        current, chain = name, set()
+        while current not in resolved:
+            if current in chain:
+                raise ValueError("拒绝循环硬链接：" + repr(name))
+            chain.add(current)
+            node = members.get(current)
+            if node is None or node[0] != "hardlink":
+                raise ValueError("硬链接必须指向归档内的普通文件：%r -> %r" % (name, current))
+            current = node[1]
+        resolved.update(chain)
+
+    if prefix and (prefix not in members or members[prefix][0] not in ("dir", "file")):
+        raise ValueError("绑定路径根必须是普通文件或目录：" + repr(prefix))
+except (OSError, EOFError, ValueError, tarfile.TarError, zlib.error) as error:
+    print("归档预检失败：%s：%s" % (sys.argv[1], error), file=sys.stderr)
+    sys.exit(1)
+ARCHIVE_PY
 }
 
-tree_links_stay_within_root() {
-  local mount_arg="$1" link_policy="${2:-strict}"
-  # 归档只在一次性容器中解压。即使 tar 先处理恶意链接，写入也只能逃到该
-  # 容器的临时根文件系统；随后拒绝绝对/越界链接（普通卷中的 MySQL socket
-  # 别名除外）。合法内部链接保留；硬链接无法跨文件系统逃出挂载点。
-  docker run --rm -v "${mount_arg}:/tree:ro" alpine:3.20 sh -eu -c '
-    find /tree -type l -exec sh -eu -c '\''
-      root="$1" policy="$2"
-      shift 2
-      for link in "$@"; do
-        target="$(readlink "$link")"
-        rel="${link#"${root}/"}"
-        # MySQL 镜像在数据卷根目录保存运行时 socket 的绝对链接。
-        # 仅保留这一精确别名，不访问目标，也不放宽绑定目录的边界。
-        if [ "$policy" = mysql-runtime-socket ] && [ "$rel" = mysql.sock ]; then
-          case "$target" in
-            /var/run/mysqld/mysqld.sock | /run/mysqld/mysqld.sock) continue ;;
-          esac
-        fi
-        case "$target" in
-          /*)
-            printf "拒绝绝对符号链接：%s -> %s\n" "$rel" "$target" >&2
-            exit 1
-            ;;
-        esac
-        case "$rel" in
-          */*) dir="${rel%/*}" ;;
-          *) dir="" ;;
-        esac
-        combined="${dir:+${dir}/}${target}"
-        depth=0
-        old_ifs="$IFS"
-        IFS=/
-        set -f
-        for component in $combined; do
-          case "$component" in
-            "" | .) ;;
-            ..)
-              depth=$((depth - 1))
-              if [ "$depth" -lt 0 ]; then
-                printf "拒绝越界符号链接：%s -> %s\n" "$rel" "$target" >&2
-                exit 1
-              fi
-              ;;
-            *) depth=$((depth + 1)) ;;
-          esac
-        done
-        IFS="$old_ifs"
-      done
-    '\'' sh /tree "$1" {} +
-  ' sh "$link_policy"
+archive_normalized_stream() {
+  # 只用于已完成结构预检的归档。Python 与 BusyBox 对 PAX/GNU 扩展头的
+  # 优先级、size 等字段存在差异；不把原始头交给第二个解析器。用同一个
+  # tarfile 解析器生成明确的 GNU tar 流，再交给隔离容器保存权限和属主。
+  python3 - "$1" <<'STREAM_PY'
+import copy
+import posixpath
+import sys
+import tarfile
+
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as source:
+        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.GNU_FORMAT,
+                          copybufsize=1024 * 1024) as output:
+            for original in source:
+                member = copy.copy(original)
+                member.name = posixpath.normpath(member.name)
+                member.pax_headers = {}
+                if member.islnk():
+                    member.linkname = posixpath.normpath(member.linkname)
+                elif not member.issym():
+                    # BusyBox 会把带 linkname 的零字节普通文件误当硬链接。
+                    member.linkname = ""
+                if member.isreg():
+                    member.type = tarfile.REGTYPE
+                    with source.extractfile(original) as payload:
+                        output.addfile(member, payload)
+                else:
+                    member.size = 0
+                    output.addfile(member)
+                source.members.clear()
+except (OSError, EOFError, ValueError, tarfile.TarError) as error:
+    print("归档读取失败：%s" % error, file=sys.stderr)
+    sys.exit(1)
+STREAM_PY
 }
 
 volume_clear_and_extract() {
-  local volume="$1" archive_dir="$2" archive_file="$3" validate_links="${4:-1}"
-  local link_policy="${5:-strict}"
+  local volume="$1" archive_dir="$2" archive_file="$3" prechecked="${4:-0}"
+  # 来自恢复入口的归档已经在停机前预检；本地回滚包仍须先验证再清空卷。
+  [[ "$prechecked" == "1" ]] || archive_members_safe "${archive_dir}/${archive_file}" || return 1
   printf '清空并解压命名卷：%s（归档：%s）\n' "$volume" "$archive_file" >&2
-  if ! docker run --rm \
+  if ! archive_normalized_stream "${archive_dir}/${archive_file}" |
+    docker run --rm -i --read-only --network none \
+    --security-opt no-new-privileges --cap-drop MKNOD \
     -v "${volume}:/to" \
-    -v "${archive_dir}:/from:ro" \
     alpine:3.20 sh -eu -c '
-      find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} \;
-      tar -xzf "/from/$1" -C /to
+      find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+      tar -xf - -C /to
     ' sh "$archive_file"; then
     return 1
-  fi
-  if [[ "$validate_links" == "1" ]]; then
-    printf '校验命名卷中的符号链接：%s\n' "$volume" >&2
-    tree_links_stay_within_root "$volume" "$link_policy" || return 1
   fi
   return 0
 }
 
 restore_volume_exact() {
   local volume="$1" archive_dir="$2" archive_file="$3" rollback_dir="$4" existed="$5"
-  local link_policy="${6:-strict}"
+  local prechecked="${6:-0}"
   local rollback_file="rollback_${volume}.tgz"
+  [[ "$prechecked" == "1" ]] || archive_members_safe "${archive_dir}/${archive_file}" || return 1
   mkdir -p "$rollback_dir"
   if ((existed == 1)); then
     printf '备份目标端原卷数据：%s\n' "$volume" >&2
@@ -2857,7 +2919,7 @@ restore_volume_exact() {
       >>"${RESTORE_TRANSACTION_DIR}/volumes.tsv" || return 1
   fi
 
-  if volume_clear_and_extract "$volume" "$archive_dir" "$archive_file" 1 "$link_policy"; then
+  if volume_clear_and_extract "$volume" "$archive_dir" "$archive_file" 1; then
     if [[ -z "${RESTORE_TRANSACTION_DIR:-}" ]]; then
       rm -f "${rollback_dir}/${rollback_file}"
     fi
@@ -2920,9 +2982,10 @@ root_exec() {
 }
 
 restore_bind_exact() {
-  local host="$1" archive="$2"
+  local host="$1" archive="$2" prechecked="${3:-0}"
   local parent base stage old staged had_old=0
   [[ "$host" == /* && "$host" != "/" ]] || return 1
+  [[ "$prechecked" == "1" ]] || archive_members_safe "$archive" "${host#/}" || return 1
   parent="$(dirname "$host")"
   base="$(basename "$host")"
   stage="${parent}/.${base}.docker-migrate-stage-$$"
@@ -2931,12 +2994,13 @@ restore_bind_exact() {
   root_exec mkdir -p "$parent" || return 1
   root_exec rm -rf "$stage" "$old" || return 1
   root_exec mkdir -p "$stage" || return 1
-  # 不在宿主机以高权限直接解压。链接若试图逃出 /stage，只会落入一次性容器。
+  # 结构预检保证成员不穿过链接写入；仅目标 staging 可写，容器根只读。
   printf '解压绑定目录：%s（归档：%s）\n' "$host" "$archive" >&2
-  if ! docker run --rm \
+  if ! archive_normalized_stream "$archive" |
+    docker run --rm -i --read-only --network none \
+    --security-opt no-new-privileges --cap-drop MKNOD \
     -v "${stage}:/stage" \
-    -v "${archive}:/archive.tgz:ro" \
-    alpine:3.20 tar -C /stage -xzf /archive.tgz; then
+    alpine:3.20 tar -C /stage -xf -; then
     root_exec rm -rf "$stage" || true
     return 1
   fi
@@ -2952,13 +3016,6 @@ restore_bind_exact() {
     root_exec rm -rf "$stage" || true
     return 1
   fi
-  # 最终只会把 $staged 子树移动到宿主 $host，因此链接边界必须以该子树
-  # 为根校验，而不能以更高层 staging 根校验；否则 ../ 可在 mv 后逃逸。
-  if ! tree_links_stay_within_root "$staged"; then
-    root_exec rm -rf "$stage" || true
-    return 1
-  fi
-
   if root_exec test -e "$host" || root_exec test -L "$host"; then
     had_old=1
   fi
@@ -4217,6 +4274,11 @@ if ! transaction_internal_paths_are_safe; then
 fi
 
 RESTORE_STAGE="预检数据归档"
+if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
+  ! command -v python3 >/dev/null 2>&1; then
+  warn "缺少 python3，尚未停止服务或修改数据；请使用主脚本「下载备份并恢复」自动补齐依赖。"
+  exit 1
+fi
 say "[0.1] 在停止目标服务前预检 volume 与 bind 归档"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r row; do
@@ -4289,12 +4351,6 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
     # 核对后端，绝不能把 NFS/plugin 数据误写进碰巧同名的 local 卷。
     v_driver=$(jq -r '.driver // "local"' <<<"$row")
     desired_volume_opts="$(jq -cS '.opts // {}' <<<"$row")"
-    volume_link_policy="strict"
-    # 仅普通 Docker 管理卷兼容 MySQL socket；local bind/NFS/plugin 后端
-    # 可能直接映射宿主路径，继续使用严格链接边界。
-    if [[ "$v_driver" == "local" && "$desired_volume_opts" == "{}" ]]; then
-      volume_link_policy="mysql-runtime-socket"
-    fi
     volume_existed=0
     if docker volume inspect "$vname" >/dev/null 2>&1; then
       volume_existed=1
@@ -4322,7 +4378,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
     if ! dm_run_with_activity "回灌命名卷：$vname" \
       restore_data_with_diagnostics "命名卷：$vname" \
       restore_volume_exact "$vname" "$PWD/volumes" "$file" \
-      "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed" "$volume_link_policy"; then
+      "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed" 1; then
       warn " 恢复卷 ${vname} 失败，终止恢复"
       FAILED_VOLUMES+=("$vname")
       break
@@ -4351,7 +4407,7 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     echo " - ${host}"
     if ! dm_run_with_activity "回灌绑定目录：$host" \
       restore_data_with_diagnostics "绑定目录：$host" \
-      restore_bind_exact "$host" "$PWD/binds/${file}"; then
+      restore_bind_exact "$host" "$PWD/binds/${file}" 1; then
       warn " 恢复绑定目录失败，终止恢复：$host"
       FAILED_BINDS+=("$host")
       break
@@ -4673,7 +4729,7 @@ restore_ensure_deps() {
   local require_openssl="${1:-0}" pm
   pm="$(pm_detect)"
   local pair bin pkg
-  local -a required_pairs=("curl curl" "tar tar" "jq jq" "docker docker")
+  local -a required_pairs=("curl curl" "tar tar" "jq jq" "docker docker" "python3 python3")
   if [[ "$require_openssl" == "1" ]]; then
     required_pairs+=("openssl openssl")
   fi

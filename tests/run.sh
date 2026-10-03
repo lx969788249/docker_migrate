@@ -404,14 +404,18 @@ SH
   [[ "$calls" -eq 2 ]]
 }
 
-test_inner_archive_member_check_uses_one_scan() {
-  local tmp real_tar calls
+test_inner_archive_members_validate_structure_not_symlink_targets() {
+  local tmp archive_case
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
-  mkdir -p "${tmp}/safe/prefix" "${tmp}/wrong/other" "${tmp}/bin"
+  mkdir -p "${tmp}/safe/prefix" "${tmp}/wrong/other"
   printf 'ok\n' >"${tmp}/safe/prefix/file"
   ln -s file "${tmp}/safe/prefix/symlink"
   ln "${tmp}/safe/prefix/file" "${tmp}/safe/prefix/hardlink"
+  ln -s /etc/passwd "${tmp}/safe/prefix/absolute"
+  ln -s ../outside "${tmp}/safe/prefix/relative"
+  ln -s missing "${tmp}/safe/prefix/dangling"
+  ln -s loop "${tmp}/safe/prefix/loop"
   tar -czf "${tmp}/safe.tgz" -C "${tmp}/safe" prefix
   tar -czf "${tmp}/wrong.tgz" -C "${tmp}/wrong" other
   printf 'not a gzip archive\n' >"${tmp}/corrupt.tgz"
@@ -425,21 +429,147 @@ test_inner_archive_member_check_uses_one_scan() {
   trap 'rm -rf "$tmp"' RETURN
 
   archive_members_safe "${tmp}/safe.tgz" prefix
-  ! archive_members_safe "${tmp}/wrong.tgz" prefix
-  ! archive_members_safe "${tmp}/corrupt.tgz" prefix
+  if archive_members_safe "${tmp}/wrong.tgz" prefix ||
+    archive_members_safe "${tmp}/corrupt.tgz" prefix; then
+    return 1
+  fi
 
-  real_tar="$(command -v tar)"
-  cat >"${tmp}/bin/tar" <<'SH'
-#!/bin/sh
-printf 'call\n' >>"$TAR_CALL_LOG"
-exec "$REAL_TAR" "$@"
-SH
-  chmod +x "${tmp}/bin/tar"
-  : >"${tmp}/tar.calls"
-  PATH="${tmp}/bin:$PATH" REAL_TAR="$real_tar" TAR_CALL_LOG="${tmp}/tar.calls" \
-    archive_members_safe "${tmp}/safe.tgz" prefix
-  calls="$(wc -l <"${tmp}/tar.calls" | tr -d '[:space:]')"
-  [[ "$calls" -eq 1 ]]
+  # 使用真实 tar 元数据覆盖顺序、重复路径、扩展头和硬链接目标。
+  python3 - "$tmp" <<'PY'
+import io
+from pathlib import Path
+import sys
+import tarfile
+
+root = Path(sys.argv[1])
+
+def write(name, members, fmt=tarfile.PAX_FORMAT):
+    with tarfile.open(root / (name + ".tgz"), "w:gz", format=fmt) as archive:
+        for path, kind, target in members:
+            info = tarfile.TarInfo(path)
+            info.type = kind
+            info.mode = 0o755 if kind == tarfile.DIRTYPE else 0o644
+            if kind == tarfile.REGTYPE:
+                info.size = 4
+                archive.addfile(info, io.BytesIO(b"data"))
+            else:
+                info.linkname = target
+                archive.addfile(info)
+
+D, F, S, H = tarfile.DIRTYPE, tarfile.REGTYPE, tarfile.SYMTYPE, tarfile.LNKTYPE
+base = [("prefix", D, "")]
+write("safe-hardlink-chain", base + [("prefix/file", F, ""),
+    ("prefix/hard", H, "prefix/file"), ("prefix/chain", H, "prefix/hard")])
+write("safe-repeat-dir", base + base + [("prefix/file", F, "")])
+write("safe-file-bind", [("prefix", F, "")])
+write("safe-fifo", base + [("prefix/pipe", tarfile.FIFOTYPE, "")])
+link = ("prefix/link", S, "/tmp/outside")
+child = ("prefix/link/overwrite", F, "")
+write("symlink-parent-first", base + [link, child])
+write("symlink-parent-last", base + [child, link])
+write("file-parent", base + [("prefix/file", F, ""), ("prefix/file/child", F, "")])
+write("hardlink-parent", base + [("prefix/file", F, ""),
+    ("prefix/link", H, "prefix/file"), ("prefix/link/child", F, "")])
+write("absolute-member", [("/prefix/file", F, "")])
+write("dotdot-member", [("prefix/../outside", F, "")])
+write("root-file", [(".", F, "")])
+write("hardlink-absolute", base + [("prefix/link", H, "/etc/passwd")])
+write("hardlink-outside", base + [("prefix/link", H, "../outside")])
+write("hardlink-wrong-prefix", base + [("prefix/link", H, "other/file")])
+write("hardlink-missing", base + [("prefix/link", H, "prefix/missing")])
+write("hardlink-symlink", base + [("prefix/link", H, "prefix/sym"),
+    ("prefix/sym", S, "/etc/passwd")])
+write("hardlink-cycle", base + [("prefix/one", H, "prefix/two"),
+    ("prefix/two", H, "prefix/one")])
+write("duplicate-file", base + [("prefix/file", F, ""), ("prefix/file", F, "")])
+write("duplicate-type", base + [("prefix/link", D, ""), link])
+write("device", base + [("prefix/device", tarfile.CHRTYPE, "")])
+long_name = "prefix/" + "long-" * 30
+for name, fmt in [("pax", tarfile.PAX_FORMAT), ("gnu", tarfile.GNU_FORMAT)]:
+    write("safe-" + name, base + [(long_name, F, ""),
+        ("prefix/link", S, "/" + "outside-" * 30)], fmt)
+    write("unsafe-" + name, base + [(long_name, S, "../outside"),
+        (long_name + "/child", F, "")], fmt)
+    write("unsafe-" + name + "-hardlink", base +
+        [("prefix/link", H, "/" + "outside-" * 30)], fmt)
+    write("unsafe-" + name + "-path", [(long_name + "/../outside", F, "")], fmt)
+data = bytearray((root / "safe.tgz").read_bytes())
+data[-8] ^= 1  # gzip CRC：tar 内容可列出，但完整压缩流已损坏。
+(root / "corrupt-trailer.tgz").write_bytes(data)
+PY
+  for archive_case in safe-hardlink-chain safe-repeat-dir safe-file-bind safe-fifo safe-pax safe-gnu; do
+    archive_members_safe "${tmp}/${archive_case}.tgz" prefix
+  done
+  for archive_case in symlink-parent-first symlink-parent-last file-parent hardlink-parent \
+    absolute-member dotdot-member root-file hardlink-absolute hardlink-outside \
+    hardlink-wrong-prefix hardlink-missing hardlink-symlink hardlink-cycle \
+    duplicate-file duplicate-type device unsafe-pax unsafe-gnu \
+    unsafe-pax-hardlink unsafe-gnu-hardlink unsafe-pax-path unsafe-gnu-path corrupt-trailer; do
+    if archive_members_safe "${tmp}/${archive_case}.tgz" prefix; then
+      printf 'unsafe or corrupt archive unexpectedly accepted: %s\n' "$archive_case" >&2
+      return 1
+    fi
+  done
+  if archive_members_safe "${tmp}/root-file.tgz"; then
+    return 1
+  fi
+}
+
+test_archive_normalizer_preserves_data_and_removes_ambiguous_metadata() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  write_bundle_restore_script "${tmp}/restore.sh"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n '/^archive_members_safe() {/,/^}/p; /^archive_normalized_stream() {/,/^}/p' "${tmp}/restore.sh")
+  trap 'rm -rf "$tmp"' RETURN
+  python3 - "${tmp}/source.tgz" <<'PY'
+import io
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "w:gz", format=tarfile.PAX_FORMAT) as archive:
+    members = [
+        ("./prefix", tarfile.DIRTYPE, "", None),
+        ("./prefix/file", tarfile.REGTYPE, "", b"normalizer payload\n"),
+        ("./prefix/empty", tarfile.REGTYPE, "/etc/passwd", b""),
+        ("./prefix/sym", tarfile.SYMTYPE, "/outside/../missing", None),
+        ("./prefix/hard", tarfile.LNKTYPE, "./prefix/file", None),
+        ("./prefix/pipe", tarfile.FIFOTYPE, "", None),
+    ]
+    for name, kind, target, payload in members:
+        info = tarfile.TarInfo(name)
+        info.type = kind
+        info.linkname = target
+        info.mode, info.uid, info.gid, info.mtime = 0o640, 123, 456, 1234
+        info.size = len(payload) if payload is not None else 512
+        info.pax_headers = {"comment": "discard irrelevant extension metadata"}
+        archive.addfile(info, io.BytesIO(payload) if payload is not None else None)
+PY
+  archive_members_safe "${tmp}/source.tgz" prefix
+  archive_normalized_stream "${tmp}/source.tgz" >"${tmp}/normalized.tar"
+  python3 - "${tmp}/normalized.tar" <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "r:") as archive:
+    members = {member.name: member for member in archive}
+    assert set(members) == {"prefix", "prefix/file", "prefix/empty", "prefix/sym",
+                            "prefix/hard", "prefix/pipe"}
+    assert archive.extractfile(members["prefix/file"]).read() == b"normalizer payload\n"
+    assert archive.extractfile(members["prefix/empty"]).read() == b""
+    assert members["prefix/empty"].isreg() and members["prefix/empty"].linkname == ""
+    assert members["prefix/sym"].issym()
+    assert members["prefix/sym"].linkname == "/outside/../missing"
+    assert members["prefix/hard"].islnk() and members["prefix/hard"].linkname == "prefix/file"
+    assert members["prefix/pipe"].isfifo()
+    for member in members.values():
+        assert member.pax_headers == {}
+        assert (member.mode, member.uid, member.gid, member.mtime) == (0o640, 123, 456, 1234)
+        if not member.isreg():
+            assert member.size == 0
+PY
 }
 
 test_restore_data_diagnostics_are_private_and_nonintrusive() {
@@ -874,7 +1004,8 @@ run_test "generated restore scripts parse as Bash" test_generated_scripts_are_va
 run_test "generated restore rejects an incomplete quiesce list" test_generated_quiesce_list_rejects_partial_pipeline
 run_test "bundle checksum detects tampering" test_checksums_detect_tampering
 run_test "top-level archive rejects unsafe members in two scans" test_archive_layout_rejects_unsafe_members_in_two_scans
-run_test "inner archive member check preserves links in one scan" test_inner_archive_member_check_uses_one_scan
+run_test "inner archive checks structure while preserving normal links" test_inner_archive_members_validate_structure_not_symlink_targets
+run_test "normalized archive preserves data without ambiguous headers" test_archive_normalizer_preserves_data_and_removes_ambiguous_metadata
 run_test "restore data diagnostics are private and preserve bundle checksums" test_restore_data_diagnostics_are_private_and_nonintrusive
 run_test "interrupted restore exposes final summary outside the data log" test_restore_interruption_keeps_final_summary_visible
 run_test "Compose env_file parser handles scalar/list/long syntax" test_compose_env_file_parser
