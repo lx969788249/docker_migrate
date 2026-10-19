@@ -199,7 +199,7 @@ jq -n --argjson network "$(jq '.labels = {"migration.expected":"source"}' <<<"$n
   >"${label_bundle}/manifest.json"
 write_bundle_restore_script "${label_bundle}/restore.sh"
 generate_bundle_checksums "$label_bundle"
-label_restore_output="$(cd "$label_bundle" && bash restore.sh)"
+label_restore_output="$(cd "$label_bundle" && bash restore.sh 2>&1)"
 grep -Fq 'labels 与迁移记录不同，继续复用且不修改' <<<"$label_restore_output"
 [[ -z "$(docker network inspect -f '{{ index .Labels "migration.expected" }}' "$network_name")" ]]
 
