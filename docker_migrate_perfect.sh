@@ -311,13 +311,13 @@ stage_end() {
 }
 
 stage_fail() {
-  local summary="${1:-}" elapsed
+  local elapsed
   [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
   elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
   stage_record_timing "$elapsed"
-  log_line "失败：$(stage_prefix)${summary:+ · ${summary}}"
+  log_line "失败：$(stage_prefix)"
   screen_clear_line
-  printf '%s %s%s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" "${summary:+ ${summary}}" >&2
+  printf '%s %s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" >&2
   DM_FAILED_STAGE="$(stage_prefix)"
   export DM_FAILED_STAGE
   DM_STAGE_TITLE=""
@@ -2285,13 +2285,13 @@ stage_end() {
 }
 
 stage_fail() {
-  local summary="${1:-}" elapsed
+  local elapsed
   [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
   elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
   stage_record_timing "$elapsed"
-  log_line "失败：$(stage_prefix)${summary:+ · ${summary}}"
+  log_line "失败：$(stage_prefix)"
   screen_clear_line
-  printf '%s %s%s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" "${summary:+ ${summary}}" >&2
+  printf '%s %s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" >&2
   DM_FAILED_STAGE="$(stage_prefix)"
   export DM_FAILED_STAGE
   DM_STAGE_TITLE=""
@@ -3721,13 +3721,13 @@ stage_end() {
 }
 
 stage_fail() {
-  local summary="${1:-}" elapsed
+  local elapsed
   [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
   elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
   stage_record_timing "$elapsed"
-  log_line "失败：$(stage_prefix)${summary:+ · ${summary}}"
+  log_line "失败：$(stage_prefix)"
   screen_clear_line
-  printf '%s %s%s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" "${summary:+ ${summary}}" >&2
+  printf '%s %s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" >&2
   DM_FAILED_STAGE="$(stage_prefix)"
   export DM_FAILED_STAGE
   DM_STAGE_TITLE=""

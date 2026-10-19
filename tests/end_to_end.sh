@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# 断言失败时指出所在行，CI 日志里才能直接定位。
+trap 'echo "${BASH_SOURCE[0]##*/}: 第 ${LINENO} 行失败（退出码 $?）" >&2' ERR
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 suffix="dme2e_${$}"

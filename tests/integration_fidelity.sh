@@ -4,6 +4,8 @@
 # docker inspect 的关键字段。任何参数在“inspect → docker run”翻译中丢失或
 # 变形（例如只读挂载生成 ro,ro）都会在这里以字段差异的形式暴露出来。
 set -euo pipefail
+# 断言失败时指出所在行，CI 日志里才能直接定位。
+trap 'echo "${BASH_SOURCE[0]##*/}: 第 ${LINENO} 行失败（退出码 $?）" >&2' ERR
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
