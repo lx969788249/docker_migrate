@@ -10,7 +10,7 @@ transaction_remove_new_services() {
           if transaction_container_exists "$name"; then
             dm_quiet docker rm -f "$name" || true
             if transaction_container_exists "$name"; then
-              warn " · 无法静默并删除本次新建的单容器：$name"
+              warn " · 本次新建的容器 ${name} 没能停止并删除"
               rc=1
             fi
           fi
@@ -18,13 +18,13 @@ transaction_remove_new_services() {
           # WAL 已写入但 rename 尚未发生；当前仍是原容器，不删除。
           :
         else
-          warn " · 单容器及其预登记回滚点均不存在：$name"
+          warn " · 容器 ${name} 和它的备份都找不到了"
           rc=1
         fi
       elif [[ "$had_old" == "0" ]]; then
         dm_quiet docker rm -f "$name" || true
         if transaction_container_exists "$name"; then
-          warn " · 无法静默并删除本次新建的单容器：$name"
+          warn " · 本次新建的容器 ${name} 没能停止并删除"
           rc=1
         fi
       fi
@@ -41,7 +41,7 @@ transaction_remove_new_services() {
       done < <(docker ps -a --filter "label=com.docker.compose.project=${project}" --format '{{.ID}}')
       if [[ -n "$(docker ps -a --filter "label=com.docker.compose.project=${project}" \
         --format '{{.ID}}')" ]]; then
-        warn " · 新 Compose 项目仍有容器未能删除，禁止回灌旧数据：$project"
+        warn " · Compose 项目 ${project} 还有容器没能删除，为安全起见没有还原旧数据"
         rc=1
       fi
     done <"${RESTORE_TRANSACTION_DIR}/compose.tsv"
@@ -60,11 +60,11 @@ transaction_restore_volumes() {
     if [[ "$existed" == "1" ]]; then
       if ! volume_clear_and_extract "$volume" "$(dirname "$rollback_file")" \
         "$(basename "$rollback_file")" 0; then
-        warn " · 命名卷数据回滚失败：$volume"
+        warn " · 数据卷 ${volume} 没能还原"
         rc=1
       fi
     elif ! dm_quiet docker volume rm "$volume"; then
-      warn " · 无法删除本次新建的命名卷：$volume"
+      warn " · 本次新建的数据卷 ${volume} 没能删除"
       rc=1
     fi
   done
@@ -95,7 +95,7 @@ transaction_restore_binds() {
         # WAL 可能已写入但 rename 尚未发生，或本地失败处理已把旧路径移回。
         continue
       else
-        warn " · 绑定目录及其回滚点均不存在：$host"
+        warn " · 目录 ${host} 和它的备份都找不到了"
         rc=1
         continue
       fi
@@ -125,13 +125,13 @@ transaction_restore_standalones() {
       if [[ -n "$backup" ]] && transaction_container_exists "$backup"; then
         dm_quiet docker rm -f "$name" || true
         if ! rename_container_with_retry "$backup" "$name"; then
-          warn " · 无法恢复旧单容器名称：$name（回滚点：$backup）"
+          warn " · 旧容器 ${name} 没能改回原名，它现在叫 ${backup}"
           rc=1
           continue
         fi
         restored_from_backup=1
       elif ! transaction_container_exists "$name"; then
-        warn " · 旧单容器及其回滚点均不存在：$name"
+        warn " · 旧容器 ${name} 和它的备份都找不到了"
         rc=1
         continue
       fi
@@ -161,7 +161,7 @@ transaction_restore_compose() {
     rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
     if grep -Fxq "$project" "${RESTORE_TRANSACTION_DIR}/compose_replaced.list"; then
       if ! compose_restore_rollback "$project" "$rollback_dir" "$restore_running"; then
-        warn " · Compose 项目自动回滚失败：$project（回滚点：$rollback_dir）"
+        warn " · Compose 项目 ${project} 没能自动还原，还原资料在：${rollback_dir}"
         rc=1
       fi
     elif ! compose_restore_existing_states "$project" "$rollback_dir" "$restore_running"; then
@@ -194,7 +194,7 @@ transaction_cleanup_artifacts() {
       [[ -n "$backup" ]] || continue
       if ! dm_quiet docker rm -f "$backup"; then
         if ! docker info >/dev/null 2>&1 || transaction_container_exists "$backup"; then
-          warn " · 无法清理旧单容器回滚点：$backup"
+          warn " · 用于还原的旧容器 ${backup} 没能删除"
           rc=1
         fi
       fi
@@ -230,13 +230,13 @@ transaction_cleanup_artifacts() {
     while IFS=$'\t' read -r host had_old old; do
       [[ "$had_old" == "1" ]] || continue
       if ! root_exec rm -rf "$old"; then
-        warn " · 无法清理绑定目录回滚点：$old"
+        warn " · 用于还原的旧目录 ${old} 没能删除"
         rc=1
       fi
     done <"${RESTORE_TRANSACTION_DIR}/binds.tsv"
   fi
   if ! root_exec rm -rf "${RESTORE_TRANSACTION_DIR}/file_backups"; then
-    warn " · 无法清理文件回滚点：${RESTORE_TRANSACTION_DIR}/file_backups"
+    warn " · 临时备份文件没能删除：${RESTORE_TRANSACTION_DIR}/file_backups"
     rc=1
   fi
 
@@ -248,7 +248,7 @@ transaction_cleanup_artifacts() {
 transaction_rollback() {
   local name state project had_old services_quiet=1 data_ok=1 rc=0 preserve_compose=0
   ((TRANSACTION_ACTIVE == 1)) || return 0
-  warn "恢复事务失败，正在统一回滚服务与数据……"
+  warn "恢复失败，正在把服务和数据还原到恢复前的状态……"
 
   # 提交阶段若某个共享写入者重启失败，先重新静默已经启动的写入者。
   if [[ -f "${RESTORE_TRANSACTION_DIR}/shared.tsv" ]]; then
@@ -284,7 +284,7 @@ transaction_rollback() {
   else
     rc=1
     data_ok=0
-    warn "新服务未能全部静默，禁止回灌旧数据；已保留全部回滚点供人工处理。"
+    warn "新启动的容器没能全部停止，为安全起见没有还原旧数据，还原资料已全部保留，请人工处理。"
   fi
 
   if ((rc == 0)); then
@@ -299,18 +299,18 @@ transaction_rollback() {
       # Compose 会把实际配置文件路径写入容器 labels。回滚后的容器仍引用这里的
       # config.yml/images.yml，因此保留这些小文件，后续迁移才能再次建立回滚点。
       if ! transaction_cleanup_artifacts 1; then
-        warn "部分无用回滚资料未能清理，事务清单已保留：$RESTORE_TRANSACTION_DIR"
+        warn "部分还原资料没能清理，已保留在：$RESTORE_TRANSACTION_DIR"
       fi
-      warn "目标端旧服务、volume 与 bind 数据已统一恢复。"
+      warn "新服务器上原来的服务和数据已经全部还原。"
       warn "Compose 回滚配置需随旧容器保留：$RESTORE_TRANSACTION_DIR"
     else
       if transaction_cleanup_artifacts; then
         rm -rf "$RESTORE_TRANSACTION_DIR" ||
-          warn "回滚已完成，但事务目录未能删除：$RESTORE_TRANSACTION_DIR"
+          warn "已还原到恢复前的状态，但临时文件夹没能删除：$RESTORE_TRANSACTION_DIR"
       else
         warn "回滚已完成，但部分无用回滚资料未能清理：$RESTORE_TRANSACTION_DIR"
       fi
-      warn "目标端旧服务、volume 与 bind 数据已统一恢复。"
+      warn "新服务器上原来的服务和数据已经全部还原。"
     fi
   else
     warn "自动回滚未完全成功，已保留回滚目录：$RESTORE_TRANSACTION_DIR"

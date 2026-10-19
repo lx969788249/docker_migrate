@@ -35,7 +35,7 @@ TRANSFER_SIZE="$(stat -c%s "$TRANSFER_PATH" 2>/dev/null || stat -f%z "$TRANSFER_
 if command -v python3 >/dev/null 2>&1; then
   # --- Fallback 1: Python3 HTTP server (best — supports secret token + proper headers) ---
   http_log_event "启动 backend=python3 port=${PORT} file=${TRANSFER_NAME} size=${TRANSFER_SIZE}"
-  python3 - "$PORT" "$SECRET_TOKEN" "$TRANSFER_NAME" >>"${HTTP_LOG}" 2>&1 <<'PY' &
+  python3 - "$PORT" "$SECRET_TOKEN" "$TRANSFER_NAME" "${PLAN_PATH:+$PLAN_NAME}" >>"${HTTP_LOG}" 2>&1 <<'PY' &
 import http.server
 import os
 from socketserver import ThreadingTCPServer
@@ -44,17 +44,22 @@ import sys
 port = int(sys.argv[1])
 secret = sys.argv[2]
 fname = sys.argv[3]
-allowed_path = "/" + secret + "/" + fname
+plan_name = sys.argv[4] if len(sys.argv) > 4 else ""
+# 同一随机路径下只提供两个文件：迁移包与迁移计划。
+allowed = {"/" + secret + "/" + fname: fname}
+if plan_name:
+    allowed["/" + secret + "/" + plan_name] = plan_name
 root = os.getcwd()
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
-        if path != allowed_path:
+        name = allowed.get(path)
+        if not name:
             self.send_response(404)
             self.end_headers()
             return
-        fpath = os.path.join(root, fname)
+        fpath = os.path.join(root, name)
         try:
             st = os.stat(fpath)
         except FileNotFoundError:
@@ -64,7 +69,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(st.st_size))
-        self.send_header("Content-Disposition", 'attachment; filename="' + fname + '"')
+        self.send_header("Content-Disposition", 'attachment; filename="' + name + '"')
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
@@ -122,6 +127,7 @@ elif command -v busybox >/dev/null 2>&1; then
   mkdir -p "$BUSYBOX_WEB/$SECRET_TOKEN"
   printf 'Not found\n' >"$BUSYBOX_WEB/index.html"
   ln -sf "$TRANSFER_PATH" "$BUSYBOX_WEB/$SECRET_TOKEN/$TRANSFER_NAME"
+  [[ -z "${PLAN_PATH:-}" ]] || ln -sf "$PLAN_PATH" "$BUSYBOX_WEB/$SECRET_TOKEN/$PLAN_NAME"
   busybox httpd -f -p "$PORT" -h "$BUSYBOX_WEB" >>"${HTTP_LOG}" 2>&1 &
   SHPID=$!
   FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${TRANSFER_NAME}${TRANSFER_FRAGMENT}"

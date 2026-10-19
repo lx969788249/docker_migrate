@@ -58,7 +58,7 @@ cleanup() {
     kill -TERM "$backup_pid" 2>/dev/null || true
     wait "$backup_pid" 2>/dev/null || true
   fi
-  docker rm -f "${all_names[@]}" >/dev/null 2>&1 || true
+  docker rm -f "${all_names[@]}" "${suffix}_port_blocker" >/dev/null 2>&1 || true
   docker network rm "$net_a" "$net_b" >/dev/null 2>&1 || true
   docker volume rm "$volume_name" >/dev/null 2>&1 || true
   docker image rm "$health_image" >/dev/null 2>&1 || true
@@ -221,6 +221,31 @@ docker network rm "$net_a" "$net_b" >/dev/null
 docker volume rm "$volume_name" >/dev/null
 docker image rm "$health_image" >/dev/null
 rm -rf "$bind_ro" "$bind_rw" "$symlink_real" "$symlink_path"
+
+# 迁移前预检：先让别的容器占用 full 需要的端口，恢复必须在下载前停下并说明原因。
+blocker_name="${suffix}_port_blocker"
+docker run -d --name "$blocker_name" -p "${port_base}:80" alpine:3.20 sleep 600 >/dev/null
+preflight_log="${tmp}/preflight.log"
+if RESTORE_IGNORE_CONTAINERS="$ignore_container" RESTORE_BASE="${tmp}/restore-preflight" \
+  bash "$ROOT_DIR/docker_migrate_perfect.sh" --restore="$download_url" \
+  </dev/null >"$preflight_log" 2>&1; then
+  echo "restore unexpectedly ignored an occupied port" >&2
+  tail -n 60 "$preflight_log" >&2
+  exit 1
+fi
+grep -Fq "端口 ${port_base} 已被容器 ${blocker_name} 占用，容器 ${full_name} 需要使用它" "$preflight_log"
+grep -Fq '尚未下载或修改任何内容' "$preflight_log"
+grep -Fq 'RESTORE_AUTO_RESOLVE=1' "$preflight_log"
+[[ -z "$(find "${tmp}/restore-preflight" -name 'bundle.tar.gz.enc*' -print -quit 2>/dev/null)" ]]
+docker rm -f "$blocker_name" >/dev/null
+
+# 端口释放后，只预检（--check）应当通过且不下载任何内容。
+check_log="${tmp}/check.log"
+RESTORE_IGNORE_CONTAINERS="$ignore_container" RESTORE_BASE="${tmp}/restore-check" \
+  bash "$ROOT_DIR/docker_migrate_perfect.sh" --check="$download_url" </dev/null >"$check_log" 2>&1
+grep -Fq '预检通过，没有下载或修改任何内容' "$check_log"
+grep -Eq '\[2/9\] 迁移前预检 ✓ 8 个容器' "$check_log"
+[[ ! -d "${tmp}/restore-check" ]] || [[ -z "$(ls -A "${tmp}/restore-check")" ]]
 
 if ! RESTORE_IGNORE_CONTAINERS="$ignore_container" RESTORE_BASE="${tmp}/restore" \
   bash "$ROOT_DIR/docker_migrate_perfect.sh" --restore="$download_url" \

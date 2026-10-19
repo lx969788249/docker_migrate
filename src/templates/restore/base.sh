@@ -23,6 +23,10 @@ cd "$BUNDLE_DIR"
 
 # @include lib/containers.sh
 
+# @include lib/preflight.sh
+
+# @include lib/decisions.sh
+
 # 细节写入日志（--verbose 时也显示）；回滚等需要用户看到的过程用 warn。
 say() { detail "$*"; }
 warn() {

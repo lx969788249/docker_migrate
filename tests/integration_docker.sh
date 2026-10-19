@@ -200,7 +200,7 @@ jq -n --argjson network "$(jq '.labels = {"migration.expected":"source"}' <<<"$n
 write_bundle_restore_script "${label_bundle}/restore.sh"
 generate_bundle_checksums "$label_bundle"
 label_restore_output="$(cd "$label_bundle" && bash restore.sh 2>&1)"
-grep -Fq 'labels 与迁移记录不同，继续复用且不修改' <<<"$label_restore_output"
+grep -Fq '只是标签和旧服务器不同，直接沿用，不做修改' <<<"$label_restore_output"
 [[ -z "$(docker network inspect -f '{{ index .Labels "migration.expected" }}' "$network_name")" ]]
 
 # 同一 Docker 目标只允许一个恢复事务；第二个实例必须在任何资源变更前退出。
@@ -257,7 +257,7 @@ if overlap_output="$(
   echo "restore unexpectedly allowed its rollback WAL inside a replaced bind" >&2
   exit 1
 fi
-grep -Fq '绑定目录与 事务回滚目录 重叠' <<<"$overlap_output"
+grep -Fq '和还原资料目录重叠' <<<"$overlap_output"
 [[ "$(cat "${overlap_target}/old.txt")" == "old-overlap-data" ]]
 [[ ! -e "${overlap_target}/new.txt" ]]
 
@@ -272,7 +272,7 @@ if overlap_output="$(
   echo "restore unexpectedly missed a symlink-parent rollback overlap" >&2
   exit 1
 fi
-grep -Fq '绑定目录与 事务回滚目录 重叠' <<<"$overlap_output"
+grep -Fq '和还原资料目录重叠' <<<"$overlap_output"
 [[ "$(cat "${overlap_target}/old.txt")" == "old-overlap-data" ]]
 [[ ! -e "${overlap_target}/new.txt" ]]
 
@@ -516,12 +516,12 @@ volume_failure_log="$(sed -n 's/^日志：//p' <<<"$volume_failure_output" | hea
 [[ -f "$volume_failure_log" ]]
 grep -Fq 'tar: injected extraction write failure' "$volume_failure_log"
 grep -Fq '原因：恢复数据卷' <<<"$volume_failure_output"
-grep -Fq '失败阶段：回灌命名卷' <<<"$volume_failure_output"
+grep -Fq '失败阶段：恢复数据卷' <<<"$volume_failure_output"
 if grep -Fq '启动服务' <<<"$volume_failure_output"; then
   echo "volume failure continued into later restore stages" >&2
   exit 1
 fi
-jq -e '.status == "FAILED_ROLLED_BACK" and .stage == "回灌命名卷"' \
+jq -e '.status == "FAILED_ROLLED_BACK" and .stage == "恢复数据卷"' \
   "$volume_failure_result" >/dev/null
 docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
   'test "$(cat /to/new.txt)" = target-before-volume-failure
@@ -594,7 +594,7 @@ PY
     echo "unsafe archive reached the mutation stage: $unsafe_case" >&2
     exit 1
   fi
-  jq -e '.status == "FAILED" and .stage == "预检数据归档"' "$unsafe_result" >/dev/null
+  jq -e '.status == "FAILED" and .stage == "检查数据备份文件"' "$unsafe_result" >/dev/null
   docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 \
     test -f /to/target-before-unsafe.txt
   [[ -f "${bind_target}/target-before-unsafe.txt" ]]

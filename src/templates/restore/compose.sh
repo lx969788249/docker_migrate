@@ -34,7 +34,7 @@ compose_capture_rollback_metadata() {
       [[ -n "$file" ]] || continue
       [[ "$file" == /* ]] || file="${old_wdir}/${file}"
       [[ -f "$file" ]] || {
-        warn " · 目标端旧 Compose 配置不存在，无法建立回滚点：$file"
+        warn " · 新服务器上已有项目的 Compose 文件找不到（${file}），无法先备份它，已停止"
         return 1
       }
       config_args+=(-f "$file")
@@ -44,12 +44,12 @@ compose_capture_rollback_metadata() {
   if [[ -n "$old_wdir" ]]; then
     if ! (cd "$old_wdir" && compose_run -p "$project" "${config_args[@]}" config) \
       >"${rollback_dir}/config.yml" 2>/dev/null; then
-      warn " · 无法解析目标端旧 Compose 配置，拒绝破坏性替换：$project"
+      warn " · 新服务器上已有的 Compose 项目 ${project} 配置无法读取，为避免损坏它，已停止"
       return 1
     fi
   elif ! compose_run -p "$project" "${config_args[@]}" config \
     >"${rollback_dir}/config.yml" 2>/dev/null; then
-    warn " · 目标端缺少 Compose 工作目录，无法建立回滚点：$project"
+    warn " · 新服务器上已有的 Compose 项目 ${project} 找不到所在目录，无法先备份它，已停止"
     return 1
   fi
 
@@ -59,7 +59,7 @@ compose_capture_rollback_metadata() {
   for id in "${ids[@]}"; do
     service="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$id" 2>/dev/null || true)"
     [[ -n "$service" ]] || {
-      warn " · 目标端容器缺少 Compose service 标签：$id"
+      warn " · 新服务器上的容器 ${id} 缺少 Compose 服务名，无法备份"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
     }
@@ -82,14 +82,14 @@ compose_capture_rollback_images() {
   while IFS=$'\t' read -r service state id; do
     [[ -n "$service" && -n "$id" ]] || continue
     if ! docker container inspect "$id" >/dev/null 2>&1; then
-      warn " · 目标端旧 Compose 容器在建立回滚镜像前消失：$service"
+      warn " · 备份过程中，新服务器上的 Compose 服务 ${service} 的容器不见了"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
     fi
     image="docker-migrate-rollback:${id:0:12}-$$"
     if ! run_with_activity "创建 Compose 回滚镜像：$service" \
       dm_quiet docker commit "$id" "$image"; then
-      warn " · 目标端容器回滚镜像创建失败：$service"
+      warn " · Compose 服务 ${service} 的容器没能备份"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
     fi

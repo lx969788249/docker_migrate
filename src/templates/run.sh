@@ -15,6 +15,8 @@ META="${BUNDLE_DIR}/meta/__NAME__.inspect.json"
 
 # @include lib/containers.sh
 
+# @include lib/decisions.sh
+
 dm_capture_command() {
   local output_file="$1"
   shift
@@ -182,7 +184,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
           ;;
       esac
       dm_quiet docker rename "$name" "$replacement_backup_name" || {
-        fail_with_output "无法为已有容器 ${name} 建立回滚点（它保持不变）" "$(log_tail_text 10)"
+        fail_with_output "无法先备份已有容器 ${name}（它保持不变）" "$(log_tail_text 10)"
         exit 1
       }
       replacement_active=1
@@ -434,6 +436,17 @@ for p in "${port_bindings[@]}"; do
   # 空 HostPort 是 Docker 随机端口分配（如 -p 80 或 -p 0.0.0.0::80），保留空 HostPort 让 Docker 重新随机分配
   [[ -z "$cont_port" ]] && continue
 
+  # 迁移前预检中选择了换端口或不对外开放时，按选择调整。
+  if [[ -n "$host_port" ]] &&
+    decided_port="$(decision_port "$name" "$host_ip" "$host_port" "${cont_port%%/*}" "$([[ "$cont_port" == */* ]] && echo "${cont_port#*/}" || echo tcp)")"; then
+    if [[ -z "$decided_port" ]]; then
+      detail "端口 ${host_port} 按预检时的选择不再对外开放"
+      continue
+    fi
+    detail "端口按预检时的选择改为：${host_port} -> ${decided_port}"
+    host_port="$decided_port"
+  fi
+
   if [[ -z "$host_port" || "$host_port" == "null" ]]; then
     # 随机端口：格式为 -p [ip::]containerPort[/proto]
     host_port=""
@@ -507,6 +520,11 @@ if [[ "$primary_net" != "bridge" && "$primary_net" != "host" &&
   # 固定下来，会与目标端同网络的其他容器冲突，也改变了原有配置。
   primary_ip="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv4Address // empty' "$META")"
   primary_ip6="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv6Address // empty' "$META")"
+  if decision_auto_ip "$name" "$primary_net"; then
+    detail "网络 ${primary_net} 中按预检时的选择改为自动分配 IP"
+    primary_ip=""
+    primary_ip6=""
+  fi
   [[ -z "$primary_ip" ]] || args+=(--ip "$primary_ip")
   [[ -z "$primary_ip6" ]] || args+=(--ip6 "$primary_ip6")
   mapfile -t primary_aliases < <(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].Aliases[]? // empty' "$META")
@@ -549,6 +567,10 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
     ip6="$(_net '.value.IPAMConfig.IPv6Address // empty')"
     aliases_raw="$(_net '.value.Aliases // empty | join(" ")')"
     conn_args=()
+    if decision_auto_ip "$name" "$net_name"; then
+      ip=""
+      ip6=""
+    fi
     [[ -n "$ip" && "$ip" != "null" ]] && conn_args+=(--ip "$ip")
     [[ -n "$ip6" && "$ip6" != "null" ]] && conn_args+=(--ip6 "$ip6")
     if [[ -n "$aliases_raw" && "$aliases_raw" != "null" ]]; then

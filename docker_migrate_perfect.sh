@@ -36,7 +36,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -494,12 +494,12 @@ print_restore_result_summary() {
     FAILED_ROLLED_BACK)
       printf '结果：❌ 恢复失败，已安全回滚\n'
       printf '失败阶段：%s\n' "${stage:-未知阶段}"
-      printf '目标端状态：旧服务与原数据已恢复\n'
+      printf '新服务器：原来的服务和数据已还原\n'
       ;;
     INTERRUPTED_ROLLED_BACK)
       printf '结果：⚠️ 恢复已中断，已安全回滚\n'
       printf '中断阶段：%s\n' "${stage:-未知阶段}"
-      printf '目标端状态：旧服务与原数据已恢复\n'
+      printf '新服务器：原来的服务和数据已还原\n'
       ;;
     FAILED_ROLLBACK_INCOMPLETE | INTERRUPTED_ROLLBACK_INCOMPLETE)
       if [[ "$status" == INTERRUPTED_* ]]; then
@@ -529,6 +529,7 @@ print_restore_result_summary() {
   [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
   [[ -z "$diagnostic_dir" ]] || printf '诊断目录：%s\n' "$diagnostic_dir"
   [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+  print_decision_summary "${DM_RESTORE_DECISIONS:-}"
   if [[ "$status" != "SUCCESS" ]]; then
     print_warning_summary
     print_failure_details
@@ -589,9 +590,9 @@ print_transfer_instructions() {
   printf '使用方法：在新服务器运行同一脚本 → 选择「2) 下载备份并恢复」→ 粘贴上面的完整链接。\n'
   print_firewall_hint "$port"
   if [[ "$mode" == "interactive" ]]; then
-    printf '目标端恢复成功后，回到此窗口按回车停止传输服务并清理临时文件。\n'
+    printf '新服务器恢复成功后，回到这个窗口按回车，停止传输并清理临时文件。\n'
   else
-    printf '传输服务将保持运行；目标端恢复完成后执行：kill -TERM %s\n' "$source_pid"
+    printf '传输服务会一直运行；新服务器恢复完成后执行：kill -TERM %s\n' "$source_pid"
   fi
   printf '%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 }
@@ -621,6 +622,7 @@ show_help() {
 
   --verbose                 在屏幕上显示每一步的细节（默认只写进日志）
   --diagnose                收集系统、Docker 与最近日志，生成可附到 issue 的诊断文件
+  --check=URL               只做迁移前预检（端口、磁盘、CPU 类型等），不下载也不修改任何东西
 
 环境变量:
   PORT=8080                 HTTP 端口（被占用会自动递增）
@@ -636,6 +638,8 @@ show_help() {
   DOCKER_MIGRATE_LOG_DIR    日志目录（默认 ~/docker_migrate_logs）；成功后日志自动删除，
                             失败时保留并在结果中给出路径
   DOCKER_MIGRATE_KEEP_LOG=1 成功后也保留日志
+  RESTORE_AUTO_RESOLVE=1    非交互模式下，预检发现的问题自动采用推荐处理（如自动换端口）
+  RESTORE_SKIP_PREFLIGHT=1  跳过迁移前预检
 
 宿主机系统路径（如 /etc/localtime、/proc、/sys、/dev）只在新服务器重建挂载，不迁移内容。
 不带参数运行时仍使用原有交互菜单。
@@ -1581,6 +1585,844 @@ collect_restore_result_metrics() {
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$total" "$running" "$paused" "$stopped" "$missing" "$volumes" "$binds"
+}
+
+# 迁移计划（plan.json）：新服务器在下载迁移包之前用它做预检。
+#
+# 源端打包时根据迁移清单与容器配置生成，内容只有“迁移需要什么”：CPU 架构、
+# 容器端口、网络网段、数据卷与目录大小等，没有任何业务数据。它既放进迁移包，
+# 也单独加密后与迁移包一起提供下载；新服务器从同一个链接推算出它的地址，
+# 用户只需要复制一个链接。
+
+# 下载链接 → 迁移计划地址：同一随机路径下，把 .tar.gz.enc 换成 .plan。
+plan_url_from_bundle_url() {
+  local url="${1%%#*}"
+  [[ "$url" == *.tar.gz.enc ]] || return 1
+  printf '%s.plan\n' "${url%.tar.gz.enc}"
+}
+
+# 计划使用与迁移包不同的 IV：同一把 CTR 密钥绝不能重复使用同一个 IV。
+plan_iv() {
+  printf 'docker-migrate-plan:%s' "${1,,}" | openssl dgst -sha256 2>/dev/null | awk '{print substr($NF, 1, 32)}'
+}
+
+# 生成迁移计划（输出到标准输出）。
+plan_build() {
+  local bundle_dir="$1" images_bytes="${2:-0}" plain_bytes
+  plain_bytes="$(path_size_bytes "$bundle_dir")"
+  jq -n \
+    --arg arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || uname -m)" \
+    --arg docker "$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)" \
+    --argjson images_bytes "${images_bytes:-0}" \
+    --argjson plain_bytes "${plain_bytes:-0}" \
+    --slurpfile manifest "${bundle_dir}/manifest.json" \
+    --slurpfile metas <(cat "${bundle_dir}"/meta/*.inspect.json 2>/dev/null || true) '
+    ($manifest[0]) as $m |
+    ([$m.projects[]?.name]) as $projects |
+    {
+      version: 1,
+      source: {arch: $arch, docker: $docker},
+      sizes: {
+        bundle: $plain_bytes,
+        images: $images_bytes,
+        volumes: ([$m.volumes[]?.bytes // 0] | add // 0),
+        binds: ([$m.binds[]?.bytes // 0] | add // 0)
+      },
+      needs_compose: (($projects | length) > 0),
+      projects: $projects,
+      containers: [$metas[] | .[0] |
+        (.Config.Labels["com.docker.compose.project"] // "") as $project |
+        {
+          name: (.Name | ltrimstr("/")),
+          project: (if ($projects | index($project)) then $project else "" end),
+          network_mode: (.HostConfig.NetworkMode // "default"),
+          runtime: (.HostConfig.Runtime // ""),
+          devices: [.HostConfig.Devices[]?.PathOnHost],
+          memory: (.HostConfig.Memory // 0),
+          ports: [(.HostConfig.PortBindings // {}) | to_entries[] | .key as $c | .value[]? |
+            select((.HostPort // "") != "") |
+            {host_ip: (.HostIp // ""), host_port: .HostPort,
+             container_port: ($c | split("/")[0]), proto: ($c | split("/")[1] // "tcp")}],
+          networks: [(.NetworkSettings.Networks // {}) | to_entries[] |
+            {name: .key, ip: (.value.IPAMConfig.IPv4Address // "")}],
+          volumes: [.Mounts[]? | select(.Type == "volume") | .Name],
+          binds: [.Mounts[]? | select(.Type == "bind") | .Source]
+        }],
+      volumes: [$m.volumes[]? | {name, driver: (.driver // "local"), opts: (.opts // {}), bytes: (.bytes // 0)}],
+      binds: [$m.binds[]? | {host, link: (.link // ""), bytes: (.bytes // 0)}],
+      networks: [$m.networks[]? | {name, driver: (.driver // "bridge"),
+        subnets: [.ipam.config[]?.Subnet // empty],
+        compose: ((.labels // {})["com.docker.compose.network"] != null)}]
+    }'
+}
+
+# 加密迁移计划：输出文件第一行是签名（HMAC），其后是密文。
+plan_encrypt() {
+  local input="$1" output="$2" encryption_key="$3" mac_key="$4" iv="$5" piv tmp mac
+  piv="$(plan_iv "$iv")"
+  valid_hex_length "$piv" 32 || return 1
+  tmp="${output}.cipher.$$"
+  openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$piv" -in "$input" -out "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mac="$(bundle_hmac_sha256_file "$tmp" "$mac_key" "$piv")" || {
+    rm -f "$tmp"
+    return 1
+  }
+  {
+    printf '%s\n' "$mac"
+    cat "$tmp"
+  } >"$output"
+  rm -f "$tmp"
+}
+
+# 验证签名并解密迁移计划。签名不符时返回 2（文件被篡改或链接不完整）。
+plan_decrypt() {
+  local input="$1" output="$2" encryption_key="$3" mac_key="$4" iv="$5" piv tmp mac
+  piv="$(plan_iv "$iv")"
+  valid_hex_length "$piv" 32 || return 1
+  mac="$(head -n1 "$input" 2>/dev/null || true)"
+  valid_sha256 "$mac" || return 2
+  tmp="${output}.cipher.$$"
+  tail -c +66 "$input" >"$tmp" || return 1
+  if [[ "$(bundle_hmac_sha256_file "$tmp" "$mac_key" "$piv" 2>/dev/null || true)" != "${mac,,}" ]]; then
+    rm -f "$tmp"
+    return 2
+  fi
+  openssl enc -d -aes-256-ctr -nosalt -K "$encryption_key" -iv "$piv" -in "$tmp" -out "$output" ||
+    {
+      rm -f "$tmp"
+      return 1
+    }
+  rm -f "$tmp"
+  jq -e '.version == 1' "$output" >/dev/null 2>&1 || return 1
+}
+
+# 迁移前预检：在下载迁移包、改动新服务器之前，根据迁移计划找出会让迁移失败的问题。
+#
+# 问题分三级：
+#   info  只提示，不停下（如 Docker 版本较旧）
+#   ask   会导致迁移失败但可以处理，停下来让用户针对性地选择（如端口被占用）
+#   stop  无法继续（如 CPU 架构不同）
+# 用户的选择写进“恢复决定”文件（JSON），恢复脚本按它执行：换端口、跳过项目、
+# 改为自动分配 IP 等。检查逻辑用 python3 实现（新服务器恢复时本来就需要它）。
+
+# 输出检查结果 JSON：{"issues": [...], "summary": {...}}。
+preflight_collect() {
+  local plan="$1" decisions="$2" base_dir="$3"
+  python3 - "$plan" "$decisions" "$base_dir" <<'PREFLIGHT_PY'
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+plan_path, decisions_path, base_dir = sys.argv[1:4]
+plan = json.load(open(plan_path))
+try:
+    decisions = json.load(open(decisions_path))
+except (OSError, ValueError):
+    decisions = {}
+issues = []
+
+
+def run(cmd):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        return p.returncode, p.stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return 127, ""
+
+
+def human(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            if unit == "B" or n >= 10:
+                return "%d%s" % (n, unit)
+            return ("%.1f" % n).rstrip("0").rstrip(".") + unit
+        n /= 1024
+
+
+def cjk_spaced(text):
+    """中文排版：与英文或数字相邻时加一个空格，与中文或全角符号相邻时不加。"""
+    if not text:
+        return text
+    left = " " if ord(text[0]) < 128 and text[0].isalnum() else ""
+    right = " " if ord(text[-1]) < 128 and text[-1].isalnum() else ""
+    return left + text + right
+
+
+def add(level, kind, title, hint="", **data):
+    item = {"level": level, "type": kind, "title": title, "hint": hint}
+    item.update(data)
+    issues.append(item)
+
+
+def free_bytes(path):
+    path = os.path.abspath(path or "/")
+    while not os.path.exists(path) and path != "/":
+        path = os.path.dirname(path)
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize, os.stat(path).st_dev
+    except OSError:
+        return None, None
+
+
+skip_projects = set(decisions.get("skip_projects", []))
+skip_containers = set(decisions.get("skip_containers", []))
+replace_containers = set(decisions.get("replace_containers", []))
+replace_projects = set(decisions.get("replace_projects", []))
+keep_volumes = set(decisions.get("keep_volumes", []))
+auto_subnet = set(decisions.get("auto_subnet", []))
+reuse_network = set(decisions.get("reuse_network", []))
+auto_ip = {(x.get("container"), x.get("network")) for x in decisions.get("auto_ip", [])}
+port_map = {}
+for item in decisions.get("port_map", []):
+    key = (item.get("container"), item.get("host_ip", ""), str(item.get("host_port")),
+           str(item.get("container_port")), item.get("proto", "tcp"))
+    port_map[key] = str(item.get("new_port", ""))
+
+containers = [c for c in plan.get("containers", [])
+              if c.get("project", "") not in skip_projects and c["name"] not in skip_containers]
+plan_names = {c["name"] for c in containers}
+used_volumes = {v for c in containers for v in c.get("volumes", [])}
+used_binds = {b for c in containers for b in c.get("binds", [])}
+
+# ---------- Docker 环境 ----------
+rc, out = run(["docker", "info", "--format", "{{json .}}"])
+try:
+    info = json.loads(out) if rc == 0 else {}
+except ValueError:
+    info = {}
+
+arch_alias = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64",
+              "armv7l": "arm", "armhf": "arm", "arm": "arm"}
+src_arch = plan.get("source", {}).get("arch", "")
+dst_arch = info.get("Architecture", "") or os.uname().machine
+if src_arch and dst_arch and arch_alias.get(src_arch, src_arch) != arch_alias.get(dst_arch, dst_arch):
+    add("stop", "arch",
+        "两台服务器的 CPU 类型不同：旧服务器是 %s，新服务器是 %s" % (src_arch, dst_arch),
+        "容器镜像只能在相同 CPU 类型的服务器上运行，请换一台和旧服务器相同类型的服务器")
+
+
+def version_tuple(v):
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(x) for x in nums[:2]) if len(nums) >= 2 else None
+
+
+src_ver = plan.get("source", {}).get("docker", "")
+dst_ver = info.get("ServerVersion", "")
+if version_tuple(src_ver) and version_tuple(dst_ver) and version_tuple(dst_ver) < version_tuple(src_ver):
+    add("info", "docker_version",
+        "新服务器的 Docker（%s）比旧服务器（%s）旧，一般不影响迁移" % (dst_ver, src_ver))
+
+if any(c.get("project") for c in containers):
+    has_plugin = run(["docker", "compose", "version"])[0] == 0
+    if not has_plugin and not shutil.which("docker-compose"):
+        add("stop", "compose",
+            "要迁移 Compose 项目，但新服务器没有安装 Docker Compose",
+            "先安装 Docker Compose（例如 apt install docker-compose-plugin）再重试")
+
+runtimes = set((info.get("Runtimes") or {}).keys())
+for c in containers:
+    rt = c.get("runtime", "")
+    if rt and rt != "runc" and runtimes and rt not in runtimes:
+        add("stop", "runtime", "容器 %s 需要 %s 运行环境，新服务器没有安装" % (c["name"], rt),
+            "先在新服务器安装它（例如 NVIDIA 显卡需要安装 NVIDIA Container Toolkit）再重试")
+    for dev in c.get("devices", []):
+        if dev and not os.path.exists(dev):
+            add("stop", "device", "容器 %s 需要设备 %s，新服务器上没有" % (c["name"], dev),
+                "确认新服务器有这个硬件并已安装驱动")
+
+volume_plugins = set((info.get("Plugins") or {}).get("Volume") or [])
+for v in plan.get("volumes", []):
+    if v["name"] not in used_volumes:
+        continue
+    driver = v.get("driver", "local")
+    if driver != "local" and volume_plugins and driver not in volume_plugins:
+        add("stop", "volume_plugin", "数据卷 %s 使用 %s 插件存储，新服务器没有安装这个插件" % (v["name"], driver),
+            "先在新服务器安装 %s 卷插件再重试" % driver)
+
+mem_total = info.get("MemTotal") or 0
+mem_need = sum(int(c.get("memory") or 0) for c in containers)
+if mem_total and mem_need > mem_total:
+    add("info", "memory", "容器设置的内存上限合计 %s，超过新服务器的内存 %s，内存紧张时容器可能被系统结束"
+        % (human(mem_need), human(mem_total)))
+
+# ---------- 磁盘空间 ----------
+sizes = plan.get("sizes", {})
+bundle = int(sizes.get("bundle") or 0)
+kept_volume_bytes = sum(int(v.get("bytes") or 0) for v in plan.get("volumes", [])
+                        if v["name"] in keep_volumes or v["name"] not in used_volumes)
+docker_need = int(sizes.get("images") or 0) + int(sizes.get("volumes") or 0) - kept_volume_bytes
+# 在已解压的迁移包里手动恢复时，下载和解压所需空间已经用掉了，不再计算。
+skip_base = os.environ.get("PREFLIGHT_SKIP_BASE_DISK") == "1"
+if skip_base:
+    bundle = 0
+base_need = 2 * bundle
+base_free, base_dev = free_bytes(base_dir)
+root_free, root_dev = free_bytes(info.get("DockerRootDir") or "/var/lib/docker")
+if base_free is not None and root_free is not None and base_dev == root_dev:
+    # 同一块磁盘：解压出的迁移包与加载后的镜像、数据卷会同时存在。
+    total = max(base_need, bundle + docker_need)
+    if base_free < total:
+        add("ask", "disk_base",
+            "磁盘空间不够：迁移需要约 %s，%s 所在磁盘只剩 %s" % (human(total), base_dir, human(base_free)),
+            "清理磁盘后重新检查，或换一个空间更大的磁盘存放下载文件",
+            need=total, free=base_free)
+    elif base_free < total * 1.2:
+        add("info", "disk_tight", "磁盘空间偏紧：迁移需要约 %s，剩余 %s" % (human(total), human(base_free)))
+else:
+    if base_free is not None and base_free < base_need:
+        add("ask", "disk_base",
+            "磁盘空间不够：下载和解压需要约 %s，%s 所在磁盘只剩 %s" % (human(base_need), base_dir, human(base_free)),
+            "清理磁盘后重新检查，或换一个空间更大的磁盘存放下载文件",
+            need=base_need, free=base_free)
+    root = info.get("DockerRootDir") or "/var/lib/docker"
+    if root_free is not None and root_free < docker_need:
+        add("ask", "disk_docker",
+            "磁盘空间不够：Docker 存放镜像和数据卷需要约 %s，%s 所在磁盘只剩 %s" % (human(docker_need), root, human(root_free)),
+            "清理磁盘后重新检查（docker system prune 可以清理不用的镜像和容器）",
+            need=docker_need, free=root_free)
+
+for b in plan.get("binds", []):
+    if b["host"] not in used_binds and (not b.get("link") or b["link"] not in used_binds):
+        continue
+    need = int(b.get("bytes") or 0)
+    free, _ = free_bytes(b["host"])
+    if free is not None and need and free < need:
+        add("ask", "disk_bind",
+            "磁盘空间不够：目录 %s 需要约 %s，所在磁盘只剩 %s" % (b["host"], human(need), human(free)),
+            "清理这块磁盘后重新检查", need=need, free=free)
+
+# ---------- 已有的同名容器、Compose 项目、数据卷 ----------
+rc, out = run(["docker", "ps", "-a", "--format",
+               '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Ports}}'])
+existing = {}
+for line in out.splitlines():
+    parts = line.split("\t")
+    if len(parts) >= 3:
+        existing[parts[0]] = {"project": parts[1], "ports": parts[2]}
+existing_projects = {e["project"] for e in existing.values() if e["project"]}
+policy = os.environ.get("RESTORE_EXISTING", "")
+
+for c in containers:
+    if c.get("project") or c["name"] not in existing or c["name"] in replace_containers:
+        continue
+    if policy == "fail":
+        add("stop", "existing_container", "新服务器上已经有同名容器 %s（RESTORE_EXISTING=fail 不允许替换）" % c["name"],
+            "删除这个容器，或改用 RESTORE_EXISTING=replace")
+    elif policy not in ("replace", "skip"):
+        add("ask", "existing_container", "新服务器上已经有同名容器 %s" % c["name"], container=c["name"])
+for project in sorted({c["project"] for c in containers if c.get("project")}):
+    if project not in existing_projects or project in replace_projects:
+        continue
+    if policy == "fail":
+        add("stop", "existing_project", "新服务器上已经有同名的 Compose 项目 %s（RESTORE_EXISTING=fail 不允许替换）" % project,
+            "删除这个项目的容器，或改用 RESTORE_EXISTING=replace")
+    elif policy not in ("replace", "skip"):
+        add("ask", "existing_project", "新服务器上已经有同名的 Compose 项目 %s" % project, project=project)
+
+for v in plan.get("volumes", []):
+    if v["name"] not in used_volumes or v["name"] in keep_volumes:
+        continue
+    rc, out = run(["docker", "volume", "inspect", v["name"]])
+    if rc != 0:
+        continue
+    try:
+        cur = json.loads(out)[0]
+    except (ValueError, IndexError):
+        continue
+    if (cur.get("Driver") or "local") != v.get("driver", "local") or (cur.get("Options") or {}) != (v.get("opts") or {}):
+        add("ask", "volume_mismatch",
+            "新服务器已有同名数据卷 %s，但它的存储方式和旧服务器不同" % v["name"], volume=v["name"])
+    else:
+        add("info", "volume_replace", "数据卷 %s 已存在，迁移的数据会替换它（失败时自动还原）" % v["name"])
+
+# ---------- 网络 ----------
+target_nets = {}
+rc, out = run(["docker", "network", "ls", "-q"])
+ids = out.split()
+if ids:
+    rc, out = run(["docker", "network", "inspect"] + ids)
+    try:
+        for n in json.loads(out) if rc == 0 else []:
+            target_nets[n["Name"]] = {
+                "driver": n.get("Driver", ""),
+                "subnets": [c.get("Subnet") for c in (n.get("IPAM") or {}).get("Config") or [] if c.get("Subnet")],
+                "ips": {(v.get("IPv4Address") or "").split("/")[0]: v.get("Name", "")
+                        for v in (n.get("Containers") or {}).values()},
+            }
+    except ValueError:
+        pass
+
+plan_nets = {n["name"]: n for n in plan.get("networks", [])}
+used_nets = {net["name"] for c in containers for net in c.get("networks", [])}
+for name, net in plan_nets.items():
+    if name not in used_nets or name in ("bridge", "host", "none") or net.get("compose"):
+        continue
+    if net.get("driver") in ("macvlan", "ipvlan"):
+        add("info", "macvlan", "网络 %s 使用 %s，需要新服务器的网卡名称和旧服务器一致" % (name, net["driver"]))
+    if name in reuse_network or name in auto_subnet:
+        continue
+    wanted = [s for s in net.get("subnets", []) if s]
+    if name in target_nets:
+        have = target_nets[name]
+        if sorted(have["subnets"]) != sorted(wanted) or have["driver"] != net.get("driver", "bridge"):
+            add("ask", "network_mismatch",
+                "新服务器已有同名网络 %s，但网段不同（旧服务器 %s，新服务器 %s）"
+                % (name, "、".join(wanted) or "自动", "、".join(have["subnets"]) or "自动"), network=name)
+        continue
+    for subnet in wanted:
+        try:
+            mine = ipaddress.ip_network(subnet, strict=False)
+        except ValueError:
+            continue
+        clash = None
+        for other, have in target_nets.items():
+            for s in have["subnets"]:
+                try:
+                    if mine.overlaps(ipaddress.ip_network(s, strict=False)):
+                        clash = (other, s)
+                except (ValueError, TypeError):
+                    pass
+        if clash:
+            add("ask", "subnet_conflict",
+                "网络 %s 要用的网段 %s 和新服务器上的网络 %s（%s）重叠" % (name, subnet, clash[0], clash[1]),
+                network=name)
+            break
+
+for c in containers:
+    for net in c.get("networks", []):
+        ip = net.get("ip", "")
+        name = net["name"]
+        if not ip or name in reuse_network or name in auto_subnet or (c["name"], name) in auto_ip:
+            continue
+        holder = target_nets.get(name, {}).get("ips", {}).get(ip)
+        if holder and holder != c["name"] and holder not in plan_names:
+            add("ask", "ip_conflict", "网络 %s 中的 IP %s 已被容器 %s 使用，容器 %s 需要它" % (name, ip, holder, c["name"]),
+                container=c["name"], network=name)
+
+# ---------- 端口 ----------
+WILD = {"", "0.0.0.0", "::", "*", "[::]"}
+
+
+def parse_listeners():
+    found = []
+    tool = None
+    for proto, flag in (("tcp", "-Hltnp"), ("udp", "-Hlunp")):
+        rc, out = run(["ss", flag])
+        if rc != 0:
+            rc, out = run(["ss", flag.replace("p", "")])
+        if rc != 0:
+            continue
+        tool = "ss"
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) < 5:
+                continue
+            local = cols[3]
+            host, _, port = local.rpartition(":")
+            host = host.strip("[]").split("%")[0]
+            proc = ""
+            m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
+            if m:
+                proc = "%s（进程 %s）" % (m.group(1), m.group(2))
+            if port.isdigit():
+                found.append((proto, host, port, proc))
+    return tool, found
+
+
+tool, listeners = parse_listeners()
+docker_ports = {}
+for cname, e in existing.items():
+    for m in re.finditer(r"([0-9a-fA-F:.\[\]]*):(\d+)->\d+/(tcp|udp)", e["ports"]):
+        docker_ports.setdefault((m.group(3), m.group(2)), cname)
+
+
+def port_holder(proto, host_ip, port):
+    owner = docker_ports.get((proto, port))
+    if owner:
+        return "容器 %s" % owner, owner
+    for p, host, lport, proc in listeners:
+        if p == proto and lport == port and (host_ip in WILD or host in WILD or host == host_ip):
+            if "docker-proxy" in proc:
+                continue
+            return proc or "其他程序", None
+    return None, None
+
+
+requested = set()
+for c in containers:
+    if c.get("network_mode", "") == "host" or c.get("network_mode", "").startswith("container:"):
+        continue
+    for p in c.get("ports", []):
+        key = (c["name"], p.get("host_ip", ""), str(p["host_port"]), str(p["container_port"]), p.get("proto", "tcp"))
+        port = port_map.get(key, str(p["host_port"]))
+        if not port:
+            continue
+        requested.add((p.get("proto", "tcp"), port))
+        holder, owner = port_holder(p.get("proto", "tcp"), p.get("host_ip", ""), port)
+        if not holder:
+            continue
+        # 占用端口的正是将被替换的同名容器：恢复时它会先停止，不算冲突。
+        if owner and owner in plan_names:
+            continue
+        busy = {(pr, po) for pr, _, po, _ in listeners} | set(docker_ports.keys()) | requested
+        suggest = next((str(x) for x in range(int(port) + 1, min(int(port) + 200, 65536))
+                        if (p.get("proto", "tcp"), str(x)) not in busy), "")
+        add("ask", "port",
+            "端口 %s 已被%s占用，%s需要使用它" % (port, cjk_spaced(holder),
+                ("Compose 项目 %s 的容器 %s " % (c["project"], c["name"])) if c.get("project") else ("容器 %s " % c["name"])),
+            container=c["name"], project=c.get("project", ""), host_ip=p.get("host_ip", ""),
+            host_port=str(p["host_port"]), current_port=port, container_port=str(p["container_port"]),
+            proto=p.get("proto", "tcp"), holder=holder, suggest=suggest)
+if tool is None and any(c.get("ports") for c in containers):
+    add("info", "port_unchecked", "新服务器没有 ss 命令，无法提前检查端口是否被占用")
+
+need = max(base_need, bundle + docker_need)
+json.dump({"issues": issues, "summary": {"containers": len(containers), "need_bytes": need}},
+          sys.stdout, ensure_ascii=False)
+PREFLIGHT_PY
+}
+
+# ---------- 恢复决定文件 ----------
+
+preflight_decide() {
+  local file="$1" filter="$2"
+  shift 2
+  local tmp="${file}.tmp.$$"
+  [[ -s "$file" ]] || printf '{}\n' >"$file"
+  jq "$@" "$filter" "$file" >"$tmp" && mv "$tmp" "$file"
+}
+
+# 读取一个选项编号；回车选默认值。非交互时直接使用默认值。
+preflight_choose() {
+  local max="$1" default="$2" answer
+  while :; do
+    printf '请选择 [%s]：' "$default" >&2
+    read -r answer </dev/tty || answer=""
+    answer="${answer:-$default}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] && ((answer >= 1 && answer <= max)); then
+      printf '%s\n' "$answer"
+      return 0
+    fi
+    printf '请输入 1 到 %s 之间的数字。\n' "$max" >&2
+  done
+}
+
+preflight_option() {
+  printf '  %s) %s\n' "$1" "$2" >&2
+}
+
+# 处理一个“需要用户选择”的问题。返回 0 表示已处理（或选择了重新检查），
+# 返回 1 表示用户选择取消。auto=1 时自动采用推荐做法，无法自动处理时返回 1。
+preflight_resolve() {
+  local issue="$1" decisions="$2" index="$3" total="$4" auto="$5"
+  local kind title choice container project port new_port network volume
+  kind="$(jq -r '.type' <<<"$issue")"
+  title="$(jq -r '.title' <<<"$issue")"
+  container="$(jq -r '.container // ""' <<<"$issue")"
+  project="$(jq -r '.project // ""' <<<"$issue")"
+  network="$(jq -r '.network // ""' <<<"$issue")"
+  volume="$(jq -r '.volume // ""' <<<"$issue")"
+
+  if [[ "$auto" != "1" ]]; then
+    printf '\n问题 %s/%s：' "$index" "$total" >&2
+  fi
+  case "$kind" in
+    port)
+      port="$(jq -r '.current_port' <<<"$issue")"
+      new_port="$(jq -r '.suggest // ""' <<<"$issue")"
+      if [[ -n "$project" ]]; then
+        if [[ "$auto" == "1" ]]; then
+          log_line "无法自动处理：${title}"
+          return 1
+        fi
+        printf '%s\n' "$(screen_color '1;33' "⚠️  端口被占用，Compose 项目 ${project} 无法启动")" >&2
+        printf '  %s\n' "$title" >&2
+        printf '  请自行停止占用端口的程序，或修改 %s 的 compose 文件中的端口后再继续。\n' "$project" >&2
+        preflight_option 1 "我已处理好，重新检查（推荐）"
+        preflight_option 2 "暂时跳过 ${project} 项目，继续迁移其他容器"
+        preflight_option 3 "取消恢复"
+        choice="$(preflight_choose 3 1)"
+        case "$choice" in
+          2) preflight_decide "$decisions" '.skip_projects = ((.skip_projects // []) + [$p] | unique) |
+               .skipped_reasons = ((.skipped_reasons // []) + [{project: $p, reason: $r}])' \
+            --arg p "$project" --arg r "端口 ${port} 被占用" ;;
+          3) return 1 ;;
+        esac
+        return 0
+      fi
+      if [[ "$auto" == "1" ]]; then
+        [[ -n "$new_port" ]] || return 1
+        choice=1
+      else
+        printf '%s\n' "$title" >&2
+        if [[ -n "$new_port" ]]; then
+          preflight_option 1 "改用空闲端口 ${new_port}（推荐）"
+        else
+          preflight_option 1 "改用其他端口（附近没有找到空闲端口，需要手动输入）"
+        fi
+        preflight_option 2 "输入其他端口"
+        preflight_option 3 "我先停掉占用端口的程序，然后重新检查"
+        preflight_option 4 "不对外开放这个端口"
+        preflight_option 5 "取消恢复"
+        choice="$(preflight_choose 5 1)"
+      fi
+      if [[ "$choice" == 1 && -z "$new_port" ]] || [[ "$choice" == 2 ]]; then
+        while :; do
+          printf '新端口：' >&2
+          read -r new_port </dev/tty || new_port=""
+          [[ "$new_port" =~ ^[0-9]+$ ]] && ((new_port >= 1 && new_port <= 65535)) && break
+          printf '请输入 1 到 65535 之间的端口号。\n' >&2
+        done
+        choice=1
+      fi
+      case "$choice" in
+        1 | 4)
+          [[ "$choice" == 1 ]] || new_port=""
+          preflight_decide "$decisions" '
+            .port_map = ([(.port_map // [])[] | select((.container == $c and .host_ip == $ip and
+              .host_port == $hp and .container_port == $cp and .proto == $proto) | not)] +
+              [{container: $c, host_ip: $ip, host_port: $hp, container_port: $cp, proto: $proto, new_port: $np}])' \
+            --arg c "$container" --arg ip "$(jq -r '.host_ip' <<<"$issue")" \
+            --arg hp "$(jq -r '.host_port' <<<"$issue")" --arg cp "$(jq -r '.container_port' <<<"$issue")" \
+            --arg proto "$(jq -r '.proto' <<<"$issue")" --arg np "$new_port"
+          ;;
+        5) return 1 ;;
+      esac
+      ;;
+    existing_container | existing_project)
+      if [[ "$auto" == "1" ]]; then
+        choice=1
+      else
+        printf '%s\n' "$title" >&2
+        preflight_option 1 "替换它（推荐，迁移失败时会自动还原）"
+        if [[ "$kind" == existing_project ]]; then
+          preflight_option 2 "保留已有的，跳过这个项目"
+        else
+          preflight_option 2 "保留已有的，跳过这个容器"
+        fi
+        preflight_option 3 "取消恢复"
+        choice="$(preflight_choose 3 1)"
+      fi
+      case "$kind:$choice" in
+        existing_container:1) preflight_decide "$decisions" '.replace_containers = ((.replace_containers // []) + [$c] | unique)' --arg c "$container" ;;
+        existing_container:2) preflight_decide "$decisions" '.skip_containers = ((.skip_containers // []) + [$c] | unique) |
+          .skipped_reasons = ((.skipped_reasons // []) + [{container: $c, reason: "保留新服务器上已有的容器"}])' --arg c "$container" ;;
+        existing_project:1) preflight_decide "$decisions" '.replace_projects = ((.replace_projects // []) + [$p] | unique)' --arg p "$project" ;;
+        existing_project:2) preflight_decide "$decisions" '.skip_projects = ((.skip_projects // []) + [$p] | unique) |
+          .skipped_reasons = ((.skipped_reasons // []) + [{project: $p, reason: "保留新服务器上已有的项目"}])' --arg p "$project" ;;
+        *:3) return 1 ;;
+      esac
+      ;;
+    ip_conflict | subnet_conflict | network_mismatch)
+      if [[ "$auto" == "1" ]]; then
+        choice=1
+      else
+        printf '%s\n' "$title" >&2
+        case "$kind" in
+          ip_conflict) preflight_option 1 "改为由 Docker 自动分配 IP（推荐）" ;;
+          subnet_conflict) preflight_option 1 "让 Docker 自动选择一个不冲突的网段，网络里的容器改为自动分配 IP（推荐）" ;;
+          network_mismatch) preflight_option 1 "继续使用新服务器上已有的这个网络，容器改为自动分配 IP（推荐）" ;;
+        esac
+        preflight_option 2 "取消恢复"
+        choice="$(preflight_choose 2 1)"
+      fi
+      [[ "$choice" == 1 ]] || return 1
+      case "$kind" in
+        ip_conflict) preflight_decide "$decisions" '.auto_ip = ((.auto_ip // []) + [{container: $c, network: $n}] | unique)' \
+          --arg c "$container" --arg n "$network" ;;
+        subnet_conflict) preflight_decide "$decisions" '.auto_subnet = ((.auto_subnet // []) + [$n] | unique)' --arg n "$network" ;;
+        network_mismatch) preflight_decide "$decisions" '.reuse_network = ((.reuse_network // []) + [$n] | unique)' --arg n "$network" ;;
+      esac
+      ;;
+    volume_mismatch)
+      [[ "$auto" != "1" ]] || return 1
+      printf '%s\n' "$title" >&2
+      preflight_option 1 "取消恢复，我先处理这个数据卷（推荐）"
+      preflight_option 2 "保留已有的数据卷，不写入迁移过来的数据"
+      choice="$(preflight_choose 2 1)"
+      [[ "$choice" == 2 ]] || return 1
+      preflight_decide "$decisions" '.keep_volumes = ((.keep_volumes // []) + [$v] | unique)' --arg v "$volume"
+      ;;
+    disk_base)
+      [[ "$auto" != "1" ]] || return 1
+      printf '%s\n' "$title" >&2
+      preflight_option 1 "我先清理磁盘，然后重新检查（推荐）"
+      preflight_option 2 "换一个目录存放下载文件"
+      preflight_option 3 "取消恢复"
+      choice="$(preflight_choose 3 1)"
+      case "$choice" in
+        2)
+          local dir
+          printf '目录（例如 /data/restore）：' >&2
+          read -r dir </dev/tty || dir=""
+          [[ "$dir" == /* ]] && preflight_decide "$decisions" '.restore_base = $d' --arg d "$dir"
+          ;;
+        3) return 1 ;;
+      esac
+      ;;
+    disk_docker | disk_bind | *)
+      [[ "$auto" != "1" ]] || return 1
+      printf '%s\n' "$title" >&2
+      preflight_option 1 "我先清理磁盘，然后重新检查（推荐）"
+      preflight_option 2 "取消恢复"
+      choice="$(preflight_choose 2 1)"
+      [[ "$choice" == 1 ]] || return 1
+      ;;
+  esac
+  return 0
+}
+
+# 运行预检，交互地处理问题，直到没有需要处理的问题。
+# 返回 0 可以继续；返回 1 不能继续（失败原因已记录）。
+# PREFLIGHT_NEED_BYTES、PREFLIGHT_CONTAINERS 会被设置，供阶段结果显示。
+preflight_run() {
+  local plan="$1" decisions="$2" base_dir="$3"
+  local result asks stops i total row interactive=0 auto="${RESTORE_AUTO_RESOLVE:-0}" round=0
+  local -A shown_infos=()
+  [[ -s "$decisions" ]] || printf '{}\n' >"$decisions"
+  if [[ -t 0 || -r /dev/tty ]] && [[ -t 2 ]]; then
+    interactive=1
+  fi
+  while :; do
+    round=$((round + 1))
+    base_dir="$(jq -r --arg d "$base_dir" '.restore_base // $d' "$decisions")"
+    if ! result="$(preflight_collect "$plan" "$decisions" "$base_dir" 2>>"${DM_LOG_FILE:-/dev/null}")"; then
+      log_line "预检脚本运行失败，跳过预检"
+      warn_user "预检没能完成，直接开始迁移（问题会在迁移过程中发现并自动回滚）"
+      return 0
+    fi
+    log_line "预检结果（第 ${round} 轮）：${result}"
+    # 供调用方在阶段结果中显示。
+    export PREFLIGHT_NEED_BYTES PREFLIGHT_CONTAINERS
+    PREFLIGHT_NEED_BYTES="$(jq -r '.summary.need_bytes // 0' <<<"$result")"
+    PREFLIGHT_CONTAINERS="$(jq -r '.summary.containers // 0' <<<"$result")"
+    while IFS= read -r row; do
+      [[ -n "$row" && -z "${shown_infos[$row]:-}" ]] || continue
+      shown_infos["$row"]=1
+      warn_user "$row"
+    done < <(jq -r '.issues[] | select(.level == "info") | .title' <<<"$result")
+
+    stops="$(jq -c '[.issues[] | select(.level == "stop")]' <<<"$result")"
+    if [[ "$(jq 'length' <<<"$stops")" -gt 0 ]]; then
+      stage_hold
+      printf '%s\n' "$(screen_color '1;31' '发现无法继续的问题，尚未下载或修改任何内容：')" >&2
+      while IFS=$'\t' read -r row hint; do
+        printf '  ✗ %s\n' "$row" >&2
+        [[ -z "$hint" ]] || printf '    建议：%s\n' "$hint" >&2
+      done < <(jq -r '.[] | [.title, .hint] | @tsv' <<<"$stops")
+      fail_reason "$(jq -r '.[0].title' <<<"$stops")" "$(jq -r '.[0].hint' <<<"$stops")"
+      return 1
+    fi
+
+    asks="$(jq -c '[.issues[] | select(.level == "ask")]' <<<"$result")"
+    total="$(jq 'length' <<<"$asks")"
+    ((total > 0)) || return 0
+
+    if ((interactive == 0)) && [[ "$auto" != "1" ]]; then
+      stage_hold
+      printf '%s\n' "$(screen_color '1;33' "发现 ${total} 个需要处理的问题，尚未下载或修改任何内容：")" >&2
+      while IFS=$'\t' read -r row hint; do
+        printf '  ! %s\n' "$row" >&2
+        [[ -z "$hint" ]] || printf '    建议：%s\n' "$hint" >&2
+      done < <(jq -r '.[] | [.title, .hint] | @tsv' <<<"$asks")
+      printf '处理后重新运行即可；也可以设置 RESTORE_AUTO_RESOLVE=1，自动采用推荐的处理方式（例如自动换一个空闲端口）。\n' >&2
+      fail_reason "$(jq -r '.[0].title' <<<"$asks")" \
+        "处理后重新运行；或设置 RESTORE_AUTO_RESOLVE=1 自动采用推荐做法（如自动换端口）"
+      return 1
+    fi
+
+    if ((interactive == 1)) && [[ "$auto" != "1" ]]; then
+      stage_hold
+      printf '%s\n' "$(screen_color '1;33' "发现 ${total} 个需要处理的问题（尚未下载或修改任何内容）")" >&2
+    fi
+    for ((i = 0; i < total; i++)); do
+      if ! preflight_resolve "$(jq -c ".[$i]" <<<"$asks")" "$decisions" "$((i + 1))" "$total" \
+        "$([[ "$auto" == "1" ]] && echo 1 || echo 0)"; then
+        fail_reason "$(jq -r ".[$i].title" <<<"$asks")" \
+          "$([[ "$auto" == "1" ]] && echo "这个问题无法自动处理，请手动处理后重新运行" || echo "处理后重新粘贴同一个链接即可继续")"
+        return 1
+      fi
+    done
+    # 自动处理只做一轮：再次检查仍有问题时交给用户。
+    if [[ "$auto" == "1" ]] && ((round >= 2)); then
+      auto=0
+      ((interactive == 1)) || {
+        fail_reason "自动处理后仍有问题没有解决" "查看日志了解详情"
+        return 1
+      }
+    fi
+    printf '\n重新检查……\n' >&2
+  done
+}
+
+# 恢复结果中列出预检时做的调整，让用户知道哪些地方和旧服务器不同。
+print_decision_summary() {
+  local decisions="${1:-}"
+  [[ -n "$decisions" && -s "$decisions" ]] || return 0
+  jq -r '
+    ([.port_map[]? | if .new_port == "" then
+        "不再对外开放：\(.container) 的端口 \(.host_port)"
+      else "端口变更：\(.container) \(.host_port) → \(.new_port)" end]) +
+    ([.skipped_reasons[]? | if .project then "⚠️ 未迁移：Compose 项目 \(.project)（\(.reason)）"
+      else "⚠️ 未迁移：容器 \(.container)（\(.reason)）" end]) +
+    ([.auto_ip[]? | "自动分配 IP：\(.container) 在网络 \(.network) 中"]) +
+    ([.auto_subnet[]? | "自动选择网段：网络 \(.)"]) +
+    ([.reuse_network[]? | "沿用新服务器已有网络：\(.)"]) +
+    ([.keep_volumes[]? | "保留已有数据卷、未写入迁移数据：\(.)"]) | .[]' "$decisions" 2>/dev/null
+  if jq -e '(.skipped_reasons // []) | any(.project)' "$decisions" >/dev/null 2>&1; then
+    printf '   处理好之后，在新服务器重新粘贴同一个链接即可补上（旧服务器的传输服务需要仍在运行）。\n'
+  fi
+}
+
+# 恢复决定：迁移前预检中用户（或 RESTORE_AUTO_RESOLVE）做出的选择，由
+# DM_RESTORE_DECISIONS 指向的 JSON 文件传给恢复脚本与单容器恢复脚本。
+# 没有这个文件时所有查询都返回“没有特别决定”，恢复按原配置进行。
+
+decisions_present() {
+  [[ -n "${DM_RESTORE_DECISIONS:-}" && -s "${DM_RESTORE_DECISIONS}" ]]
+}
+
+# decision_listed 列表名 值：值是否在决定文件的某个列表里（如 skip_projects）。
+decision_listed() {
+  decisions_present || return 1
+  jq -e --arg k "$1" --arg v "$2" '(.[$k] // []) | index($v) != null' \
+    "$DM_RESTORE_DECISIONS" >/dev/null 2>&1
+}
+
+# 容器在某个网络中是否改为自动分配 IP（单独选择、网段改为自动或沿用已有网络时都是）。
+decision_auto_ip() {
+  local container="$1" network="$2"
+  decisions_present || return 1
+  jq -e --arg c "$container" --arg n "$network" '(.auto_ip // []) | any(.container == $c and .network == $n)' \
+    "$DM_RESTORE_DECISIONS" >/dev/null 2>&1 ||
+    decision_listed auto_subnet "$network" || decision_listed reuse_network "$network"
+}
+
+# 端口映射的新宿主机端口；输出为空表示不再对外开放；没有调整时返回 1。
+decision_port() {
+  local container="$1" host_ip="$2" host_port="$3" container_port="$4" proto="$5"
+  decisions_present || return 1
+  jq -er --arg c "$container" --arg ip "$host_ip" --arg hp "$host_port" \
+    --arg cp "$container_port" --arg proto "$proto" '
+    [(.port_map // [])[] | select(.container == $c and .host_ip == $ip and .host_port == $hp and
+      .container_port == $cp and .proto == $proto) | .new_port] | first // empty | tostring' \
+    "$DM_RESTORE_DECISIONS" 2>/dev/null || {
+    jq -e --arg c "$container" --arg ip "$host_ip" --arg hp "$host_port" \
+      --arg cp "$container_port" --arg proto "$proto" '
+      (.port_map // []) | any(.container == $c and .host_ip == $ip and .host_port == $hp and
+        .container_port == $cp and .proto == $proto and .new_port == "")' \
+      "$DM_RESTORE_DECISIONS" >/dev/null 2>&1 || return 1
+    printf '\n'
+  }
 }
 
 # 源端 HTTP 下载服务与对外地址探测。
@@ -2785,6 +3627,48 @@ restore_container_networks() {
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
+# 恢复决定：迁移前预检中用户（或 RESTORE_AUTO_RESOLVE）做出的选择，由
+# DM_RESTORE_DECISIONS 指向的 JSON 文件传给恢复脚本与单容器恢复脚本。
+# 没有这个文件时所有查询都返回“没有特别决定”，恢复按原配置进行。
+
+decisions_present() {
+  [[ -n "${DM_RESTORE_DECISIONS:-}" && -s "${DM_RESTORE_DECISIONS}" ]]
+}
+
+# decision_listed 列表名 值：值是否在决定文件的某个列表里（如 skip_projects）。
+decision_listed() {
+  decisions_present || return 1
+  jq -e --arg k "$1" --arg v "$2" '(.[$k] // []) | index($v) != null' \
+    "$DM_RESTORE_DECISIONS" >/dev/null 2>&1
+}
+
+# 容器在某个网络中是否改为自动分配 IP（单独选择、网段改为自动或沿用已有网络时都是）。
+decision_auto_ip() {
+  local container="$1" network="$2"
+  decisions_present || return 1
+  jq -e --arg c "$container" --arg n "$network" '(.auto_ip // []) | any(.container == $c and .network == $n)' \
+    "$DM_RESTORE_DECISIONS" >/dev/null 2>&1 ||
+    decision_listed auto_subnet "$network" || decision_listed reuse_network "$network"
+}
+
+# 端口映射的新宿主机端口；输出为空表示不再对外开放；没有调整时返回 1。
+decision_port() {
+  local container="$1" host_ip="$2" host_port="$3" container_port="$4" proto="$5"
+  decisions_present || return 1
+  jq -er --arg c "$container" --arg ip "$host_ip" --arg hp "$host_port" \
+    --arg cp "$container_port" --arg proto "$proto" '
+    [(.port_map // [])[] | select(.container == $c and .host_ip == $ip and .host_port == $hp and
+      .container_port == $cp and .proto == $proto) | .new_port] | first // empty | tostring' \
+    "$DM_RESTORE_DECISIONS" 2>/dev/null || {
+    jq -e --arg c "$container" --arg ip "$host_ip" --arg hp "$host_port" \
+      --arg cp "$container_port" --arg proto "$proto" '
+      (.port_map // []) | any(.container == $c and .host_ip == $ip and .host_port == $hp and
+        .container_port == $cp and .proto == $proto and .new_port == "")' \
+      "$DM_RESTORE_DECISIONS" >/dev/null 2>&1 || return 1
+    printf '\n'
+  }
+}
+
 dm_capture_command() {
   local output_file="$1"
   shift
@@ -2952,7 +3836,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
           ;;
       esac
       dm_quiet docker rename "$name" "$replacement_backup_name" || {
-        fail_with_output "无法为已有容器 ${name} 建立回滚点（它保持不变）" "$(log_tail_text 10)"
+        fail_with_output "无法先备份已有容器 ${name}（它保持不变）" "$(log_tail_text 10)"
         exit 1
       }
       replacement_active=1
@@ -3204,6 +4088,17 @@ for p in "${port_bindings[@]}"; do
   # 空 HostPort 是 Docker 随机端口分配（如 -p 80 或 -p 0.0.0.0::80），保留空 HostPort 让 Docker 重新随机分配
   [[ -z "$cont_port" ]] && continue
 
+  # 迁移前预检中选择了换端口或不对外开放时，按选择调整。
+  if [[ -n "$host_port" ]] &&
+    decided_port="$(decision_port "$name" "$host_ip" "$host_port" "${cont_port%%/*}" "$([[ "$cont_port" == */* ]] && echo "${cont_port#*/}" || echo tcp)")"; then
+    if [[ -z "$decided_port" ]]; then
+      detail "端口 ${host_port} 按预检时的选择不再对外开放"
+      continue
+    fi
+    detail "端口按预检时的选择改为：${host_port} -> ${decided_port}"
+    host_port="$decided_port"
+  fi
+
   if [[ -z "$host_port" || "$host_port" == "null" ]]; then
     # 随机端口：格式为 -p [ip::]containerPort[/proto]
     host_port=""
@@ -3277,6 +4172,11 @@ if [[ "$primary_net" != "bridge" && "$primary_net" != "host" &&
   # 固定下来，会与目标端同网络的其他容器冲突，也改变了原有配置。
   primary_ip="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv4Address // empty' "$META")"
   primary_ip6="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv6Address // empty' "$META")"
+  if decision_auto_ip "$name" "$primary_net"; then
+    detail "网络 ${primary_net} 中按预检时的选择改为自动分配 IP"
+    primary_ip=""
+    primary_ip6=""
+  fi
   [[ -z "$primary_ip" ]] || args+=(--ip "$primary_ip")
   [[ -z "$primary_ip6" ]] || args+=(--ip6 "$primary_ip6")
   mapfile -t primary_aliases < <(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].Aliases[]? // empty' "$META")
@@ -3319,6 +4219,10 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
     ip6="$(_net '.value.IPAMConfig.IPv6Address // empty')"
     aliases_raw="$(_net '.value.Aliases // empty | join(" ")')"
     conn_args=()
+    if decision_auto_ip "$name" "$net_name"; then
+      ip=""
+      ip6=""
+    fi
     [[ -n "$ip" && "$ip" != "null" ]] && conn_args+=(--ip "$ip")
     [[ -n "$ip6" && "$ip6" != "null" ]] && conn_args+=(--ip6 "$ip6")
     if [[ -n "$aliases_raw" && "$aliases_raw" != "null" ]]; then
@@ -4450,6 +5354,732 @@ restore_container_networks() {
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
+# 迁移前预检：在下载迁移包、改动新服务器之前，根据迁移计划找出会让迁移失败的问题。
+#
+# 问题分三级：
+#   info  只提示，不停下（如 Docker 版本较旧）
+#   ask   会导致迁移失败但可以处理，停下来让用户针对性地选择（如端口被占用）
+#   stop  无法继续（如 CPU 架构不同）
+# 用户的选择写进“恢复决定”文件（JSON），恢复脚本按它执行：换端口、跳过项目、
+# 改为自动分配 IP 等。检查逻辑用 python3 实现（新服务器恢复时本来就需要它）。
+
+# 输出检查结果 JSON：{"issues": [...], "summary": {...}}。
+preflight_collect() {
+  local plan="$1" decisions="$2" base_dir="$3"
+  python3 - "$plan" "$decisions" "$base_dir" <<'PREFLIGHT_PY'
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+plan_path, decisions_path, base_dir = sys.argv[1:4]
+plan = json.load(open(plan_path))
+try:
+    decisions = json.load(open(decisions_path))
+except (OSError, ValueError):
+    decisions = {}
+issues = []
+
+
+def run(cmd):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        return p.returncode, p.stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return 127, ""
+
+
+def human(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            if unit == "B" or n >= 10:
+                return "%d%s" % (n, unit)
+            return ("%.1f" % n).rstrip("0").rstrip(".") + unit
+        n /= 1024
+
+
+def cjk_spaced(text):
+    """中文排版：与英文或数字相邻时加一个空格，与中文或全角符号相邻时不加。"""
+    if not text:
+        return text
+    left = " " if ord(text[0]) < 128 and text[0].isalnum() else ""
+    right = " " if ord(text[-1]) < 128 and text[-1].isalnum() else ""
+    return left + text + right
+
+
+def add(level, kind, title, hint="", **data):
+    item = {"level": level, "type": kind, "title": title, "hint": hint}
+    item.update(data)
+    issues.append(item)
+
+
+def free_bytes(path):
+    path = os.path.abspath(path or "/")
+    while not os.path.exists(path) and path != "/":
+        path = os.path.dirname(path)
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize, os.stat(path).st_dev
+    except OSError:
+        return None, None
+
+
+skip_projects = set(decisions.get("skip_projects", []))
+skip_containers = set(decisions.get("skip_containers", []))
+replace_containers = set(decisions.get("replace_containers", []))
+replace_projects = set(decisions.get("replace_projects", []))
+keep_volumes = set(decisions.get("keep_volumes", []))
+auto_subnet = set(decisions.get("auto_subnet", []))
+reuse_network = set(decisions.get("reuse_network", []))
+auto_ip = {(x.get("container"), x.get("network")) for x in decisions.get("auto_ip", [])}
+port_map = {}
+for item in decisions.get("port_map", []):
+    key = (item.get("container"), item.get("host_ip", ""), str(item.get("host_port")),
+           str(item.get("container_port")), item.get("proto", "tcp"))
+    port_map[key] = str(item.get("new_port", ""))
+
+containers = [c for c in plan.get("containers", [])
+              if c.get("project", "") not in skip_projects and c["name"] not in skip_containers]
+plan_names = {c["name"] for c in containers}
+used_volumes = {v for c in containers for v in c.get("volumes", [])}
+used_binds = {b for c in containers for b in c.get("binds", [])}
+
+# ---------- Docker 环境 ----------
+rc, out = run(["docker", "info", "--format", "{{json .}}"])
+try:
+    info = json.loads(out) if rc == 0 else {}
+except ValueError:
+    info = {}
+
+arch_alias = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64",
+              "armv7l": "arm", "armhf": "arm", "arm": "arm"}
+src_arch = plan.get("source", {}).get("arch", "")
+dst_arch = info.get("Architecture", "") or os.uname().machine
+if src_arch and dst_arch and arch_alias.get(src_arch, src_arch) != arch_alias.get(dst_arch, dst_arch):
+    add("stop", "arch",
+        "两台服务器的 CPU 类型不同：旧服务器是 %s，新服务器是 %s" % (src_arch, dst_arch),
+        "容器镜像只能在相同 CPU 类型的服务器上运行，请换一台和旧服务器相同类型的服务器")
+
+
+def version_tuple(v):
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(x) for x in nums[:2]) if len(nums) >= 2 else None
+
+
+src_ver = plan.get("source", {}).get("docker", "")
+dst_ver = info.get("ServerVersion", "")
+if version_tuple(src_ver) and version_tuple(dst_ver) and version_tuple(dst_ver) < version_tuple(src_ver):
+    add("info", "docker_version",
+        "新服务器的 Docker（%s）比旧服务器（%s）旧，一般不影响迁移" % (dst_ver, src_ver))
+
+if any(c.get("project") for c in containers):
+    has_plugin = run(["docker", "compose", "version"])[0] == 0
+    if not has_plugin and not shutil.which("docker-compose"):
+        add("stop", "compose",
+            "要迁移 Compose 项目，但新服务器没有安装 Docker Compose",
+            "先安装 Docker Compose（例如 apt install docker-compose-plugin）再重试")
+
+runtimes = set((info.get("Runtimes") or {}).keys())
+for c in containers:
+    rt = c.get("runtime", "")
+    if rt and rt != "runc" and runtimes and rt not in runtimes:
+        add("stop", "runtime", "容器 %s 需要 %s 运行环境，新服务器没有安装" % (c["name"], rt),
+            "先在新服务器安装它（例如 NVIDIA 显卡需要安装 NVIDIA Container Toolkit）再重试")
+    for dev in c.get("devices", []):
+        if dev and not os.path.exists(dev):
+            add("stop", "device", "容器 %s 需要设备 %s，新服务器上没有" % (c["name"], dev),
+                "确认新服务器有这个硬件并已安装驱动")
+
+volume_plugins = set((info.get("Plugins") or {}).get("Volume") or [])
+for v in plan.get("volumes", []):
+    if v["name"] not in used_volumes:
+        continue
+    driver = v.get("driver", "local")
+    if driver != "local" and volume_plugins and driver not in volume_plugins:
+        add("stop", "volume_plugin", "数据卷 %s 使用 %s 插件存储，新服务器没有安装这个插件" % (v["name"], driver),
+            "先在新服务器安装 %s 卷插件再重试" % driver)
+
+mem_total = info.get("MemTotal") or 0
+mem_need = sum(int(c.get("memory") or 0) for c in containers)
+if mem_total and mem_need > mem_total:
+    add("info", "memory", "容器设置的内存上限合计 %s，超过新服务器的内存 %s，内存紧张时容器可能被系统结束"
+        % (human(mem_need), human(mem_total)))
+
+# ---------- 磁盘空间 ----------
+sizes = plan.get("sizes", {})
+bundle = int(sizes.get("bundle") or 0)
+kept_volume_bytes = sum(int(v.get("bytes") or 0) for v in plan.get("volumes", [])
+                        if v["name"] in keep_volumes or v["name"] not in used_volumes)
+docker_need = int(sizes.get("images") or 0) + int(sizes.get("volumes") or 0) - kept_volume_bytes
+# 在已解压的迁移包里手动恢复时，下载和解压所需空间已经用掉了，不再计算。
+skip_base = os.environ.get("PREFLIGHT_SKIP_BASE_DISK") == "1"
+if skip_base:
+    bundle = 0
+base_need = 2 * bundle
+base_free, base_dev = free_bytes(base_dir)
+root_free, root_dev = free_bytes(info.get("DockerRootDir") or "/var/lib/docker")
+if base_free is not None and root_free is not None and base_dev == root_dev:
+    # 同一块磁盘：解压出的迁移包与加载后的镜像、数据卷会同时存在。
+    total = max(base_need, bundle + docker_need)
+    if base_free < total:
+        add("ask", "disk_base",
+            "磁盘空间不够：迁移需要约 %s，%s 所在磁盘只剩 %s" % (human(total), base_dir, human(base_free)),
+            "清理磁盘后重新检查，或换一个空间更大的磁盘存放下载文件",
+            need=total, free=base_free)
+    elif base_free < total * 1.2:
+        add("info", "disk_tight", "磁盘空间偏紧：迁移需要约 %s，剩余 %s" % (human(total), human(base_free)))
+else:
+    if base_free is not None and base_free < base_need:
+        add("ask", "disk_base",
+            "磁盘空间不够：下载和解压需要约 %s，%s 所在磁盘只剩 %s" % (human(base_need), base_dir, human(base_free)),
+            "清理磁盘后重新检查，或换一个空间更大的磁盘存放下载文件",
+            need=base_need, free=base_free)
+    root = info.get("DockerRootDir") or "/var/lib/docker"
+    if root_free is not None and root_free < docker_need:
+        add("ask", "disk_docker",
+            "磁盘空间不够：Docker 存放镜像和数据卷需要约 %s，%s 所在磁盘只剩 %s" % (human(docker_need), root, human(root_free)),
+            "清理磁盘后重新检查（docker system prune 可以清理不用的镜像和容器）",
+            need=docker_need, free=root_free)
+
+for b in plan.get("binds", []):
+    if b["host"] not in used_binds and (not b.get("link") or b["link"] not in used_binds):
+        continue
+    need = int(b.get("bytes") or 0)
+    free, _ = free_bytes(b["host"])
+    if free is not None and need and free < need:
+        add("ask", "disk_bind",
+            "磁盘空间不够：目录 %s 需要约 %s，所在磁盘只剩 %s" % (b["host"], human(need), human(free)),
+            "清理这块磁盘后重新检查", need=need, free=free)
+
+# ---------- 已有的同名容器、Compose 项目、数据卷 ----------
+rc, out = run(["docker", "ps", "-a", "--format",
+               '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Ports}}'])
+existing = {}
+for line in out.splitlines():
+    parts = line.split("\t")
+    if len(parts) >= 3:
+        existing[parts[0]] = {"project": parts[1], "ports": parts[2]}
+existing_projects = {e["project"] for e in existing.values() if e["project"]}
+policy = os.environ.get("RESTORE_EXISTING", "")
+
+for c in containers:
+    if c.get("project") or c["name"] not in existing or c["name"] in replace_containers:
+        continue
+    if policy == "fail":
+        add("stop", "existing_container", "新服务器上已经有同名容器 %s（RESTORE_EXISTING=fail 不允许替换）" % c["name"],
+            "删除这个容器，或改用 RESTORE_EXISTING=replace")
+    elif policy not in ("replace", "skip"):
+        add("ask", "existing_container", "新服务器上已经有同名容器 %s" % c["name"], container=c["name"])
+for project in sorted({c["project"] for c in containers if c.get("project")}):
+    if project not in existing_projects or project in replace_projects:
+        continue
+    if policy == "fail":
+        add("stop", "existing_project", "新服务器上已经有同名的 Compose 项目 %s（RESTORE_EXISTING=fail 不允许替换）" % project,
+            "删除这个项目的容器，或改用 RESTORE_EXISTING=replace")
+    elif policy not in ("replace", "skip"):
+        add("ask", "existing_project", "新服务器上已经有同名的 Compose 项目 %s" % project, project=project)
+
+for v in plan.get("volumes", []):
+    if v["name"] not in used_volumes or v["name"] in keep_volumes:
+        continue
+    rc, out = run(["docker", "volume", "inspect", v["name"]])
+    if rc != 0:
+        continue
+    try:
+        cur = json.loads(out)[0]
+    except (ValueError, IndexError):
+        continue
+    if (cur.get("Driver") or "local") != v.get("driver", "local") or (cur.get("Options") or {}) != (v.get("opts") or {}):
+        add("ask", "volume_mismatch",
+            "新服务器已有同名数据卷 %s，但它的存储方式和旧服务器不同" % v["name"], volume=v["name"])
+    else:
+        add("info", "volume_replace", "数据卷 %s 已存在，迁移的数据会替换它（失败时自动还原）" % v["name"])
+
+# ---------- 网络 ----------
+target_nets = {}
+rc, out = run(["docker", "network", "ls", "-q"])
+ids = out.split()
+if ids:
+    rc, out = run(["docker", "network", "inspect"] + ids)
+    try:
+        for n in json.loads(out) if rc == 0 else []:
+            target_nets[n["Name"]] = {
+                "driver": n.get("Driver", ""),
+                "subnets": [c.get("Subnet") for c in (n.get("IPAM") or {}).get("Config") or [] if c.get("Subnet")],
+                "ips": {(v.get("IPv4Address") or "").split("/")[0]: v.get("Name", "")
+                        for v in (n.get("Containers") or {}).values()},
+            }
+    except ValueError:
+        pass
+
+plan_nets = {n["name"]: n for n in plan.get("networks", [])}
+used_nets = {net["name"] for c in containers for net in c.get("networks", [])}
+for name, net in plan_nets.items():
+    if name not in used_nets or name in ("bridge", "host", "none") or net.get("compose"):
+        continue
+    if net.get("driver") in ("macvlan", "ipvlan"):
+        add("info", "macvlan", "网络 %s 使用 %s，需要新服务器的网卡名称和旧服务器一致" % (name, net["driver"]))
+    if name in reuse_network or name in auto_subnet:
+        continue
+    wanted = [s for s in net.get("subnets", []) if s]
+    if name in target_nets:
+        have = target_nets[name]
+        if sorted(have["subnets"]) != sorted(wanted) or have["driver"] != net.get("driver", "bridge"):
+            add("ask", "network_mismatch",
+                "新服务器已有同名网络 %s，但网段不同（旧服务器 %s，新服务器 %s）"
+                % (name, "、".join(wanted) or "自动", "、".join(have["subnets"]) or "自动"), network=name)
+        continue
+    for subnet in wanted:
+        try:
+            mine = ipaddress.ip_network(subnet, strict=False)
+        except ValueError:
+            continue
+        clash = None
+        for other, have in target_nets.items():
+            for s in have["subnets"]:
+                try:
+                    if mine.overlaps(ipaddress.ip_network(s, strict=False)):
+                        clash = (other, s)
+                except (ValueError, TypeError):
+                    pass
+        if clash:
+            add("ask", "subnet_conflict",
+                "网络 %s 要用的网段 %s 和新服务器上的网络 %s（%s）重叠" % (name, subnet, clash[0], clash[1]),
+                network=name)
+            break
+
+for c in containers:
+    for net in c.get("networks", []):
+        ip = net.get("ip", "")
+        name = net["name"]
+        if not ip or name in reuse_network or name in auto_subnet or (c["name"], name) in auto_ip:
+            continue
+        holder = target_nets.get(name, {}).get("ips", {}).get(ip)
+        if holder and holder != c["name"] and holder not in plan_names:
+            add("ask", "ip_conflict", "网络 %s 中的 IP %s 已被容器 %s 使用，容器 %s 需要它" % (name, ip, holder, c["name"]),
+                container=c["name"], network=name)
+
+# ---------- 端口 ----------
+WILD = {"", "0.0.0.0", "::", "*", "[::]"}
+
+
+def parse_listeners():
+    found = []
+    tool = None
+    for proto, flag in (("tcp", "-Hltnp"), ("udp", "-Hlunp")):
+        rc, out = run(["ss", flag])
+        if rc != 0:
+            rc, out = run(["ss", flag.replace("p", "")])
+        if rc != 0:
+            continue
+        tool = "ss"
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) < 5:
+                continue
+            local = cols[3]
+            host, _, port = local.rpartition(":")
+            host = host.strip("[]").split("%")[0]
+            proc = ""
+            m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
+            if m:
+                proc = "%s（进程 %s）" % (m.group(1), m.group(2))
+            if port.isdigit():
+                found.append((proto, host, port, proc))
+    return tool, found
+
+
+tool, listeners = parse_listeners()
+docker_ports = {}
+for cname, e in existing.items():
+    for m in re.finditer(r"([0-9a-fA-F:.\[\]]*):(\d+)->\d+/(tcp|udp)", e["ports"]):
+        docker_ports.setdefault((m.group(3), m.group(2)), cname)
+
+
+def port_holder(proto, host_ip, port):
+    owner = docker_ports.get((proto, port))
+    if owner:
+        return "容器 %s" % owner, owner
+    for p, host, lport, proc in listeners:
+        if p == proto and lport == port and (host_ip in WILD or host in WILD or host == host_ip):
+            if "docker-proxy" in proc:
+                continue
+            return proc or "其他程序", None
+    return None, None
+
+
+requested = set()
+for c in containers:
+    if c.get("network_mode", "") == "host" or c.get("network_mode", "").startswith("container:"):
+        continue
+    for p in c.get("ports", []):
+        key = (c["name"], p.get("host_ip", ""), str(p["host_port"]), str(p["container_port"]), p.get("proto", "tcp"))
+        port = port_map.get(key, str(p["host_port"]))
+        if not port:
+            continue
+        requested.add((p.get("proto", "tcp"), port))
+        holder, owner = port_holder(p.get("proto", "tcp"), p.get("host_ip", ""), port)
+        if not holder:
+            continue
+        # 占用端口的正是将被替换的同名容器：恢复时它会先停止，不算冲突。
+        if owner and owner in plan_names:
+            continue
+        busy = {(pr, po) for pr, _, po, _ in listeners} | set(docker_ports.keys()) | requested
+        suggest = next((str(x) for x in range(int(port) + 1, min(int(port) + 200, 65536))
+                        if (p.get("proto", "tcp"), str(x)) not in busy), "")
+        add("ask", "port",
+            "端口 %s 已被%s占用，%s需要使用它" % (port, cjk_spaced(holder),
+                ("Compose 项目 %s 的容器 %s " % (c["project"], c["name"])) if c.get("project") else ("容器 %s " % c["name"])),
+            container=c["name"], project=c.get("project", ""), host_ip=p.get("host_ip", ""),
+            host_port=str(p["host_port"]), current_port=port, container_port=str(p["container_port"]),
+            proto=p.get("proto", "tcp"), holder=holder, suggest=suggest)
+if tool is None and any(c.get("ports") for c in containers):
+    add("info", "port_unchecked", "新服务器没有 ss 命令，无法提前检查端口是否被占用")
+
+need = max(base_need, bundle + docker_need)
+json.dump({"issues": issues, "summary": {"containers": len(containers), "need_bytes": need}},
+          sys.stdout, ensure_ascii=False)
+PREFLIGHT_PY
+}
+
+# ---------- 恢复决定文件 ----------
+
+preflight_decide() {
+  local file="$1" filter="$2"
+  shift 2
+  local tmp="${file}.tmp.$$"
+  [[ -s "$file" ]] || printf '{}\n' >"$file"
+  jq "$@" "$filter" "$file" >"$tmp" && mv "$tmp" "$file"
+}
+
+# 读取一个选项编号；回车选默认值。非交互时直接使用默认值。
+preflight_choose() {
+  local max="$1" default="$2" answer
+  while :; do
+    printf '请选择 [%s]：' "$default" >&2
+    read -r answer </dev/tty || answer=""
+    answer="${answer:-$default}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] && ((answer >= 1 && answer <= max)); then
+      printf '%s\n' "$answer"
+      return 0
+    fi
+    printf '请输入 1 到 %s 之间的数字。\n' "$max" >&2
+  done
+}
+
+preflight_option() {
+  printf '  %s) %s\n' "$1" "$2" >&2
+}
+
+# 处理一个“需要用户选择”的问题。返回 0 表示已处理（或选择了重新检查），
+# 返回 1 表示用户选择取消。auto=1 时自动采用推荐做法，无法自动处理时返回 1。
+preflight_resolve() {
+  local issue="$1" decisions="$2" index="$3" total="$4" auto="$5"
+  local kind title choice container project port new_port network volume
+  kind="$(jq -r '.type' <<<"$issue")"
+  title="$(jq -r '.title' <<<"$issue")"
+  container="$(jq -r '.container // ""' <<<"$issue")"
+  project="$(jq -r '.project // ""' <<<"$issue")"
+  network="$(jq -r '.network // ""' <<<"$issue")"
+  volume="$(jq -r '.volume // ""' <<<"$issue")"
+
+  if [[ "$auto" != "1" ]]; then
+    printf '\n问题 %s/%s：' "$index" "$total" >&2
+  fi
+  case "$kind" in
+    port)
+      port="$(jq -r '.current_port' <<<"$issue")"
+      new_port="$(jq -r '.suggest // ""' <<<"$issue")"
+      if [[ -n "$project" ]]; then
+        if [[ "$auto" == "1" ]]; then
+          log_line "无法自动处理：${title}"
+          return 1
+        fi
+        printf '%s\n' "$(screen_color '1;33' "⚠️  端口被占用，Compose 项目 ${project} 无法启动")" >&2
+        printf '  %s\n' "$title" >&2
+        printf '  请自行停止占用端口的程序，或修改 %s 的 compose 文件中的端口后再继续。\n' "$project" >&2
+        preflight_option 1 "我已处理好，重新检查（推荐）"
+        preflight_option 2 "暂时跳过 ${project} 项目，继续迁移其他容器"
+        preflight_option 3 "取消恢复"
+        choice="$(preflight_choose 3 1)"
+        case "$choice" in
+          2) preflight_decide "$decisions" '.skip_projects = ((.skip_projects // []) + [$p] | unique) |
+               .skipped_reasons = ((.skipped_reasons // []) + [{project: $p, reason: $r}])' \
+            --arg p "$project" --arg r "端口 ${port} 被占用" ;;
+          3) return 1 ;;
+        esac
+        return 0
+      fi
+      if [[ "$auto" == "1" ]]; then
+        [[ -n "$new_port" ]] || return 1
+        choice=1
+      else
+        printf '%s\n' "$title" >&2
+        if [[ -n "$new_port" ]]; then
+          preflight_option 1 "改用空闲端口 ${new_port}（推荐）"
+        else
+          preflight_option 1 "改用其他端口（附近没有找到空闲端口，需要手动输入）"
+        fi
+        preflight_option 2 "输入其他端口"
+        preflight_option 3 "我先停掉占用端口的程序，然后重新检查"
+        preflight_option 4 "不对外开放这个端口"
+        preflight_option 5 "取消恢复"
+        choice="$(preflight_choose 5 1)"
+      fi
+      if [[ "$choice" == 1 && -z "$new_port" ]] || [[ "$choice" == 2 ]]; then
+        while :; do
+          printf '新端口：' >&2
+          read -r new_port </dev/tty || new_port=""
+          [[ "$new_port" =~ ^[0-9]+$ ]] && ((new_port >= 1 && new_port <= 65535)) && break
+          printf '请输入 1 到 65535 之间的端口号。\n' >&2
+        done
+        choice=1
+      fi
+      case "$choice" in
+        1 | 4)
+          [[ "$choice" == 1 ]] || new_port=""
+          preflight_decide "$decisions" '
+            .port_map = ([(.port_map // [])[] | select((.container == $c and .host_ip == $ip and
+              .host_port == $hp and .container_port == $cp and .proto == $proto) | not)] +
+              [{container: $c, host_ip: $ip, host_port: $hp, container_port: $cp, proto: $proto, new_port: $np}])' \
+            --arg c "$container" --arg ip "$(jq -r '.host_ip' <<<"$issue")" \
+            --arg hp "$(jq -r '.host_port' <<<"$issue")" --arg cp "$(jq -r '.container_port' <<<"$issue")" \
+            --arg proto "$(jq -r '.proto' <<<"$issue")" --arg np "$new_port"
+          ;;
+        5) return 1 ;;
+      esac
+      ;;
+    existing_container | existing_project)
+      if [[ "$auto" == "1" ]]; then
+        choice=1
+      else
+        printf '%s\n' "$title" >&2
+        preflight_option 1 "替换它（推荐，迁移失败时会自动还原）"
+        if [[ "$kind" == existing_project ]]; then
+          preflight_option 2 "保留已有的，跳过这个项目"
+        else
+          preflight_option 2 "保留已有的，跳过这个容器"
+        fi
+        preflight_option 3 "取消恢复"
+        choice="$(preflight_choose 3 1)"
+      fi
+      case "$kind:$choice" in
+        existing_container:1) preflight_decide "$decisions" '.replace_containers = ((.replace_containers // []) + [$c] | unique)' --arg c "$container" ;;
+        existing_container:2) preflight_decide "$decisions" '.skip_containers = ((.skip_containers // []) + [$c] | unique) |
+          .skipped_reasons = ((.skipped_reasons // []) + [{container: $c, reason: "保留新服务器上已有的容器"}])' --arg c "$container" ;;
+        existing_project:1) preflight_decide "$decisions" '.replace_projects = ((.replace_projects // []) + [$p] | unique)' --arg p "$project" ;;
+        existing_project:2) preflight_decide "$decisions" '.skip_projects = ((.skip_projects // []) + [$p] | unique) |
+          .skipped_reasons = ((.skipped_reasons // []) + [{project: $p, reason: "保留新服务器上已有的项目"}])' --arg p "$project" ;;
+        *:3) return 1 ;;
+      esac
+      ;;
+    ip_conflict | subnet_conflict | network_mismatch)
+      if [[ "$auto" == "1" ]]; then
+        choice=1
+      else
+        printf '%s\n' "$title" >&2
+        case "$kind" in
+          ip_conflict) preflight_option 1 "改为由 Docker 自动分配 IP（推荐）" ;;
+          subnet_conflict) preflight_option 1 "让 Docker 自动选择一个不冲突的网段，网络里的容器改为自动分配 IP（推荐）" ;;
+          network_mismatch) preflight_option 1 "继续使用新服务器上已有的这个网络，容器改为自动分配 IP（推荐）" ;;
+        esac
+        preflight_option 2 "取消恢复"
+        choice="$(preflight_choose 2 1)"
+      fi
+      [[ "$choice" == 1 ]] || return 1
+      case "$kind" in
+        ip_conflict) preflight_decide "$decisions" '.auto_ip = ((.auto_ip // []) + [{container: $c, network: $n}] | unique)' \
+          --arg c "$container" --arg n "$network" ;;
+        subnet_conflict) preflight_decide "$decisions" '.auto_subnet = ((.auto_subnet // []) + [$n] | unique)' --arg n "$network" ;;
+        network_mismatch) preflight_decide "$decisions" '.reuse_network = ((.reuse_network // []) + [$n] | unique)' --arg n "$network" ;;
+      esac
+      ;;
+    volume_mismatch)
+      [[ "$auto" != "1" ]] || return 1
+      printf '%s\n' "$title" >&2
+      preflight_option 1 "取消恢复，我先处理这个数据卷（推荐）"
+      preflight_option 2 "保留已有的数据卷，不写入迁移过来的数据"
+      choice="$(preflight_choose 2 1)"
+      [[ "$choice" == 2 ]] || return 1
+      preflight_decide "$decisions" '.keep_volumes = ((.keep_volumes // []) + [$v] | unique)' --arg v "$volume"
+      ;;
+    disk_base)
+      [[ "$auto" != "1" ]] || return 1
+      printf '%s\n' "$title" >&2
+      preflight_option 1 "我先清理磁盘，然后重新检查（推荐）"
+      preflight_option 2 "换一个目录存放下载文件"
+      preflight_option 3 "取消恢复"
+      choice="$(preflight_choose 3 1)"
+      case "$choice" in
+        2)
+          local dir
+          printf '目录（例如 /data/restore）：' >&2
+          read -r dir </dev/tty || dir=""
+          [[ "$dir" == /* ]] && preflight_decide "$decisions" '.restore_base = $d' --arg d "$dir"
+          ;;
+        3) return 1 ;;
+      esac
+      ;;
+    disk_docker | disk_bind | *)
+      [[ "$auto" != "1" ]] || return 1
+      printf '%s\n' "$title" >&2
+      preflight_option 1 "我先清理磁盘，然后重新检查（推荐）"
+      preflight_option 2 "取消恢复"
+      choice="$(preflight_choose 2 1)"
+      [[ "$choice" == 1 ]] || return 1
+      ;;
+  esac
+  return 0
+}
+
+# 运行预检，交互地处理问题，直到没有需要处理的问题。
+# 返回 0 可以继续；返回 1 不能继续（失败原因已记录）。
+# PREFLIGHT_NEED_BYTES、PREFLIGHT_CONTAINERS 会被设置，供阶段结果显示。
+preflight_run() {
+  local plan="$1" decisions="$2" base_dir="$3"
+  local result asks stops i total row interactive=0 auto="${RESTORE_AUTO_RESOLVE:-0}" round=0
+  local -A shown_infos=()
+  [[ -s "$decisions" ]] || printf '{}\n' >"$decisions"
+  if [[ -t 0 || -r /dev/tty ]] && [[ -t 2 ]]; then
+    interactive=1
+  fi
+  while :; do
+    round=$((round + 1))
+    base_dir="$(jq -r --arg d "$base_dir" '.restore_base // $d' "$decisions")"
+    if ! result="$(preflight_collect "$plan" "$decisions" "$base_dir" 2>>"${DM_LOG_FILE:-/dev/null}")"; then
+      log_line "预检脚本运行失败，跳过预检"
+      warn_user "预检没能完成，直接开始迁移（问题会在迁移过程中发现并自动回滚）"
+      return 0
+    fi
+    log_line "预检结果（第 ${round} 轮）：${result}"
+    # 供调用方在阶段结果中显示。
+    export PREFLIGHT_NEED_BYTES PREFLIGHT_CONTAINERS
+    PREFLIGHT_NEED_BYTES="$(jq -r '.summary.need_bytes // 0' <<<"$result")"
+    PREFLIGHT_CONTAINERS="$(jq -r '.summary.containers // 0' <<<"$result")"
+    while IFS= read -r row; do
+      [[ -n "$row" && -z "${shown_infos[$row]:-}" ]] || continue
+      shown_infos["$row"]=1
+      warn_user "$row"
+    done < <(jq -r '.issues[] | select(.level == "info") | .title' <<<"$result")
+
+    stops="$(jq -c '[.issues[] | select(.level == "stop")]' <<<"$result")"
+    if [[ "$(jq 'length' <<<"$stops")" -gt 0 ]]; then
+      stage_hold
+      printf '%s\n' "$(screen_color '1;31' '发现无法继续的问题，尚未下载或修改任何内容：')" >&2
+      while IFS=$'\t' read -r row hint; do
+        printf '  ✗ %s\n' "$row" >&2
+        [[ -z "$hint" ]] || printf '    建议：%s\n' "$hint" >&2
+      done < <(jq -r '.[] | [.title, .hint] | @tsv' <<<"$stops")
+      fail_reason "$(jq -r '.[0].title' <<<"$stops")" "$(jq -r '.[0].hint' <<<"$stops")"
+      return 1
+    fi
+
+    asks="$(jq -c '[.issues[] | select(.level == "ask")]' <<<"$result")"
+    total="$(jq 'length' <<<"$asks")"
+    ((total > 0)) || return 0
+
+    if ((interactive == 0)) && [[ "$auto" != "1" ]]; then
+      stage_hold
+      printf '%s\n' "$(screen_color '1;33' "发现 ${total} 个需要处理的问题，尚未下载或修改任何内容：")" >&2
+      while IFS=$'\t' read -r row hint; do
+        printf '  ! %s\n' "$row" >&2
+        [[ -z "$hint" ]] || printf '    建议：%s\n' "$hint" >&2
+      done < <(jq -r '.[] | [.title, .hint] | @tsv' <<<"$asks")
+      printf '处理后重新运行即可；也可以设置 RESTORE_AUTO_RESOLVE=1，自动采用推荐的处理方式（例如自动换一个空闲端口）。\n' >&2
+      fail_reason "$(jq -r '.[0].title' <<<"$asks")" \
+        "处理后重新运行；或设置 RESTORE_AUTO_RESOLVE=1 自动采用推荐做法（如自动换端口）"
+      return 1
+    fi
+
+    if ((interactive == 1)) && [[ "$auto" != "1" ]]; then
+      stage_hold
+      printf '%s\n' "$(screen_color '1;33' "发现 ${total} 个需要处理的问题（尚未下载或修改任何内容）")" >&2
+    fi
+    for ((i = 0; i < total; i++)); do
+      if ! preflight_resolve "$(jq -c ".[$i]" <<<"$asks")" "$decisions" "$((i + 1))" "$total" \
+        "$([[ "$auto" == "1" ]] && echo 1 || echo 0)"; then
+        fail_reason "$(jq -r ".[$i].title" <<<"$asks")" \
+          "$([[ "$auto" == "1" ]] && echo "这个问题无法自动处理，请手动处理后重新运行" || echo "处理后重新粘贴同一个链接即可继续")"
+        return 1
+      fi
+    done
+    # 自动处理只做一轮：再次检查仍有问题时交给用户。
+    if [[ "$auto" == "1" ]] && ((round >= 2)); then
+      auto=0
+      ((interactive == 1)) || {
+        fail_reason "自动处理后仍有问题没有解决" "查看日志了解详情"
+        return 1
+      }
+    fi
+    printf '\n重新检查……\n' >&2
+  done
+}
+
+# 恢复结果中列出预检时做的调整，让用户知道哪些地方和旧服务器不同。
+print_decision_summary() {
+  local decisions="${1:-}"
+  [[ -n "$decisions" && -s "$decisions" ]] || return 0
+  jq -r '
+    ([.port_map[]? | if .new_port == "" then
+        "不再对外开放：\(.container) 的端口 \(.host_port)"
+      else "端口变更：\(.container) \(.host_port) → \(.new_port)" end]) +
+    ([.skipped_reasons[]? | if .project then "⚠️ 未迁移：Compose 项目 \(.project)（\(.reason)）"
+      else "⚠️ 未迁移：容器 \(.container)（\(.reason)）" end]) +
+    ([.auto_ip[]? | "自动分配 IP：\(.container) 在网络 \(.network) 中"]) +
+    ([.auto_subnet[]? | "自动选择网段：网络 \(.)"]) +
+    ([.reuse_network[]? | "沿用新服务器已有网络：\(.)"]) +
+    ([.keep_volumes[]? | "保留已有数据卷、未写入迁移数据：\(.)"]) | .[]' "$decisions" 2>/dev/null
+  if jq -e '(.skipped_reasons // []) | any(.project)' "$decisions" >/dev/null 2>&1; then
+    printf '   处理好之后，在新服务器重新粘贴同一个链接即可补上（旧服务器的传输服务需要仍在运行）。\n'
+  fi
+}
+
+# 恢复决定：迁移前预检中用户（或 RESTORE_AUTO_RESOLVE）做出的选择，由
+# DM_RESTORE_DECISIONS 指向的 JSON 文件传给恢复脚本与单容器恢复脚本。
+# 没有这个文件时所有查询都返回“没有特别决定”，恢复按原配置进行。
+
+decisions_present() {
+  [[ -n "${DM_RESTORE_DECISIONS:-}" && -s "${DM_RESTORE_DECISIONS}" ]]
+}
+
+# decision_listed 列表名 值：值是否在决定文件的某个列表里（如 skip_projects）。
+decision_listed() {
+  decisions_present || return 1
+  jq -e --arg k "$1" --arg v "$2" '(.[$k] // []) | index($v) != null' \
+    "$DM_RESTORE_DECISIONS" >/dev/null 2>&1
+}
+
+# 容器在某个网络中是否改为自动分配 IP（单独选择、网段改为自动或沿用已有网络时都是）。
+decision_auto_ip() {
+  local container="$1" network="$2"
+  decisions_present || return 1
+  jq -e --arg c "$container" --arg n "$network" '(.auto_ip // []) | any(.container == $c and .network == $n)' \
+    "$DM_RESTORE_DECISIONS" >/dev/null 2>&1 ||
+    decision_listed auto_subnet "$network" || decision_listed reuse_network "$network"
+}
+
+# 端口映射的新宿主机端口；输出为空表示不再对外开放；没有调整时返回 1。
+decision_port() {
+  local container="$1" host_ip="$2" host_port="$3" container_port="$4" proto="$5"
+  decisions_present || return 1
+  jq -er --arg c "$container" --arg ip "$host_ip" --arg hp "$host_port" \
+    --arg cp "$container_port" --arg proto "$proto" '
+    [(.port_map // [])[] | select(.container == $c and .host_ip == $ip and .host_port == $hp and
+      .container_port == $cp and .proto == $proto) | .new_port] | first // empty | tostring' \
+    "$DM_RESTORE_DECISIONS" 2>/dev/null || {
+    jq -e --arg c "$container" --arg ip "$host_ip" --arg hp "$host_port" \
+      --arg cp "$container_port" --arg proto "$proto" '
+      (.port_map // []) | any(.container == $c and .host_ip == $ip and .host_port == $hp and
+        .container_port == $cp and .proto == $proto and .new_port == "")' \
+      "$DM_RESTORE_DECISIONS" >/dev/null 2>&1 || return 1
+    printf '\n'
+  }
+}
+
 # 细节写入日志（--verbose 时也显示）；回滚等需要用户看到的过程用 warn。
 say() { detail "$*"; }
 warn() {
@@ -4532,11 +6162,11 @@ restore_print_final_result() {
       ;;
     FAILED_ROLLED_BACK)
       printf '结果：❌ 恢复失败，已安全回滚\n失败阶段：%s\n' "$RESTORE_STAGE"
-      printf '目标端状态：旧服务与原数据已恢复\n诊断目录：%s\n' "$BUNDLE_DIR"
+      printf '新服务器：原来的服务和数据已还原\n诊断目录：%s\n' "$BUNDLE_DIR"
       ;;
     INTERRUPTED_ROLLED_BACK)
       printf '结果：⚠️ 恢复已中断，已安全回滚\n中断阶段：%s\n' "$RESTORE_STAGE"
-      printf '目标端状态：旧服务与原数据已恢复\n诊断目录：%s\n' "$BUNDLE_DIR"
+      printf '新服务器：原来的服务和数据已还原\n诊断目录：%s\n' "$BUNDLE_DIR"
       ;;
     FAILED_ROLLBACK_INCOMPLETE | INTERRUPTED_ROLLBACK_INCOMPLETE)
       if [[ "$status" == INTERRUPTED_* ]]; then
@@ -4561,6 +6191,7 @@ restore_print_final_result() {
       ;;
   esac
   printf '耗时：%s\n' "$elapsed"
+  print_decision_summary "${DM_RESTORE_DECISIONS:-}"
   if [[ "$status" != "SUCCESS" ]]; then
     print_warning_summary
     print_failure_details
@@ -4654,7 +6285,7 @@ compose_capture_rollback_metadata() {
       [[ -n "$file" ]] || continue
       [[ "$file" == /* ]] || file="${old_wdir}/${file}"
       [[ -f "$file" ]] || {
-        warn " · 目标端旧 Compose 配置不存在，无法建立回滚点：$file"
+        warn " · 新服务器上已有项目的 Compose 文件找不到（${file}），无法先备份它，已停止"
         return 1
       }
       config_args+=(-f "$file")
@@ -4664,12 +6295,12 @@ compose_capture_rollback_metadata() {
   if [[ -n "$old_wdir" ]]; then
     if ! (cd "$old_wdir" && compose_run -p "$project" "${config_args[@]}" config) \
       >"${rollback_dir}/config.yml" 2>/dev/null; then
-      warn " · 无法解析目标端旧 Compose 配置，拒绝破坏性替换：$project"
+      warn " · 新服务器上已有的 Compose 项目 ${project} 配置无法读取，为避免损坏它，已停止"
       return 1
     fi
   elif ! compose_run -p "$project" "${config_args[@]}" config \
     >"${rollback_dir}/config.yml" 2>/dev/null; then
-    warn " · 目标端缺少 Compose 工作目录，无法建立回滚点：$project"
+    warn " · 新服务器上已有的 Compose 项目 ${project} 找不到所在目录，无法先备份它，已停止"
     return 1
   fi
 
@@ -4679,7 +6310,7 @@ compose_capture_rollback_metadata() {
   for id in "${ids[@]}"; do
     service="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$id" 2>/dev/null || true)"
     [[ -n "$service" ]] || {
-      warn " · 目标端容器缺少 Compose service 标签：$id"
+      warn " · 新服务器上的容器 ${id} 缺少 Compose 服务名，无法备份"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
     }
@@ -4702,14 +6333,14 @@ compose_capture_rollback_images() {
   while IFS=$'\t' read -r service state id; do
     [[ -n "$service" && -n "$id" ]] || continue
     if ! docker container inspect "$id" >/dev/null 2>&1; then
-      warn " · 目标端旧 Compose 容器在建立回滚镜像前消失：$service"
+      warn " · 备份过程中，新服务器上的 Compose 服务 ${service} 的容器不见了"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
     fi
     image="docker-migrate-rollback:${id:0:12}-$$"
     if ! run_with_activity "创建 Compose 回滚镜像：$service" \
       dm_quiet docker commit "$id" "$image"; then
-      warn " · 目标端容器回滚镜像创建失败：$service"
+      warn " · Compose 服务 ${service} 的容器没能备份"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
     fi
@@ -5069,7 +6700,7 @@ restore_volume_exact() {
   [[ "$prechecked" == "1" ]] || archive_members_safe "${archive_dir}/${archive_file}" || return 1
   mkdir -p "$rollback_dir"
   if ((existed == 1)); then
-    printf '备份目标端原卷数据：%s\n' "$volume" >&2
+    printf '先备份新服务器上原有的数据卷：%s\n' "$volume" >&2
     if ! docker run --rm \
       -v "${volume}:/from:ro" \
       -v "${rollback_dir}:/rollback" \
@@ -5092,7 +6723,7 @@ restore_volume_exact() {
     return 0
   fi
 
-  warn " 卷恢复失败，正在回滚目标端原数据：$volume"
+  warn " 数据卷 ${volume} 恢复失败，正在还原原来的数据"
   if [[ -n "${RESTORE_TRANSACTION_DIR:-}" ]]; then
     # 全局事务持有回滚包；不要提前删除，让统一回滚按确定顺序处理。
     return 1
@@ -5241,11 +6872,11 @@ restore_bind_link() {
     current="$(root_exec readlink -f "$link" 2>/dev/null || true)"
     [[ -z "$current" || "$current" != "$(root_exec readlink -f "$host" 2>/dev/null || true)" ]] ||
       return 0
-    warn " 目标端已有同名软链接但指向不同：$link -> ${current:-未知}（期望 $host）"
+    warn " 新服务器上已有同名软链接 ${link}，但它指向 ${current:-未知}（应该指向 ${host}）"
     return 1
   fi
   if root_exec test -e "$link"; then
-    warn " 目标端 $link 已存在且不是软链接，无法指向迁移的数据目录：$host"
+    warn " 新服务器上的 ${link} 已存在且不是软链接，无法让它指向迁移过来的目录 ${host}"
     return 1
   fi
   if [[ -n "${RESTORE_TRANSACTION_DIR:-}" ]]; then
@@ -5253,6 +6884,28 @@ restore_bind_link() {
   fi
   root_exec mkdir -p "$(dirname "$link")" || return 1
   root_exec ln -s "$host" "$link"
+}
+
+# 按预检时的选择跳过的项目或容器所独占的数据卷与目录（每行“volume<TAB>名称”
+# 或“bind<TAB>路径”）。与其他容器共用的数据照常恢复。
+restore_skipped_mounts() {
+  decisions_present || return 0
+  jq -rs --slurpfile d "$DM_RESTORE_DECISIONS" '
+    ($d[0].skip_projects // []) as $sp | ($d[0].skip_containers // []) as $sc |
+    [.[] | .[0] | {
+      skipped: ((($sp | index(.Config.Labels["com.docker.compose.project"] // "")) != null) or
+        (($sc | index(.Name | ltrimstr("/"))) != null)),
+      mounts: [.Mounts[]? | if .Type == "volume" then "volume\t\(.Name)"
+        elif .Type == "bind" then "bind\t\(.Source)" else empty end]
+    }] as $all |
+    (([$all[] | select(.skipped) | .mounts[]] | unique) -
+     ([$all[] | select(.skipped | not) | .mounts[]] | unique))[]
+  ' meta/*.inspect.json 2>/dev/null || true
+}
+
+restore_mount_skipped() {
+  [[ -n "${RESTORE_SKIPPED_MOUNTS:-}" ]] || return 1
+  grep -Fxq -- "$1"$'\t'"$2" <<<"$RESTORE_SKIPPED_MOUNTS"
 }
 compose_networks_from_meta_all() {
   [[ -d meta ]] || return 0
@@ -5356,7 +7009,7 @@ compose_prepare_networks() {
           warn " · 外部网络缺失且迁移包没有其配置，拒绝创建默认错误网络：$net"
           return 1
         else
-          warn " · 迁移包没有该外部网络的配置，复用目标端已有网络：$net"
+          warn " · 迁移包里没有网络 ${net} 的设置，沿用新服务器上已有的这个网络"
         fi
         ;;
       false)
@@ -5388,6 +7041,11 @@ create_network_from_record() {
   name="$(jq -r '.name' <<<"$row")"
   driver="$(jq -r '.driver // "bridge"' <<<"$row")"
   [[ -n "$name" && "$name" != "null" ]] || return 1
+  # 迁移前预检中选择了沿用新服务器上已有的同名网络。
+  if decision_listed reuse_network "$name" && docker network inspect "$name" >/dev/null 2>&1; then
+    log_line "按预检时的选择沿用已有网络：$name"
+    return 0
+  fi
 
   desired_core="$(jq -cS '{
     driver: (.driver // "bridge"),
@@ -5422,7 +7080,7 @@ create_network_from_record() {
     desired_labels="$(jq -cS '.labels // {}' <<<"$row")"
     actual_labels="$(docker network inspect "$name" | jq -cS '.[0].Labels // {}')"
     if [[ "$actual_labels" != "$desired_labels" ]]; then
-      warn " 已存在网络的 labels 与迁移记录不同，继续复用且不修改：$name"
+      warn " 网络 ${name} 已存在，只是标签和旧服务器不同，直接沿用，不做修改"
     fi
     return 0
   fi
@@ -5443,6 +7101,8 @@ create_network_from_record() {
 
   while IFS= read -r cfg; do
     [[ -n "$cfg" ]] || continue
+    # 迁移前预检中选择了让 Docker 自动选择网段。
+    decision_listed auto_subnet "$name" && break
     subnet="$(jq -r '.Subnet // empty' <<<"$cfg")"
     ip_range="$(jq -r '.IPRange // empty' <<<"$cfg")"
     gateway="$(jq -r '.Gateway // empty' <<<"$cfg")"
@@ -5472,7 +7132,7 @@ transaction_acquire_lock() {
     if ! flock -n 201 2>/dev/null; then
       exec 201>&-
       RESTORE_LOCK_METHOD=""
-      warn "另一个 Docker 恢复事务正在运行，已拒绝并发恢复。"
+      warn "另一个恢复任务正在运行，请等它结束后再试。"
       return 1
     fi
     return 0
@@ -5490,7 +7150,7 @@ transaction_acquire_lock() {
     fi
     if ! mkdir "$RESTORE_LOCK_DIR" 2>/dev/null; then
       RESTORE_LOCK_METHOD=""
-      warn "另一个 Docker 恢复事务正在运行，已拒绝并发恢复。"
+      warn "另一个恢复任务正在运行，请等它结束后再试。"
       return 1
     fi
   fi
@@ -5671,12 +7331,12 @@ transaction_internal_paths_are_safe() {
   rollback_base="${RESTORE_ROLLBACK_BASE:-${HOME:-${BUNDLE_DIR}}/.docker_migrate_rollback}"
   lock_base="${RESTORE_LOCK_BASE:-${HOME:-${BUNDLE_DIR}}/.docker_migrate_locks}"
   local -a protected_paths=(
-    "迁移包目录" "$BUNDLE_DIR"
-    "事务回滚目录" "$rollback_base"
-    "并发锁目录" "$lock_base"
+    "迁移包所在目录" "$BUNDLE_DIR"
+    "还原资料目录" "$rollback_base"
+    "锁文件目录" "$lock_base"
   )
   if [[ -n "${RESTORE_SESSION_DIR:-}" ]]; then
-    protected_paths+=("下载恢复会话目录" "$RESTORE_SESSION_DIR")
+    protected_paths+=("下载目录" "$RESTORE_SESSION_DIR")
   fi
 
   while IFS= read -r host; do
@@ -5688,9 +7348,9 @@ transaction_internal_paths_are_safe() {
       protected="${protected_paths[$((protected_i + 1))]}"
       normalized_protected="$(transaction_normalize_path "$protected")" || return 1
       if mount_paths_overlap "$normalized_host" "$normalized_protected"; then
-        warn "绑定目录与 ${label} 重叠，已在改动目标数据前拒绝恢复：$host"
-        warn "冲突路径：$normalized_protected"
-        warn "请把 RESTORE_BASE、RESTORE_ROLLBACK_BASE 与 RESTORE_LOCK_BASE 放到该 bind 之外后重试。"
+        warn "挂载目录 ${host} 和${label}重叠，为避免覆盖，已在改动数据前停止"
+        warn "重叠的位置：$normalized_protected"
+        warn "请把 RESTORE_BASE、RESTORE_ROLLBACK_BASE、RESTORE_LOCK_BASE 设置到这个目录之外后重试。"
         return 1
       fi
     done
@@ -5798,7 +7458,7 @@ transaction_remove_new_services() {
           if transaction_container_exists "$name"; then
             dm_quiet docker rm -f "$name" || true
             if transaction_container_exists "$name"; then
-              warn " · 无法静默并删除本次新建的单容器：$name"
+              warn " · 本次新建的容器 ${name} 没能停止并删除"
               rc=1
             fi
           fi
@@ -5806,13 +7466,13 @@ transaction_remove_new_services() {
           # WAL 已写入但 rename 尚未发生；当前仍是原容器，不删除。
           :
         else
-          warn " · 单容器及其预登记回滚点均不存在：$name"
+          warn " · 容器 ${name} 和它的备份都找不到了"
           rc=1
         fi
       elif [[ "$had_old" == "0" ]]; then
         dm_quiet docker rm -f "$name" || true
         if transaction_container_exists "$name"; then
-          warn " · 无法静默并删除本次新建的单容器：$name"
+          warn " · 本次新建的容器 ${name} 没能停止并删除"
           rc=1
         fi
       fi
@@ -5829,7 +7489,7 @@ transaction_remove_new_services() {
       done < <(docker ps -a --filter "label=com.docker.compose.project=${project}" --format '{{.ID}}')
       if [[ -n "$(docker ps -a --filter "label=com.docker.compose.project=${project}" \
         --format '{{.ID}}')" ]]; then
-        warn " · 新 Compose 项目仍有容器未能删除，禁止回灌旧数据：$project"
+        warn " · Compose 项目 ${project} 还有容器没能删除，为安全起见没有还原旧数据"
         rc=1
       fi
     done <"${RESTORE_TRANSACTION_DIR}/compose.tsv"
@@ -5848,11 +7508,11 @@ transaction_restore_volumes() {
     if [[ "$existed" == "1" ]]; then
       if ! volume_clear_and_extract "$volume" "$(dirname "$rollback_file")" \
         "$(basename "$rollback_file")" 0; then
-        warn " · 命名卷数据回滚失败：$volume"
+        warn " · 数据卷 ${volume} 没能还原"
         rc=1
       fi
     elif ! dm_quiet docker volume rm "$volume"; then
-      warn " · 无法删除本次新建的命名卷：$volume"
+      warn " · 本次新建的数据卷 ${volume} 没能删除"
       rc=1
     fi
   done
@@ -5883,7 +7543,7 @@ transaction_restore_binds() {
         # WAL 可能已写入但 rename 尚未发生，或本地失败处理已把旧路径移回。
         continue
       else
-        warn " · 绑定目录及其回滚点均不存在：$host"
+        warn " · 目录 ${host} 和它的备份都找不到了"
         rc=1
         continue
       fi
@@ -5913,13 +7573,13 @@ transaction_restore_standalones() {
       if [[ -n "$backup" ]] && transaction_container_exists "$backup"; then
         dm_quiet docker rm -f "$name" || true
         if ! rename_container_with_retry "$backup" "$name"; then
-          warn " · 无法恢复旧单容器名称：$name（回滚点：$backup）"
+          warn " · 旧容器 ${name} 没能改回原名，它现在叫 ${backup}"
           rc=1
           continue
         fi
         restored_from_backup=1
       elif ! transaction_container_exists "$name"; then
-        warn " · 旧单容器及其回滚点均不存在：$name"
+        warn " · 旧容器 ${name} 和它的备份都找不到了"
         rc=1
         continue
       fi
@@ -5949,7 +7609,7 @@ transaction_restore_compose() {
     rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
     if grep -Fxq "$project" "${RESTORE_TRANSACTION_DIR}/compose_replaced.list"; then
       if ! compose_restore_rollback "$project" "$rollback_dir" "$restore_running"; then
-        warn " · Compose 项目自动回滚失败：$project（回滚点：$rollback_dir）"
+        warn " · Compose 项目 ${project} 没能自动还原，还原资料在：${rollback_dir}"
         rc=1
       fi
     elif ! compose_restore_existing_states "$project" "$rollback_dir" "$restore_running"; then
@@ -5982,7 +7642,7 @@ transaction_cleanup_artifacts() {
       [[ -n "$backup" ]] || continue
       if ! dm_quiet docker rm -f "$backup"; then
         if ! docker info >/dev/null 2>&1 || transaction_container_exists "$backup"; then
-          warn " · 无法清理旧单容器回滚点：$backup"
+          warn " · 用于还原的旧容器 ${backup} 没能删除"
           rc=1
         fi
       fi
@@ -6018,13 +7678,13 @@ transaction_cleanup_artifacts() {
     while IFS=$'\t' read -r host had_old old; do
       [[ "$had_old" == "1" ]] || continue
       if ! root_exec rm -rf "$old"; then
-        warn " · 无法清理绑定目录回滚点：$old"
+        warn " · 用于还原的旧目录 ${old} 没能删除"
         rc=1
       fi
     done <"${RESTORE_TRANSACTION_DIR}/binds.tsv"
   fi
   if ! root_exec rm -rf "${RESTORE_TRANSACTION_DIR}/file_backups"; then
-    warn " · 无法清理文件回滚点：${RESTORE_TRANSACTION_DIR}/file_backups"
+    warn " · 临时备份文件没能删除：${RESTORE_TRANSACTION_DIR}/file_backups"
     rc=1
   fi
 
@@ -6036,7 +7696,7 @@ transaction_cleanup_artifacts() {
 transaction_rollback() {
   local name state project had_old services_quiet=1 data_ok=1 rc=0 preserve_compose=0
   ((TRANSACTION_ACTIVE == 1)) || return 0
-  warn "恢复事务失败，正在统一回滚服务与数据……"
+  warn "恢复失败，正在把服务和数据还原到恢复前的状态……"
 
   # 提交阶段若某个共享写入者重启失败，先重新静默已经启动的写入者。
   if [[ -f "${RESTORE_TRANSACTION_DIR}/shared.tsv" ]]; then
@@ -6072,7 +7732,7 @@ transaction_rollback() {
   else
     rc=1
     data_ok=0
-    warn "新服务未能全部静默，禁止回灌旧数据；已保留全部回滚点供人工处理。"
+    warn "新启动的容器没能全部停止，为安全起见没有还原旧数据，还原资料已全部保留，请人工处理。"
   fi
 
   if ((rc == 0)); then
@@ -6087,18 +7747,18 @@ transaction_rollback() {
       # Compose 会把实际配置文件路径写入容器 labels。回滚后的容器仍引用这里的
       # config.yml/images.yml，因此保留这些小文件，后续迁移才能再次建立回滚点。
       if ! transaction_cleanup_artifacts 1; then
-        warn "部分无用回滚资料未能清理，事务清单已保留：$RESTORE_TRANSACTION_DIR"
+        warn "部分还原资料没能清理，已保留在：$RESTORE_TRANSACTION_DIR"
       fi
-      warn "目标端旧服务、volume 与 bind 数据已统一恢复。"
+      warn "新服务器上原来的服务和数据已经全部还原。"
       warn "Compose 回滚配置需随旧容器保留：$RESTORE_TRANSACTION_DIR"
     else
       if transaction_cleanup_artifacts; then
         rm -rf "$RESTORE_TRANSACTION_DIR" ||
-          warn "回滚已完成，但事务目录未能删除：$RESTORE_TRANSACTION_DIR"
+          warn "已还原到恢复前的状态，但临时文件夹没能删除：$RESTORE_TRANSACTION_DIR"
       else
         warn "回滚已完成，但部分无用回滚资料未能清理：$RESTORE_TRANSACTION_DIR"
       fi
-      warn "目标端旧服务、volume 与 bind 数据已统一恢复。"
+      warn "新服务器上原来的服务和数据已经全部还原。"
     fi
   else
     warn "自动回滚未完全成功，已保留回滚目录：$RESTORE_TRANSACTION_DIR"
@@ -6186,13 +7846,13 @@ transaction_prepare() {
   done < <(jq -r '.runs[]' manifest.json)
 
   if [[ "$policy" == "fail" && "$existing_targets" -gt 0 ]]; then
-    warn "目标端已存在待恢复服务，RESTORE_EXISTING=fail 在修改任何数据前终止。"
+    warn "新服务器上已经有同名的服务，RESTORE_EXISTING=fail 不允许替换，已停止（没有改动任何数据）。"
     transaction_release_lock
     trap restore_nontransaction_exit_handler EXIT
     return 1
   fi
   if [[ "$policy" == "skip" && "$has_data" == "1" && "$existing_targets" -gt 0 ]]; then
-    warn "RESTORE_EXISTING=skip 无法安全区分共享数据归属；存在 volume/bind 时拒绝部分覆盖。"
+    warn "RESTORE_EXISTING=skip 时无法判断共用的数据属于谁；迁移包里有数据卷或目录，为避免覆盖已有数据，已停止。"
     transaction_release_lock
     trap restore_nontransaction_exit_handler EXIT
     return 1
@@ -6204,7 +7864,7 @@ transaction_prepare() {
     elif command -v docker-compose >/dev/null 2>&1; then
       COMPOSE_IMPL="legacy"
     else
-      warn "新机未安装 docker compose/docker-compose，恢复尚未修改目标端。"
+      warn "新服务器没有安装 Docker Compose，已停止（没有改动任何数据）。"
       transaction_release_lock
       trap restore_nontransaction_exit_handler EXIT
       return 1
@@ -6234,6 +7894,7 @@ transaction_prepare() {
 
   while IFS= read -r project; do
     [[ -n "$project" ]] || continue
+    decision_listed skip_projects "$project" && continue
     had_old=0
     if [[ -n "$(docker ps -a --filter "label=com.docker.compose.project=${project}" \
       --format '{{.ID}}')" ]]; then
@@ -6247,9 +7908,9 @@ transaction_prepare() {
         continue
       fi
       rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
-      say "保存目标端旧 Compose 配置与运行状态：$project"
+      say "备份新服务器上已有的 Compose 项目：$project"
       if ! compose_capture_rollback_metadata "$project" "$rollback_dir"; then
-        warn " · 无法安全读取 Compose 回滚元数据，目标端尚未停止：$project"
+        warn " · 无法备份新服务器上已有的 Compose 项目 ${project}，已停止（它仍在正常运行）"
         transaction_discard_prepared
         return 1
       fi
@@ -6262,6 +7923,7 @@ transaction_prepare() {
   while IFS= read -r run; do
     [[ -n "$run" ]] || continue
     name="$(basename "${run%.sh}")"
+    decision_listed skip_containers "$name" && continue
     had_old=0
     state="absent"
     if transaction_container_exists "$name"; then
@@ -6280,12 +7942,16 @@ transaction_prepare() {
 
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
+    decision_listed keep_volumes "$name" && continue
+    restore_mount_skipped volume "$name" && continue
     SELECTED_TRANSACTION_VOLUMES["$name"]=1
   done < <(jq -r '.volumes[].name' manifest.json)
   SELECTED_TRANSACTION_BINDS=()
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    bind_path_is_system "$name" || SELECTED_TRANSACTION_BINDS+=("$name")
+    bind_path_is_system "$name" && continue
+    restore_mount_skipped bind "$name" && continue
+    SELECTED_TRANSACTION_BINDS+=("$name")
   done < <(jq -r '.binds[] | .host, (.link // empty)' manifest.json)
 
   # restore.sh 也可在挂载 Docker socket 的工具容器中运行；绝不能把执行自身停掉。
@@ -6346,12 +8012,12 @@ transaction_prepare() {
   if ! transaction_build_quiesce_list \
     "${RESTORE_TRANSACTION_DIR}/shared.tsv" \
     "${RESTORE_TRANSACTION_DIR}/managed_names.list" "$quiesce_list_file"; then
-    warn "无法完整生成目标端停机名单，尚未停止服务或回灌数据。"
+    warn "无法确定需要临时停止哪些容器，已停止（没有停止服务，也没有写入数据）。"
     return 1
   fi
   mapfile -t quiesce_names <"$quiesce_list_file"
   for name in "${quiesce_names[@]}"; do
-    say "准备暂停目标端服务或共享数据的容器：$name"
+    say "临时停止新服务器上的容器：$name"
   done
   transaction_quiesce_containers "${quiesce_names[@]}" || return 1
 
@@ -6382,7 +8048,7 @@ transaction_commit() {
   # 这是不可逆提交点：新服务及数据已验证，共享写入者也已恢复。
   # EXIT handler 始终保持不变，只用这一条赋值区分“可回滚”与“已提交”；
   # 因此 INT/TERM 不会落入 trap 切换或两个状态变量之间的竞态窗口。
-  RESTORE_STAGE="提交与清理回滚点"
+  RESTORE_STAGE="清理还原资料"
   RESTORE_COMMIT_STARTED=1
   TRANSACTION_ACTIVE=0
   if ! run_with_activity "提交事务：清理旧容器、镜像和数据回滚点" \
@@ -6392,21 +8058,21 @@ transaction_commit() {
   fi
   if ! run_with_activity "提交事务：删除临时事务目录" \
     rm -rf "$RESTORE_TRANSACTION_DIR"; then
-    warn "服务与数据已恢复，但事务目录清理失败：$RESTORE_TRANSACTION_DIR"
+    warn "服务和数据已经恢复，但临时文件夹没能删除：$RESTORE_TRANSACTION_DIR"
     return 1
   fi
   RESTORE_TRANSACTION_DIR=""
   export RESTORE_TRANSACTION_DIR
   transaction_release_lock
   RESTORE_STAGE="完成"
-  say "所有服务与数据已通过验证，恢复事务已提交。"
+  say "所有服务和数据都已验证通过。"
 }
 trap restore_nontransaction_exit_handler EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-RESTORE_STAGE="迁移包校验"
-restore_stage 1 "预检数据"
+RESTORE_STAGE="校验迁移包"
+restore_stage 1 "检查迁移包"
 if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" != "1" ]]; then
   if ! run_with_activity "校验每个文件" verify_bundle_checksums "$BUNDLE_DIR"; then
     error_user "迁移包文件校验失败，拒绝恢复" "请在旧服务器重新运行备份"
@@ -6414,14 +8080,25 @@ if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" != "1" ]]; then
   fi
 fi
 if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
-  error_user "迁移包的 manifest 结构或路径不安全，拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
+  error_user "迁移包里的清单文件有问题（格式不对或包含不安全的路径），已拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
   exit 1
 fi
 if ! transaction_internal_paths_are_safe; then
   exit 1
 fi
 
-RESTORE_STAGE="预检数据归档"
+# 在迁移包目录手动执行时也做迁移前预检（由主脚本调用时已在下载前做过）。
+if [[ "${DM_PREFLIGHT_DONE:-0}" != "1" && "${RESTORE_SKIP_PREFLIGHT:-0}" != "1" && -f plan.json ]]; then
+  DM_RESTORE_DECISIONS="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-decisions.XXXXXX")"
+  printf '{}\n' >"$DM_RESTORE_DECISIONS"
+  export DM_RESTORE_DECISIONS
+  if ! PREFLIGHT_SKIP_BASE_DISK=1 preflight_run plan.json "$DM_RESTORE_DECISIONS" "$BUNDLE_DIR"; then
+    exit 1
+  fi
+fi
+RESTORE_SKIPPED_MOUNTS="$(restore_skipped_mounts)"
+
+RESTORE_STAGE="检查数据备份文件"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! command -v python3 >/dev/null 2>&1; then
   error_user "缺少 python3（尚未停止服务或修改数据）" "安装 python3，或使用主脚本「下载备份并恢复」自动安装依赖"
@@ -6479,8 +8156,8 @@ else
   stage_end
 fi
 
-RESTORE_STAGE="建立统一回滚事务"
-restore_stage 3 "建立回滚点"
+RESTORE_STAGE="备份新服务器上已有的服务"
+restore_stage 3 "备份已有服务"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
   DM_PROGRESS_HINT="正在从 Docker Hub 下载，网络较慢时可能需要几分钟" \
@@ -6493,7 +8170,7 @@ fi
 transaction_prepare
 stage_end
 
-RESTORE_STAGE="回灌命名卷"
+RESTORE_STAGE="恢复数据卷"
 restore_stage 4 "恢复数据"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p volumes
@@ -6504,6 +8181,10 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       error_user "迁移包缺少数据卷 ${vname} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_VOLUMES+=("$vname")
       break
+    fi
+    if decision_listed keep_volumes "$vname" || restore_mount_skipped volume "$vname"; then
+      say "按预检时的选择不写入数据卷：${vname}"
+      continue
     fi
     say "恢复数据卷：${vname}"
     # 使用备份时记录的 driver 和 options 创建卷；同名卷已存在时必须先
@@ -6553,7 +8234,7 @@ if ((${#FAILED_VOLUMES[@]} > 0)); then
   exit 1
 fi
 
-RESTORE_STAGE="回灌绑定目录"
+RESTORE_STAGE="恢复挂载目录"
 if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p binds
   while IFS= read -r row; do
@@ -6561,6 +8242,10 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     file=$(jq -r '.file' <<<"$row")
     bind_link=$(jq -r '.link // empty' <<<"$row")
     bind_path_is_system "$host" && continue
+    if restore_mount_skipped bind "$host" || { [[ -n "$bind_link" ]] && restore_mount_skipped bind "$bind_link"; }; then
+      say "按预检时的选择不写入目录：${host}"
+      continue
+    fi
     if [[ ! -f "binds/$file" ]]; then
       error_user "迁移包缺少挂载目录 ${host} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_BINDS+=("$host")
@@ -6647,6 +8332,10 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     say "恢复 Compose 项目：${name}"
     mkdir -p "${COMPOSE_RESTORE_ROOT}/${name}"
 
+    if decision_listed skip_projects "$name"; then
+      say "按预检时的选择跳过 Compose 项目：${name}"
+      continue
+    fi
     if [[ -n "${SKIP_PROJECTS[$name]:-}" ]]; then
       warn_user "Compose 项目 ${name} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       continue
@@ -6722,7 +8411,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
   done < <(jq -c '.projects[]' manifest.json)
 fi
 
-RESTORE_STAGE="创建独立容器网络"
+RESTORE_STAGE="创建网络"
 say "创建自定义网络"
 declare -A COMPOSE_NETS=()
 while IFS= read -r n; do
@@ -6800,12 +8489,16 @@ restore_runs_in_dependency_order() {
   done
 }
 
-RESTORE_STAGE="恢复独立容器"
+RESTORE_STAGE="启动容器"
 if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
     cname_from_script="${r#runs/}"
     cname_from_script="${cname_from_script%.sh}"
+    if decision_listed skip_containers "$cname_from_script"; then
+      say "按预检时的选择保留已有容器：${cname_from_script}"
+      continue
+    fi
     if [[ -n "${SKIP_CONTAINERS[$cname_from_script]:-}" ]]; then
       warn_user "容器 ${cname_from_script} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       continue
@@ -7010,13 +8703,67 @@ restore_extract() {
   progress_meter "$count_file" <"$archive" | tar -xzf - -C "$outdir"
 }
 
+# 迁移前预检：从同一个链接推算迁移计划的地址，下载、验证后检查新服务器。
+# 旧版源端没有迁移计划时静默跳过。返回 1 表示发现了无法继续的问题。
+restore_preflight() {
+  local download_url="$1" encryption_key="$2" mac_key="$3" iv="$4" decisions="$5"
+  local plan_url work rc=0 summary
+  plan_url="$(plan_url_from_bundle_url "$download_url")" || return 0
+  work="$(mktemp -d "${TMPDIR:-/tmp}/docker-migrate-plan.XXXXXX")" || return 0
+  log_line "迁移计划地址：${plan_url}"
+  if ! curl -fsS --globoff --max-time 30 --retry 2 -o "${work}/plan.enc" --url "$plan_url" \
+    2>>"${DM_LOG_FILE:-/dev/null}"; then
+    log_line "没有获取到迁移计划（旧服务器可能是旧版本），跳过迁移前预检"
+    rm -rf "$work"
+    stage_end "旧服务器没有提供迁移计划，已跳过"
+    return 0
+  fi
+  plan_decrypt "${work}/plan.enc" "${work}/plan.json" "$encryption_key" "$mac_key" "$iv" || rc=$?
+  if ((rc != 0)); then
+    rm -rf "$work"
+    if ((rc == 2)); then
+      error_user "迁移计划的签名校验失败，链接可能没有复制完整" "请重新完整复制旧服务器输出的链接"
+      return 1
+    fi
+    log_line "迁移计划无法解析，跳过迁移前预检"
+    stage_end "已跳过"
+    return 0
+  fi
+  if ! preflight_run "${work}/plan.json" "$decisions" "$RESTORE_BASE_DIR"; then
+    rm -rf "$work"
+    return 1
+  fi
+  RESTORE_BASE_DIR="$(jq -r --arg d "$RESTORE_BASE_DIR" '.restore_base // $d' "$decisions")"
+  summary="${PREFLIGHT_CONTAINERS:-0} 个容器 · 需要约 $(human "${PREFLIGHT_NEED_BYTES:-0}")"
+  if [[ "$(jq '[.port_map, .skip_projects, .skip_containers, .auto_ip, .auto_subnet, .reuse_network, .keep_volumes] |
+    map(length? // 0) | add' "$decisions" 2>/dev/null || echo 0)" != "0" ]]; then
+    summary+=" · 已按你的选择调整"
+  fi
+  rm -rf "$work"
+  stage_end "$summary"
+}
+
+# 恢复工作目录建立之前的退出：失败时告诉用户日志位置，成功时删除日志。
+restore_early_exit() {
+  local rc="$1"
+  trap - EXIT
+  if ((rc == 0)); then
+    log_finish 1
+  else
+    stage_fail
+    [[ -z "${DM_LOG_FILE:-}" ]] || printf '日志：%s（反馈问题时请附上这个文件）\n' "$DM_LOG_FILE" >&2
+  fi
+  exit "$rc"
+}
+
 restore_main() {
   local URL DOWNLOAD_URL EXPECTED_SHA256 ENCRYPTION_SCHEME ENCRYPTION_SECRET
   local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY tgz_bytes free_bytes
-  local restore_started=$SECONDS
+  local restore_started=$SECONDS decisions
   URL="$(restore_prompt_url "${1:-}")"
   log_init restore
-  stage_begin 1 8 "检查环境"
+  trap 'restore_early_exit $?' EXIT
+  stage_begin 1 9 "检查环境"
   DOWNLOAD_URL="$(bundle_download_url "$URL")"
   EXPECTED_SHA256="$(bundle_expected_sha256 "$URL")"
   ENCRYPTION_SCHEME="$(bundle_encryption_scheme "$URL")"
@@ -7030,12 +8777,32 @@ restore_main() {
     ! valid_hex_length "$ENCRYPTION_SECRET" 128 ||
     ! valid_hex_length "$ENCRYPTION_IV" 32 ||
     ! valid_hex_length "$ENCRYPTION_MAC" 64; then
-    error_user "链接缺少有效的 sha256/enc/secret/iv/mac 参数" \
+    error_user "链接不完整，缺少解密和校验需要的部分" \
       "请完整复制旧服务器输出的链接；如果旧服务器运行的是旧版脚本，请用最新版重新生成"
     exit 1
   fi
   restore_ensure_deps
-  local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
+  stage_end "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
+
+  stage_begin 2 9 "迁移前预检"
+  RESTORE_BASE_DIR="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
+  decisions="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-decisions.XXXXXX")"
+  printf '{}\n' >"$decisions"
+  if [[ "${RESTORE_SKIP_PREFLIGHT:-0}" == "1" ]]; then
+    stage_end "已按 RESTORE_SKIP_PREFLIGHT=1 跳过"
+  elif ! restore_preflight "$DOWNLOAD_URL" "$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")" \
+    "$(bundle_secret_mac_key "$ENCRYPTION_SECRET")" "$ENCRYPTION_IV" "$decisions"; then
+    rm -f "$decisions"
+    exit 1
+  fi
+  if [[ "${RESTORE_CHECK_ONLY:-0}" == "1" ]]; then
+    printf '\n预检通过，没有下载或修改任何内容。去掉 --check 重新运行即可开始迁移。\n'
+    print_decision_summary "$decisions"
+    rm -f "$decisions"
+    exit 0
+  fi
+
+  local BASE="$RESTORE_BASE_DIR"
   mkdir -p "$BASE"
   BASE="$(cd "$BASE" && pwd -P)" || {
     error_user "无法访问恢复目录：$BASE" "设置 RESTORE_BASE 指向一个可写的目录后重试"
@@ -7050,7 +8817,9 @@ restore_main() {
     rmdir "$SESSION_DIR" 2>/dev/null || true
     exit 1
   fi
-  stage_end "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
+  mv "$decisions" "${SESSION_DIR}/decisions.json"
+  decisions="${SESSION_DIR}/decisions.json"
+  DM_RESTORE_DECISIONS="$decisions"
   local RID
   RID="$(basename "$DOWNLOAD_URL" | sed 's/\.tar\.gz.*$//' | tr -dc 'A-Za-z0-9_-')"
   [[ -n "$RID" ]] || RID="$(date +%s)"
@@ -7061,7 +8830,7 @@ restore_main() {
   local HEADER_FILE="${SESSION_DIR}/download.headers"
   local OUTDIR="${SESSION_DIR}/unpacked"
 
-  stage_begin 2 8 "下载迁移包"
+  stage_begin 3 9 "下载迁移包"
   log_line "下载地址：${DOWNLOAD_URL}"
   if ! DM_PROGRESS_HINT="长时间没有进展时，请检查旧服务器的防火墙和云厂商安全组" \
     run_with_progress "下载" "$DOWNLOAD_PARTIAL" "header:${HEADER_FILE}" \
@@ -7076,7 +8845,7 @@ restore_main() {
   fi
   stage_end "$(human "$(progress_file_size "$DOWNLOAD_FILE")")"
 
-  stage_begin 3 8 "校验并解密"
+  stage_begin 4 9 "校验并解密"
   ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
   MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
   if ! run_with_activity "校验摘要与签名" verify_bundle_digests \
@@ -7133,7 +8902,7 @@ restore_main() {
     exit 1
   fi
   if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
-    error_user "迁移包的 manifest 结构或路径不安全，拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
+    error_user "迁移包里的清单文件有问题（格式不对或包含不安全的路径），已拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
     exit 1
   fi
   stage_end "$(human "$tgz_bytes")"
@@ -7149,7 +8918,8 @@ restore_main() {
   DM_SUMMARY_ARMED=1
   RESTORE_CHECKSUM_VERIFIED=1 RESTORE_SESSION_DIR="$SESSION_DIR" \
     RESTORE_RESULT_FILE="$result_file" RESTORE_DEFER_FINAL_SUMMARY=1 \
-    DM_STAGE_OFFSET=3 DM_STAGE_TOTAL=8 DM_SUMMARY_ARMED=1 \
+    DM_STAGE_OFFSET=4 DM_STAGE_TOTAL=9 DM_SUMMARY_ARMED=1 \
+    DM_PREFLIGHT_DONE=1 DM_RESTORE_DECISIONS="$decisions" \
     bash "${BUNDLE_DIR}/restore.sh"
   rc=$?
   set -e
@@ -7310,6 +9080,11 @@ for ((arg_i = 0; arg_i < ${#ORIGINAL_ARGS[@]}; arg_i++)); do
     --backup) REQUESTED_MODE=1 ;;
     --diagnose) REQUESTED_MODE=diagnose ;;
     --verbose | -v) DOCKER_MIGRATE_VERBOSE=1 ;;
+    --check=*)
+      REQUESTED_MODE=2
+      export RESTORE_CHECK_ONLY=1
+      RESTORE_URL="${ORIGINAL_ARGS[$arg_i]#*=}"
+      ;;
     --restore=*)
       REQUESTED_MODE=2
       RESTORE_URL="${ORIGINAL_ARGS[$arg_i]#*=}"
@@ -7547,6 +9322,7 @@ hard_clean() {
   [[ -z "${SINGLE_TAR_PATH:-}" ]] || rm -f "${SINGLE_TAR_PATH}" 2>/dev/null || failed=1
   [[ -z "${ENCRYPTED_TAR_PATH:-}" ]] || rm -f "${ENCRYPTED_TAR_PATH}" 2>/dev/null || failed=1
   [[ -z "${ENCRYPTED_PARTIAL_PATH:-}" ]] || rm -f "${ENCRYPTED_PARTIAL_PATH}" 2>/dev/null || failed=1
+  [[ -z "${PLAN_PATH:-}" ]] || rm -f "${PLAN_PATH}" 2>/dev/null || failed=1
   [[ -z "${BUNDLE_ROOT:-}" ]] || rm -rf "${BUNDLE_ROOT}/_bb_http_serve" 2>/dev/null || failed=1
   [[ -z "${BUNDLE_ROOT:-}" ]] || rm -f "${BUNDLE_ROOT}/nc_http_response.http" 2>/dev/null || failed=1
   if [[ "$preserve_http_log" != "1" && -n "${HTTP_LOG:-}" ]]; then
@@ -7944,7 +9720,7 @@ while ((dependency_added == 1)); do
       done
       ((dep_selected == 0)) || continue
       dep_name="$(docker inspect -f '{{.Name}}' "$dep_id" 2>/dev/null | sed 's#^/##')"
-      warn_user "自动加入被依附的容器 ${dep_name:-${dep_id:0:12}}（其他所选容器共享它的网络或进程命名空间）"
+      warn_user "自动加入被依附的容器 ${dep_name:-${dep_id:0:12}}（选中的容器要借用它的网络，必须一起迁移）"
       IDS+=("${dep_id:0:12}")
       dependency_added=1
     done < <(docker inspect -f '{{.HostConfig.NetworkMode}}
@@ -8380,9 +10156,12 @@ for id in "${IDS[@]}"; do
           BACKUP_FAILURES+=("数据卷 ${vname} 打包失败")
           continue
         fi
-        PACKED_BYTES=$((${PACKED_BYTES:-0} + $(progress_current "count:${out}.count")))
+        item_bytes="$(progress_current "count:${out}.count")"
+        PACKED_BYTES=$((${PACKED_BYTES:-0} + item_bytes))
         rm -f "${out}.count"
-        MAN_VOL+=("$(jq -cn --arg name "$vname" --arg dest "$dest" --arg driver "$v_driver" --argjson opts "$v_opts_json" '{name:$name,dest:$dest,driver:$driver,opts:$opts}')")
+        MAN_VOL+=("$(jq -cn --arg name "$vname" --arg dest "$dest" --arg driver "$v_driver" \
+          --argjson opts "$v_opts_json" --argjson bytes "$item_bytes" \
+          '{name:$name,dest:$dest,driver:$driver,opts:$opts,bytes:$bytes}')")
         ;;
       bind)
         src=$(jq -r '.Source' <<<"$m")
@@ -8424,11 +10203,12 @@ for id in "${IDS[@]}"; do
           BACKUP_FAILURES+=("挂载目录 ${src} 打包失败")
           continue
         fi
-        PACKED_BYTES=$((${PACKED_BYTES:-0} + $(progress_current "count:${out}.count")))
+        item_bytes="$(progress_current "count:${out}.count")"
+        PACKED_BYTES=$((${PACKED_BYTES:-0} + item_bytes))
         rm -f "${out}.count"
         MAN_BIND+=("$(jq -cn --arg host "$src" --arg link "$bind_link" --arg dest "$dest" \
-          --arg file "$(basename "$out")" \
-          '{host:$host,dest:$dest,file:$file} + (if $link == "" then {} else {link:$link} end)')")
+          --arg file "$(basename "$out")" --argjson bytes "$item_bytes" \
+          '{host:$host,dest:$dest,file:$file,bytes:$bytes} + (if $link == "" then {} else {link:$link} end)')")
         ;;
       *)
         detail "跳过不需要迁移的挂载类型：$t（$dest）"
@@ -8480,7 +10260,8 @@ fi
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | awk 'NF' | sort -u)
 if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
-  if progress_docker_save "${OUT_IMG}" "$(images_total_bytes "${IMAGES[@]}")" \
+  IMAGES_TOTAL_BYTES="$(images_total_bytes "${IMAGES[@]}")"
+  if progress_docker_save "${OUT_IMG}" "$IMAGES_TOTAL_BYTES" \
     docker image save "${IMAGES[@]}"; then
     detail "images.tar 已生成：$(human "$(progress_file_size "$OUT_IMG")")"
     if ! cleanup_snapshot_images; then
@@ -8593,6 +10374,11 @@ README
 
 stage_begin 6 7 "加密打包"
 generate_manifest_and_restore
+# 迁移计划：新服务器下载前据此预检（端口、磁盘、CPU 类型等）。
+if ! plan_build "$BUNDLE" "${IMAGES_TOTAL_BYTES:-0}" >"${BUNDLE}/plan.json"; then
+  rm -f "${BUNDLE}/plan.json"
+  warn_user "迁移计划生成失败，新服务器将跳过迁移前预检"
+fi
 run_with_activity "计算文件校验值" generate_bundle_checksums "$BUNDLE"
 
 #####################################
@@ -8642,6 +10428,15 @@ if ! mv "$ENCRYPTED_PARTIAL_PATH" "$ENCRYPTED_TAR_PATH"; then
   error_user "无法保存加密迁移包" "执行 df -h 检查磁盘空间后重试"
   exit 1
 fi
+# 迁移计划单独加密，与迁移包放在同一随机路径下，新服务器从同一个链接推算地址。
+PLAN_NAME="${BUNDLE_BASENAME}.plan"
+PLAN_PATH="${BUNDLE_ROOT}/${PLAN_NAME}"
+if [[ -f "${BUNDLE}/plan.json" ]] && ! plan_encrypt "${BUNDLE}/plan.json" "$PLAN_PATH" \
+  "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_MAC_KEY" "$BUNDLE_IV"; then
+  rm -f "$PLAN_PATH"
+  warn_user "迁移计划加密失败，新服务器将跳过迁移前预检"
+fi
+[[ -f "$PLAN_PATH" ]] || PLAN_PATH=""
 # 明文目录已全部进入加密包：立即删除，释放磁盘并减少明文数据停留时间。
 rm -rf "$BUNDLE" 2>/dev/null || detail "明文迁移目录暂未删除，退出时会再次清理：$BUNDLE"
 TRANSFER_NAME="${BUNDLE_BASENAME}.tar.gz.enc"
@@ -8690,7 +10485,7 @@ TRANSFER_SIZE="$(stat -c%s "$TRANSFER_PATH" 2>/dev/null || stat -f%z "$TRANSFER_
 if command -v python3 >/dev/null 2>&1; then
   # --- Fallback 1: Python3 HTTP server (best — supports secret token + proper headers) ---
   http_log_event "启动 backend=python3 port=${PORT} file=${TRANSFER_NAME} size=${TRANSFER_SIZE}"
-  python3 - "$PORT" "$SECRET_TOKEN" "$TRANSFER_NAME" >>"${HTTP_LOG}" 2>&1 <<'PY' &
+  python3 - "$PORT" "$SECRET_TOKEN" "$TRANSFER_NAME" "${PLAN_PATH:+$PLAN_NAME}" >>"${HTTP_LOG}" 2>&1 <<'PY' &
 import http.server
 import os
 from socketserver import ThreadingTCPServer
@@ -8699,17 +10494,22 @@ import sys
 port = int(sys.argv[1])
 secret = sys.argv[2]
 fname = sys.argv[3]
-allowed_path = "/" + secret + "/" + fname
+plan_name = sys.argv[4] if len(sys.argv) > 4 else ""
+# 同一随机路径下只提供两个文件：迁移包与迁移计划。
+allowed = {"/" + secret + "/" + fname: fname}
+if plan_name:
+    allowed["/" + secret + "/" + plan_name] = plan_name
 root = os.getcwd()
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
-        if path != allowed_path:
+        name = allowed.get(path)
+        if not name:
             self.send_response(404)
             self.end_headers()
             return
-        fpath = os.path.join(root, fname)
+        fpath = os.path.join(root, name)
         try:
             st = os.stat(fpath)
         except FileNotFoundError:
@@ -8719,7 +10519,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(st.st_size))
-        self.send_header("Content-Disposition", 'attachment; filename="' + fname + '"')
+        self.send_header("Content-Disposition", 'attachment; filename="' + name + '"')
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
@@ -8777,6 +10577,7 @@ elif command -v busybox >/dev/null 2>&1; then
   mkdir -p "$BUSYBOX_WEB/$SECRET_TOKEN"
   printf 'Not found\n' >"$BUSYBOX_WEB/index.html"
   ln -sf "$TRANSFER_PATH" "$BUSYBOX_WEB/$SECRET_TOKEN/$TRANSFER_NAME"
+  [[ -z "${PLAN_PATH:-}" ]] || ln -sf "$PLAN_PATH" "$BUSYBOX_WEB/$SECRET_TOKEN/$PLAN_NAME"
   busybox httpd -f -p "$PORT" -h "$BUSYBOX_WEB" >>"${HTTP_LOG}" 2>&1 &
   SHPID=$!
   FINAL_URL="${BASE_URL}/${SECRET_TOKEN}/${TRANSFER_NAME}${TRANSFER_FRAGMENT}"

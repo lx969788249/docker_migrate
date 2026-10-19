@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.5.0
+
+### Pre-flight check
+
+- Before downloading, the new server fetches a small encrypted migration plan from the same link (no extra copy-paste) and checks CPU type, disk space, port usage, network ranges, static IPs, existing containers and volumes, Compose availability, runtimes, devices and volume plugins.
+- Problems are sorted by impact: harmless differences such as an older Docker version are only noted; problems that would make the migration fail stop and offer targeted choices (use a free port, enter a port, stop publishing it, recheck, replace or keep an existing container, let Docker pick a network range or IP, keep an existing volume, use another download directory); problems that cannot be worked around stop with an explanation.
+- Compose port conflicts are never rewritten automatically; the user can fix the port and recheck, or skip the project and migrate the rest.
+- The restore applies these choices and lists every adjustment in the final summary.
+- Add `--check=URL` to run only the pre-flight check, `RESTORE_AUTO_RESOLVE=1` to accept recommended fixes without a terminal, and `RESTORE_SKIP_PREFLIGHT=1` to skip it.
+- Restoring by hand from an extracted bundle runs the same check.
+
+### Wording
+
+- Rewrite rollback and error messages in plain language and rename restore steps (检查迁移包、备份已有服务).
+
 ## 2.4.0
 
 ### Output and progress

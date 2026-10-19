@@ -36,13 +36,13 @@ transaction_prepare() {
   done < <(jq -r '.runs[]' manifest.json)
 
   if [[ "$policy" == "fail" && "$existing_targets" -gt 0 ]]; then
-    warn "目标端已存在待恢复服务，RESTORE_EXISTING=fail 在修改任何数据前终止。"
+    warn "新服务器上已经有同名的服务，RESTORE_EXISTING=fail 不允许替换，已停止（没有改动任何数据）。"
     transaction_release_lock
     trap restore_nontransaction_exit_handler EXIT
     return 1
   fi
   if [[ "$policy" == "skip" && "$has_data" == "1" && "$existing_targets" -gt 0 ]]; then
-    warn "RESTORE_EXISTING=skip 无法安全区分共享数据归属；存在 volume/bind 时拒绝部分覆盖。"
+    warn "RESTORE_EXISTING=skip 时无法判断共用的数据属于谁；迁移包里有数据卷或目录，为避免覆盖已有数据，已停止。"
     transaction_release_lock
     trap restore_nontransaction_exit_handler EXIT
     return 1
@@ -54,7 +54,7 @@ transaction_prepare() {
     elif command -v docker-compose >/dev/null 2>&1; then
       COMPOSE_IMPL="legacy"
     else
-      warn "新机未安装 docker compose/docker-compose，恢复尚未修改目标端。"
+      warn "新服务器没有安装 Docker Compose，已停止（没有改动任何数据）。"
       transaction_release_lock
       trap restore_nontransaction_exit_handler EXIT
       return 1
@@ -84,6 +84,7 @@ transaction_prepare() {
 
   while IFS= read -r project; do
     [[ -n "$project" ]] || continue
+    decision_listed skip_projects "$project" && continue
     had_old=0
     if [[ -n "$(docker ps -a --filter "label=com.docker.compose.project=${project}" \
       --format '{{.ID}}')" ]]; then
@@ -97,9 +98,9 @@ transaction_prepare() {
         continue
       fi
       rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
-      say "保存目标端旧 Compose 配置与运行状态：$project"
+      say "备份新服务器上已有的 Compose 项目：$project"
       if ! compose_capture_rollback_metadata "$project" "$rollback_dir"; then
-        warn " · 无法安全读取 Compose 回滚元数据，目标端尚未停止：$project"
+        warn " · 无法备份新服务器上已有的 Compose 项目 ${project}，已停止（它仍在正常运行）"
         transaction_discard_prepared
         return 1
       fi
@@ -112,6 +113,7 @@ transaction_prepare() {
   while IFS= read -r run; do
     [[ -n "$run" ]] || continue
     name="$(basename "${run%.sh}")"
+    decision_listed skip_containers "$name" && continue
     had_old=0
     state="absent"
     if transaction_container_exists "$name"; then
@@ -130,12 +132,16 @@ transaction_prepare() {
 
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
+    decision_listed keep_volumes "$name" && continue
+    restore_mount_skipped volume "$name" && continue
     SELECTED_TRANSACTION_VOLUMES["$name"]=1
   done < <(jq -r '.volumes[].name' manifest.json)
   SELECTED_TRANSACTION_BINDS=()
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    bind_path_is_system "$name" || SELECTED_TRANSACTION_BINDS+=("$name")
+    bind_path_is_system "$name" && continue
+    restore_mount_skipped bind "$name" && continue
+    SELECTED_TRANSACTION_BINDS+=("$name")
   done < <(jq -r '.binds[] | .host, (.link // empty)' manifest.json)
 
   # restore.sh 也可在挂载 Docker socket 的工具容器中运行；绝不能把执行自身停掉。
@@ -196,12 +202,12 @@ transaction_prepare() {
   if ! transaction_build_quiesce_list \
     "${RESTORE_TRANSACTION_DIR}/shared.tsv" \
     "${RESTORE_TRANSACTION_DIR}/managed_names.list" "$quiesce_list_file"; then
-    warn "无法完整生成目标端停机名单，尚未停止服务或回灌数据。"
+    warn "无法确定需要临时停止哪些容器，已停止（没有停止服务，也没有写入数据）。"
     return 1
   fi
   mapfile -t quiesce_names <"$quiesce_list_file"
   for name in "${quiesce_names[@]}"; do
-    say "准备暂停目标端服务或共享数据的容器：$name"
+    say "临时停止新服务器上的容器：$name"
   done
   transaction_quiesce_containers "${quiesce_names[@]}" || return 1
 
@@ -232,7 +238,7 @@ transaction_commit() {
   # 这是不可逆提交点：新服务及数据已验证，共享写入者也已恢复。
   # EXIT handler 始终保持不变，只用这一条赋值区分“可回滚”与“已提交”；
   # 因此 INT/TERM 不会落入 trap 切换或两个状态变量之间的竞态窗口。
-  RESTORE_STAGE="提交与清理回滚点"
+  RESTORE_STAGE="清理还原资料"
   RESTORE_COMMIT_STARTED=1
   TRANSACTION_ACTIVE=0
   if ! run_with_activity "提交事务：清理旧容器、镜像和数据回滚点" \
@@ -242,12 +248,12 @@ transaction_commit() {
   fi
   if ! run_with_activity "提交事务：删除临时事务目录" \
     rm -rf "$RESTORE_TRANSACTION_DIR"; then
-    warn "服务与数据已恢复，但事务目录清理失败：$RESTORE_TRANSACTION_DIR"
+    warn "服务和数据已经恢复，但临时文件夹没能删除：$RESTORE_TRANSACTION_DIR"
     return 1
   fi
   RESTORE_TRANSACTION_DIR=""
   export RESTORE_TRANSACTION_DIR
   transaction_release_lock
   RESTORE_STAGE="完成"
-  say "所有服务与数据已通过验证，恢复事务已提交。"
+  say "所有服务和数据都已验证通过。"
 }

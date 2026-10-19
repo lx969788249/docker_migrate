@@ -247,7 +247,7 @@ while ((dependency_added == 1)); do
       done
       ((dep_selected == 0)) || continue
       dep_name="$(docker inspect -f '{{.Name}}' "$dep_id" 2>/dev/null | sed 's#^/##')"
-      warn_user "自动加入被依附的容器 ${dep_name:-${dep_id:0:12}}（其他所选容器共享它的网络或进程命名空间）"
+      warn_user "自动加入被依附的容器 ${dep_name:-${dep_id:0:12}}（选中的容器要借用它的网络，必须一起迁移）"
       IDS+=("${dep_id:0:12}")
       dependency_added=1
     done < <(docker inspect -f '{{.HostConfig.NetworkMode}}

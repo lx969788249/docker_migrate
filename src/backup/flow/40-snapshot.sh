@@ -213,9 +213,12 @@ for id in "${IDS[@]}"; do
           BACKUP_FAILURES+=("数据卷 ${vname} 打包失败")
           continue
         fi
-        PACKED_BYTES=$((${PACKED_BYTES:-0} + $(progress_current "count:${out}.count")))
+        item_bytes="$(progress_current "count:${out}.count")"
+        PACKED_BYTES=$((${PACKED_BYTES:-0} + item_bytes))
         rm -f "${out}.count"
-        MAN_VOL+=("$(jq -cn --arg name "$vname" --arg dest "$dest" --arg driver "$v_driver" --argjson opts "$v_opts_json" '{name:$name,dest:$dest,driver:$driver,opts:$opts}')")
+        MAN_VOL+=("$(jq -cn --arg name "$vname" --arg dest "$dest" --arg driver "$v_driver" \
+          --argjson opts "$v_opts_json" --argjson bytes "$item_bytes" \
+          '{name:$name,dest:$dest,driver:$driver,opts:$opts,bytes:$bytes}')")
         ;;
       bind)
         src=$(jq -r '.Source' <<<"$m")
@@ -257,11 +260,12 @@ for id in "${IDS[@]}"; do
           BACKUP_FAILURES+=("挂载目录 ${src} 打包失败")
           continue
         fi
-        PACKED_BYTES=$((${PACKED_BYTES:-0} + $(progress_current "count:${out}.count")))
+        item_bytes="$(progress_current "count:${out}.count")"
+        PACKED_BYTES=$((${PACKED_BYTES:-0} + item_bytes))
         rm -f "${out}.count"
         MAN_BIND+=("$(jq -cn --arg host "$src" --arg link "$bind_link" --arg dest "$dest" \
-          --arg file "$(basename "$out")" \
-          '{host:$host,dest:$dest,file:$file} + (if $link == "" then {} else {link:$link} end)')")
+          --arg file "$(basename "$out")" --argjson bytes "$item_bytes" \
+          '{host:$host,dest:$dest,file:$file,bytes:$bytes} + (if $link == "" then {} else {link:$link} end)')")
         ;;
       *)
         detail "跳过不需要迁移的挂载类型：$t（$dest）"

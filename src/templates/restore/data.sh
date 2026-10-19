@@ -23,7 +23,7 @@ restore_volume_exact() {
   [[ "$prechecked" == "1" ]] || archive_members_safe "${archive_dir}/${archive_file}" || return 1
   mkdir -p "$rollback_dir"
   if ((existed == 1)); then
-    printf '备份目标端原卷数据：%s\n' "$volume" >&2
+    printf '先备份新服务器上原有的数据卷：%s\n' "$volume" >&2
     if ! docker run --rm \
       -v "${volume}:/from:ro" \
       -v "${rollback_dir}:/rollback" \
@@ -46,7 +46,7 @@ restore_volume_exact() {
     return 0
   fi
 
-  warn " 卷恢复失败，正在回滚目标端原数据：$volume"
+  warn " 数据卷 ${volume} 恢复失败，正在还原原来的数据"
   if [[ -n "${RESTORE_TRANSACTION_DIR:-}" ]]; then
     # 全局事务持有回滚包；不要提前删除，让统一回滚按确定顺序处理。
     return 1
@@ -195,11 +195,11 @@ restore_bind_link() {
     current="$(root_exec readlink -f "$link" 2>/dev/null || true)"
     [[ -z "$current" || "$current" != "$(root_exec readlink -f "$host" 2>/dev/null || true)" ]] ||
       return 0
-    warn " 目标端已有同名软链接但指向不同：$link -> ${current:-未知}（期望 $host）"
+    warn " 新服务器上已有同名软链接 ${link}，但它指向 ${current:-未知}（应该指向 ${host}）"
     return 1
   fi
   if root_exec test -e "$link"; then
-    warn " 目标端 $link 已存在且不是软链接，无法指向迁移的数据目录：$host"
+    warn " 新服务器上的 ${link} 已存在且不是软链接，无法让它指向迁移过来的目录 ${host}"
     return 1
   fi
   if [[ -n "${RESTORE_TRANSACTION_DIR:-}" ]]; then
@@ -207,4 +207,26 @@ restore_bind_link() {
   fi
   root_exec mkdir -p "$(dirname "$link")" || return 1
   root_exec ln -s "$host" "$link"
+}
+
+# 按预检时的选择跳过的项目或容器所独占的数据卷与目录（每行“volume<TAB>名称”
+# 或“bind<TAB>路径”）。与其他容器共用的数据照常恢复。
+restore_skipped_mounts() {
+  decisions_present || return 0
+  jq -rs --slurpfile d "$DM_RESTORE_DECISIONS" '
+    ($d[0].skip_projects // []) as $sp | ($d[0].skip_containers // []) as $sc |
+    [.[] | .[0] | {
+      skipped: ((($sp | index(.Config.Labels["com.docker.compose.project"] // "")) != null) or
+        (($sc | index(.Name | ltrimstr("/"))) != null)),
+      mounts: [.Mounts[]? | if .Type == "volume" then "volume\t\(.Name)"
+        elif .Type == "bind" then "bind\t\(.Source)" else empty end]
+    }] as $all |
+    (([$all[] | select(.skipped) | .mounts[]] | unique) -
+     ([$all[] | select(.skipped | not) | .mounts[]] | unique))[]
+  ' meta/*.inspect.json 2>/dev/null || true
+}
+
+restore_mount_skipped() {
+  [[ -n "${RESTORE_SKIPPED_MOUNTS:-}" ]] || return 1
+  grep -Fxq -- "$1"$'\t'"$2" <<<"$RESTORE_SKIPPED_MOUNTS"
 }

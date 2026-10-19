@@ -2,8 +2,8 @@ trap restore_nontransaction_exit_handler EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-RESTORE_STAGE="迁移包校验"
-restore_stage 1 "预检数据"
+RESTORE_STAGE="校验迁移包"
+restore_stage 1 "检查迁移包"
 if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" != "1" ]]; then
   if ! run_with_activity "校验每个文件" verify_bundle_checksums "$BUNDLE_DIR"; then
     error_user "迁移包文件校验失败，拒绝恢复" "请在旧服务器重新运行备份"
@@ -11,14 +11,25 @@ if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" != "1" ]]; then
   fi
 fi
 if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
-  error_user "迁移包的 manifest 结构或路径不安全，拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
+  error_user "迁移包里的清单文件有问题（格式不对或包含不安全的路径），已拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
   exit 1
 fi
 if ! transaction_internal_paths_are_safe; then
   exit 1
 fi
 
-RESTORE_STAGE="预检数据归档"
+# 在迁移包目录手动执行时也做迁移前预检（由主脚本调用时已在下载前做过）。
+if [[ "${DM_PREFLIGHT_DONE:-0}" != "1" && "${RESTORE_SKIP_PREFLIGHT:-0}" != "1" && -f plan.json ]]; then
+  DM_RESTORE_DECISIONS="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-decisions.XXXXXX")"
+  printf '{}\n' >"$DM_RESTORE_DECISIONS"
+  export DM_RESTORE_DECISIONS
+  if ! PREFLIGHT_SKIP_BASE_DISK=1 preflight_run plan.json "$DM_RESTORE_DECISIONS" "$BUNDLE_DIR"; then
+    exit 1
+  fi
+fi
+RESTORE_SKIPPED_MOUNTS="$(restore_skipped_mounts)"
+
+RESTORE_STAGE="检查数据备份文件"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! command -v python3 >/dev/null 2>&1; then
   error_user "缺少 python3（尚未停止服务或修改数据）" "安装 python3，或使用主脚本「下载备份并恢复」自动安装依赖"
@@ -76,8 +87,8 @@ else
   stage_end
 fi
 
-RESTORE_STAGE="建立统一回滚事务"
-restore_stage 3 "建立回滚点"
+RESTORE_STAGE="备份新服务器上已有的服务"
+restore_stage 3 "备份已有服务"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
   DM_PROGRESS_HINT="正在从 Docker Hub 下载，网络较慢时可能需要几分钟" \
@@ -90,7 +101,7 @@ fi
 transaction_prepare
 stage_end
 
-RESTORE_STAGE="回灌命名卷"
+RESTORE_STAGE="恢复数据卷"
 restore_stage 4 "恢复数据"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p volumes
@@ -101,6 +112,10 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       error_user "迁移包缺少数据卷 ${vname} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_VOLUMES+=("$vname")
       break
+    fi
+    if decision_listed keep_volumes "$vname" || restore_mount_skipped volume "$vname"; then
+      say "按预检时的选择不写入数据卷：${vname}"
+      continue
     fi
     say "恢复数据卷：${vname}"
     # 使用备份时记录的 driver 和 options 创建卷；同名卷已存在时必须先
@@ -150,7 +165,7 @@ if ((${#FAILED_VOLUMES[@]} > 0)); then
   exit 1
 fi
 
-RESTORE_STAGE="回灌绑定目录"
+RESTORE_STAGE="恢复挂载目录"
 if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p binds
   while IFS= read -r row; do
@@ -158,6 +173,10 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     file=$(jq -r '.file' <<<"$row")
     bind_link=$(jq -r '.link // empty' <<<"$row")
     bind_path_is_system "$host" && continue
+    if restore_mount_skipped bind "$host" || { [[ -n "$bind_link" ]] && restore_mount_skipped bind "$bind_link"; }; then
+      say "按预检时的选择不写入目录：${host}"
+      continue
+    fi
     if [[ ! -f "binds/$file" ]]; then
       error_user "迁移包缺少挂载目录 ${host} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_BINDS+=("$host")
@@ -244,6 +263,10 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     say "恢复 Compose 项目：${name}"
     mkdir -p "${COMPOSE_RESTORE_ROOT}/${name}"
 
+    if decision_listed skip_projects "$name"; then
+      say "按预检时的选择跳过 Compose 项目：${name}"
+      continue
+    fi
     if [[ -n "${SKIP_PROJECTS[$name]:-}" ]]; then
       warn_user "Compose 项目 ${name} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       continue
@@ -319,7 +342,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
   done < <(jq -c '.projects[]' manifest.json)
 fi
 
-RESTORE_STAGE="创建独立容器网络"
+RESTORE_STAGE="创建网络"
 say "创建自定义网络"
 declare -A COMPOSE_NETS=()
 while IFS= read -r n; do
@@ -397,12 +420,16 @@ restore_runs_in_dependency_order() {
   done
 }
 
-RESTORE_STAGE="恢复独立容器"
+RESTORE_STAGE="启动容器"
 if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
     cname_from_script="${r#runs/}"
     cname_from_script="${cname_from_script%.sh}"
+    if decision_listed skip_containers "$cname_from_script"; then
+      say "按预检时的选择保留已有容器：${cname_from_script}"
+      continue
+    fi
     if [[ -n "${SKIP_CONTAINERS[$cname_from_script]:-}" ]]; then
       warn_user "容器 ${cname_from_script} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       continue

@@ -14,7 +14,7 @@ transaction_acquire_lock() {
     if ! flock -n 201 2>/dev/null; then
       exec 201>&-
       RESTORE_LOCK_METHOD=""
-      warn "另一个 Docker 恢复事务正在运行，已拒绝并发恢复。"
+      warn "另一个恢复任务正在运行，请等它结束后再试。"
       return 1
     fi
     return 0
@@ -32,7 +32,7 @@ transaction_acquire_lock() {
     fi
     if ! mkdir "$RESTORE_LOCK_DIR" 2>/dev/null; then
       RESTORE_LOCK_METHOD=""
-      warn "另一个 Docker 恢复事务正在运行，已拒绝并发恢复。"
+      warn "另一个恢复任务正在运行，请等它结束后再试。"
       return 1
     fi
   fi
@@ -213,12 +213,12 @@ transaction_internal_paths_are_safe() {
   rollback_base="${RESTORE_ROLLBACK_BASE:-${HOME:-${BUNDLE_DIR}}/.docker_migrate_rollback}"
   lock_base="${RESTORE_LOCK_BASE:-${HOME:-${BUNDLE_DIR}}/.docker_migrate_locks}"
   local -a protected_paths=(
-    "迁移包目录" "$BUNDLE_DIR"
-    "事务回滚目录" "$rollback_base"
-    "并发锁目录" "$lock_base"
+    "迁移包所在目录" "$BUNDLE_DIR"
+    "还原资料目录" "$rollback_base"
+    "锁文件目录" "$lock_base"
   )
   if [[ -n "${RESTORE_SESSION_DIR:-}" ]]; then
-    protected_paths+=("下载恢复会话目录" "$RESTORE_SESSION_DIR")
+    protected_paths+=("下载目录" "$RESTORE_SESSION_DIR")
   fi
 
   while IFS= read -r host; do
@@ -230,9 +230,9 @@ transaction_internal_paths_are_safe() {
       protected="${protected_paths[$((protected_i + 1))]}"
       normalized_protected="$(transaction_normalize_path "$protected")" || return 1
       if mount_paths_overlap "$normalized_host" "$normalized_protected"; then
-        warn "绑定目录与 ${label} 重叠，已在改动目标数据前拒绝恢复：$host"
-        warn "冲突路径：$normalized_protected"
-        warn "请把 RESTORE_BASE、RESTORE_ROLLBACK_BASE 与 RESTORE_LOCK_BASE 放到该 bind 之外后重试。"
+        warn "挂载目录 ${host} 和${label}重叠，为避免覆盖，已在改动数据前停止"
+        warn "重叠的位置：$normalized_protected"
+        warn "请把 RESTORE_BASE、RESTORE_ROLLBACK_BASE、RESTORE_LOCK_BASE 设置到这个目录之外后重试。"
         return 1
       fi
     done

@@ -217,7 +217,7 @@ test_final_result_summaries_are_unambiguous() {
     '' '' '恢复文件已保留，便于排查' '/tmp/session' '' '8 秒')"
   [[ "$(grep -Fc '结果：' <<<"$rolled_back")" -eq 1 ]]
   grep -Fq '结果：❌ 恢复失败，已安全回滚' <<<"$rolled_back"
-  grep -Fq '目标端状态：旧服务与原数据已恢复' <<<"$rolled_back"
+  grep -Fq '新服务器：原来的服务和数据已还原' <<<"$rolled_back"
 
   incomplete="$(print_restore_result_summary FAILED_ROLLBACK_INCOMPLETE 回灌命名卷 \
     '' '' '恢复文件已保留，便于排查' '/tmp/session' '/tmp/rollback' '9 秒')"
@@ -251,7 +251,7 @@ test_transfer_instructions_are_concise() {
   output="$(print_transfer_instructions "$url" interactive)"
   [[ "$(grep -Fc "$url" <<<"$output")" -eq 1 ]]
   [[ "$(grep -Fc '选择「2) 下载备份并恢复」' <<<"$output")" -eq 1 ]]
-  grep -Fq '按回车停止传输服务并清理临时文件' <<<"$output"
+  grep -Fq '按回车，停止传输并清理临时文件' <<<"$output"
   ! grep -Fq '可信渠道' <<<"$output"
   ! grep -Fq 'HTTP 服务日志' <<<"$output"
 }
@@ -1301,6 +1301,162 @@ test_releasing_restore_lock_keeps_stderr() {
   [[ "$output" == *still-visible* ]]
 }
 
+# 模拟一台新服务器：80 端口被 nginx 占用，已有网段 172.30.0.0/16，已有同名容器 web。
+preflight_fake_host() {
+  local dir="$1" arch="${2:-x86_64}"
+  mkdir -p "${dir}/bin" "${dir}/docker-root"
+  cat >"${dir}/bin/docker" <<SH
+#!/bin/sh
+case "\$*" in
+  "info --format {{json .}}")
+    printf '{"Architecture":"${arch}","ServerVersion":"20.10.24","DockerRootDir":"${dir}/docker-root","Runtimes":{"runc":{}},"Plugins":{"Volume":["local"]},"MemTotal":8589934592}\n' ;;
+  "compose version") exit 0 ;;
+  "ps -a --format"*) printf 'web\t\t0.0.0.0:8080->80/tcp\n' ;;
+  "volume inspect"*) exit 1 ;;
+  "network ls -q") printf 'n1\n' ;;
+  "network inspect n1") printf '[{"Name":"other","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.30.0.0/16"}]},"Containers":{}}]\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  cat >"${dir}/bin/ss" <<'SH'
+#!/bin/sh
+case "$1" in
+  -Hltnp) printf 'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=812,fd=6))\n' ;;
+  *) : ;;
+esac
+SH
+  chmod +x "${dir}/bin/docker" "${dir}/bin/ss"
+  jq -n '{version:1, source:{arch:"x86_64", docker:"27.1.1"},
+    sizes:{bundle:1024, images:1024, volumes:0, binds:0}, needs_compose:true, projects:["blog"],
+    containers:[
+      {name:"api", project:"", network_mode:"mynet", runtime:"", devices:[], memory:0,
+       ports:[{host_ip:"", host_port:"80", container_port:"8000", proto:"tcp"}],
+       networks:[{name:"mynet", ip:""}], volumes:["api_data"], binds:[]},
+      {name:"blog-web-1", project:"blog", network_mode:"blog_default", runtime:"", devices:[], memory:0,
+       ports:[{host_ip:"", host_port:"80", container_port:"80", proto:"tcp"}],
+       networks:[{name:"blog_default", ip:""}], volumes:["blog_data"], binds:[]},
+      {name:"web", project:"", network_mode:"default", runtime:"", devices:[], memory:0,
+       ports:[{host_ip:"", host_port:"8080", container_port:"80", proto:"tcp"}],
+       networks:[], volumes:[], binds:[]}],
+    volumes:[{name:"api_data", driver:"local", opts:{}, bytes:0}, {name:"blog_data", driver:"local", opts:{}, bytes:0}],
+    binds:[],
+    networks:[{name:"mynet", driver:"bridge", subnets:["172.30.1.0/24"], compose:false},
+      {name:"blog_default", driver:"bridge", subnets:["172.18.0.0/16"], compose:true}]}' >"${dir}/plan.json"
+}
+
+test_plan_url_and_encryption() {
+  local tmp secret key mac iv rc=0
+  command -v openssl >/dev/null 2>&1 || return 0
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  [[ "$(plan_url_from_bundle_url 'http://h:8080/tok/docker_migrate_1_x.tar.gz.enc#sha256=a&secret=b')" == 'http://h:8080/tok/docker_migrate_1_x.plan' ]]
+  ! plan_url_from_bundle_url 'http://h/other.zip' >/dev/null
+  secret="$(printf '0123456789abcdef%.0s' {1..8})"
+  key="$(bundle_secret_encryption_key "$secret")"
+  mac="$(bundle_secret_mac_key "$secret")"
+  iv="00112233445566778899aabbccddeeff"
+  # 计划与迁移包共用密钥，IV 必须不同。
+  [[ "$(plan_iv "$iv")" != "$iv" ]]
+  valid_hex_length "$(plan_iv "$iv")" 32
+  printf '{"version":1,"containers":[{"name":"secret-app"}]}\n' >"${tmp}/plan.json"
+  plan_encrypt "${tmp}/plan.json" "${tmp}/plan.enc" "$key" "$mac" "$iv"
+  ! grep -aFq secret-app "${tmp}/plan.enc"
+  plan_decrypt "${tmp}/plan.enc" "${tmp}/out.json" "$key" "$mac" "$iv"
+  cmp -s "${tmp}/plan.json" "${tmp}/out.json"
+  printf 'x' >>"${tmp}/plan.enc"
+  plan_decrypt "${tmp}/plan.enc" "${tmp}/bad.json" "$key" "$mac" "$iv" || rc=$?
+  [[ "$rc" -eq 2 ]]
+}
+
+test_preflight_classifies_problems() {
+  local tmp result
+  command -v python3 >/dev/null 2>&1 || return 0
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  preflight_fake_host "$tmp"
+  printf '{}\n' >"${tmp}/decisions.json"
+  result="$(PATH="${tmp}/bin:$PATH" preflight_collect "${tmp}/plan.json" "${tmp}/decisions.json" "$tmp")"
+  # 版本较旧只提示；端口、网段、同名容器需要用户选择；没有无法继续的问题。
+  jq -e '[.issues[] | select(.level == "info" and .type == "docker_version")] | length == 1' <<<"$result" >/dev/null
+  jq -e '[.issues[] | select(.level == "stop")] | length == 0' <<<"$result" >/dev/null
+  jq -e '.issues[] | select(.type == "port" and .container == "api") |
+    .holder == "nginx（进程 812）" and .suggest == "81" and .project == ""' <<<"$result" >/dev/null
+  jq -e '.issues[] | select(.type == "port" and .container == "blog-web-1") | .project == "blog"' <<<"$result" >/dev/null
+  jq -e '[.issues[] | select(.type == "subnet_conflict" and .network == "mynet")] | length == 1' <<<"$result" >/dev/null
+  jq -e '[.issues[] | select(.type == "existing_container" and .container == "web")] | length == 1' <<<"$result" >/dev/null
+  # 占用 8080 的正是将被替换的同名容器 web：不算端口冲突；Compose 网络由 Compose 自己创建，不检查网段。
+  jq -e '[.issues[] | select(.type == "port" and .container == "web")] | length == 0' <<<"$result" >/dev/null
+  jq -e '[.issues[] | select(.network == "blog_default")] | length == 0' <<<"$result" >/dev/null
+  grep -Fq '端口 80 已被 nginx（进程 812）占用，容器 api 需要使用它' <<<"$result"
+
+  # 用户的选择会消除对应问题：api 换端口、跳过 blog、网段自动、替换 web。
+  jq -n '{port_map:[{container:"api", host_ip:"", host_port:"80", container_port:"8000", proto:"tcp", new_port:"81"}],
+    skip_projects:["blog"], auto_subnet:["mynet"], replace_containers:["web"]}' >"${tmp}/decisions.json"
+  result="$(PATH="${tmp}/bin:$PATH" preflight_collect "${tmp}/plan.json" "${tmp}/decisions.json" "$tmp")"
+  jq -e '[.issues[] | select(.level != "info")] | length == 0' <<<"$result" >/dev/null
+
+  preflight_fake_host "$tmp" aarch64
+  result="$(PATH="${tmp}/bin:$PATH" preflight_collect "${tmp}/plan.json" "${tmp}/decisions.json" "$tmp")"
+  jq -e '.issues[] | select(.level == "stop" and .type == "arch") |
+    .title == "两台服务器的 CPU 类型不同：旧服务器是 x86_64，新服务器是 aarch64"' <<<"$result" >/dev/null
+}
+
+test_preflight_run_without_terminal() {
+  local tmp output rc=0
+  command -v python3 >/dev/null 2>&1 || return 0
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  preflight_fake_host "$tmp"
+  # 非交互且没有允许自动处理：停下并说明，不做任何改动。
+  output="$(PATH="${tmp}/bin:$PATH" DM_REASON_FILE="${tmp}/reason" preflight_run \
+    "${tmp}/plan.json" "${tmp}/d1.json" "$tmp" 2>&1)" || rc=$?
+  [[ "$rc" -eq 1 ]]
+  grep -Fq '发现 4 个需要处理的问题' <<<"$output"
+  grep -Fq 'RESTORE_AUTO_RESOLVE=1' "${tmp}/reason"
+
+  # 自动处理：独立容器换端口、网段自动、替换同名容器；Compose 端口冲突无法自动处理。
+  rc=0
+  PATH="${tmp}/bin:$PATH" RESTORE_AUTO_RESOLVE=1 DM_REASON_FILE="${tmp}/reason2" \
+    preflight_run "${tmp}/plan.json" "${tmp}/d2.json" "$tmp" >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -eq 1 ]]
+  grep -Fq 'Compose 项目 blog' "${tmp}/reason2"
+  jq -e '.port_map[0].new_port == "81" and (.auto_subnet | index("mynet")) != null and
+    (.replace_containers | index("web")) != null' "${tmp}/d2.json" >/dev/null
+
+  # 用户已决定跳过 blog 后，自动处理可以完成全部问题。
+  jq -n '{skip_projects:["blog"], skipped_reasons:[{project:"blog", reason:"端口 80 被占用"}]}' >"${tmp}/d3.json"
+  PATH="${tmp}/bin:$PATH" RESTORE_AUTO_RESOLVE=1 preflight_run "${tmp}/plan.json" "${tmp}/d3.json" "$tmp" >/dev/null 2>&1
+  output="$(print_decision_summary "${tmp}/d3.json")"
+  grep -Fq '端口变更：api 80 → 81' <<<"$output"
+  grep -Fq '⚠️ 未迁移：Compose 项目 blog（端口 80 被占用）' <<<"$output"
+  grep -Fq '重新粘贴同一个链接即可补上' <<<"$output"
+}
+
+test_restore_follows_decisions() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  jq -n '{port_map:[{container:"api", host_ip:"", host_port:"80", container_port:"8000", proto:"tcp", new_port:"81"},
+      {container:"api", host_ip:"", host_port:"443", container_port:"8443", proto:"tcp", new_port:""}],
+    auto_ip:[{container:"api", network:"n1"}], auto_subnet:["n2"], skip_projects:["blog"]}' >"${tmp}/d.json"
+  (
+    export DM_RESTORE_DECISIONS="${tmp}/d.json"
+    [[ "$(decision_port api "" 80 8000 tcp)" == 81 ]]
+    decision_port api "" 443 8443 tcp >"${tmp}/unpublish"
+    [[ ! -s "${tmp}/unpublish" ]] || [[ "$(<"${tmp}/unpublish")" == "" ]]
+    ! decision_port api "" 22 22 tcp >/dev/null
+    decision_auto_ip api n1
+    decision_auto_ip other n2
+    ! decision_auto_ip api n3
+    decision_listed skip_projects blog
+    ! decision_listed skip_projects shop
+  )
+  ! (
+    unset DM_RESTORE_DECISIONS
+    decision_listed skip_projects blog
+  )
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
@@ -1351,6 +1507,10 @@ run_test "stage lines and failure summary are clear" test_stage_lines_and_summar
 run_test "byte meter and download totals feed the progress bar" test_progress_meter_counts_bytes
 run_test "--diagnose collects a redacted report" test_diagnose_collects_redacted_report
 run_test "releasing the restore lock keeps error output visible" test_releasing_restore_lock_keeps_stderr
+run_test "migration plan URL is derived and the plan is encrypted and signed" test_plan_url_and_encryption
+run_test "pre-flight check classifies problems by impact" test_preflight_classifies_problems
+run_test "pre-flight without a terminal stops or auto-resolves safely" test_preflight_run_without_terminal
+run_test "restore follows the pre-flight decisions" test_restore_follows_decisions
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

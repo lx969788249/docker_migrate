@@ -176,13 +176,67 @@ restore_extract() {
   progress_meter "$count_file" <"$archive" | tar -xzf - -C "$outdir"
 }
 
+# 迁移前预检：从同一个链接推算迁移计划的地址，下载、验证后检查新服务器。
+# 旧版源端没有迁移计划时静默跳过。返回 1 表示发现了无法继续的问题。
+restore_preflight() {
+  local download_url="$1" encryption_key="$2" mac_key="$3" iv="$4" decisions="$5"
+  local plan_url work rc=0 summary
+  plan_url="$(plan_url_from_bundle_url "$download_url")" || return 0
+  work="$(mktemp -d "${TMPDIR:-/tmp}/docker-migrate-plan.XXXXXX")" || return 0
+  log_line "迁移计划地址：${plan_url}"
+  if ! curl -fsS --globoff --max-time 30 --retry 2 -o "${work}/plan.enc" --url "$plan_url" \
+    2>>"${DM_LOG_FILE:-/dev/null}"; then
+    log_line "没有获取到迁移计划（旧服务器可能是旧版本），跳过迁移前预检"
+    rm -rf "$work"
+    stage_end "旧服务器没有提供迁移计划，已跳过"
+    return 0
+  fi
+  plan_decrypt "${work}/plan.enc" "${work}/plan.json" "$encryption_key" "$mac_key" "$iv" || rc=$?
+  if ((rc != 0)); then
+    rm -rf "$work"
+    if ((rc == 2)); then
+      error_user "迁移计划的签名校验失败，链接可能没有复制完整" "请重新完整复制旧服务器输出的链接"
+      return 1
+    fi
+    log_line "迁移计划无法解析，跳过迁移前预检"
+    stage_end "已跳过"
+    return 0
+  fi
+  if ! preflight_run "${work}/plan.json" "$decisions" "$RESTORE_BASE_DIR"; then
+    rm -rf "$work"
+    return 1
+  fi
+  RESTORE_BASE_DIR="$(jq -r --arg d "$RESTORE_BASE_DIR" '.restore_base // $d' "$decisions")"
+  summary="${PREFLIGHT_CONTAINERS:-0} 个容器 · 需要约 $(human "${PREFLIGHT_NEED_BYTES:-0}")"
+  if [[ "$(jq '[.port_map, .skip_projects, .skip_containers, .auto_ip, .auto_subnet, .reuse_network, .keep_volumes] |
+    map(length? // 0) | add' "$decisions" 2>/dev/null || echo 0)" != "0" ]]; then
+    summary+=" · 已按你的选择调整"
+  fi
+  rm -rf "$work"
+  stage_end "$summary"
+}
+
+# 恢复工作目录建立之前的退出：失败时告诉用户日志位置，成功时删除日志。
+restore_early_exit() {
+  local rc="$1"
+  trap - EXIT
+  if ((rc == 0)); then
+    log_finish 1
+  else
+    stage_fail
+    [[ -z "${DM_LOG_FILE:-}" ]] || printf '日志：%s（反馈问题时请附上这个文件）\n' "$DM_LOG_FILE" >&2
+  fi
+  exit "$rc"
+}
+
 restore_main() {
   local URL DOWNLOAD_URL EXPECTED_SHA256 ENCRYPTION_SCHEME ENCRYPTION_SECRET
   local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY tgz_bytes free_bytes
-  local restore_started=$SECONDS
+  local restore_started=$SECONDS decisions
   URL="$(restore_prompt_url "${1:-}")"
   log_init restore
-  stage_begin 1 8 "检查环境"
+  trap 'restore_early_exit $?' EXIT
+  stage_begin 1 9 "检查环境"
   DOWNLOAD_URL="$(bundle_download_url "$URL")"
   EXPECTED_SHA256="$(bundle_expected_sha256 "$URL")"
   ENCRYPTION_SCHEME="$(bundle_encryption_scheme "$URL")"
@@ -196,12 +250,32 @@ restore_main() {
     ! valid_hex_length "$ENCRYPTION_SECRET" 128 ||
     ! valid_hex_length "$ENCRYPTION_IV" 32 ||
     ! valid_hex_length "$ENCRYPTION_MAC" 64; then
-    error_user "链接缺少有效的 sha256/enc/secret/iv/mac 参数" \
+    error_user "链接不完整，缺少解密和校验需要的部分" \
       "请完整复制旧服务器输出的链接；如果旧服务器运行的是旧版脚本，请用最新版重新生成"
     exit 1
   fi
   restore_ensure_deps
-  local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
+  stage_end "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
+
+  stage_begin 2 9 "迁移前预检"
+  RESTORE_BASE_DIR="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
+  decisions="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-decisions.XXXXXX")"
+  printf '{}\n' >"$decisions"
+  if [[ "${RESTORE_SKIP_PREFLIGHT:-0}" == "1" ]]; then
+    stage_end "已按 RESTORE_SKIP_PREFLIGHT=1 跳过"
+  elif ! restore_preflight "$DOWNLOAD_URL" "$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")" \
+    "$(bundle_secret_mac_key "$ENCRYPTION_SECRET")" "$ENCRYPTION_IV" "$decisions"; then
+    rm -f "$decisions"
+    exit 1
+  fi
+  if [[ "${RESTORE_CHECK_ONLY:-0}" == "1" ]]; then
+    printf '\n预检通过，没有下载或修改任何内容。去掉 --check 重新运行即可开始迁移。\n'
+    print_decision_summary "$decisions"
+    rm -f "$decisions"
+    exit 0
+  fi
+
+  local BASE="$RESTORE_BASE_DIR"
   mkdir -p "$BASE"
   BASE="$(cd "$BASE" && pwd -P)" || {
     error_user "无法访问恢复目录：$BASE" "设置 RESTORE_BASE 指向一个可写的目录后重试"
@@ -216,7 +290,9 @@ restore_main() {
     rmdir "$SESSION_DIR" 2>/dev/null || true
     exit 1
   fi
-  stage_end "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
+  mv "$decisions" "${SESSION_DIR}/decisions.json"
+  decisions="${SESSION_DIR}/decisions.json"
+  DM_RESTORE_DECISIONS="$decisions"
   local RID
   RID="$(basename "$DOWNLOAD_URL" | sed 's/\.tar\.gz.*$//' | tr -dc 'A-Za-z0-9_-')"
   [[ -n "$RID" ]] || RID="$(date +%s)"
@@ -227,7 +303,7 @@ restore_main() {
   local HEADER_FILE="${SESSION_DIR}/download.headers"
   local OUTDIR="${SESSION_DIR}/unpacked"
 
-  stage_begin 2 8 "下载迁移包"
+  stage_begin 3 9 "下载迁移包"
   log_line "下载地址：${DOWNLOAD_URL}"
   if ! DM_PROGRESS_HINT="长时间没有进展时，请检查旧服务器的防火墙和云厂商安全组" \
     run_with_progress "下载" "$DOWNLOAD_PARTIAL" "header:${HEADER_FILE}" \
@@ -242,7 +318,7 @@ restore_main() {
   fi
   stage_end "$(human "$(progress_file_size "$DOWNLOAD_FILE")")"
 
-  stage_begin 3 8 "校验并解密"
+  stage_begin 4 9 "校验并解密"
   ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
   MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
   if ! run_with_activity "校验摘要与签名" verify_bundle_digests \
@@ -299,7 +375,7 @@ restore_main() {
     exit 1
   fi
   if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
-    error_user "迁移包的 manifest 结构或路径不安全，拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
+    error_user "迁移包里的清单文件有问题（格式不对或包含不安全的路径），已拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
     exit 1
   fi
   stage_end "$(human "$tgz_bytes")"
@@ -315,7 +391,8 @@ restore_main() {
   DM_SUMMARY_ARMED=1
   RESTORE_CHECKSUM_VERIFIED=1 RESTORE_SESSION_DIR="$SESSION_DIR" \
     RESTORE_RESULT_FILE="$result_file" RESTORE_DEFER_FINAL_SUMMARY=1 \
-    DM_STAGE_OFFSET=3 DM_STAGE_TOTAL=8 DM_SUMMARY_ARMED=1 \
+    DM_STAGE_OFFSET=4 DM_STAGE_TOTAL=9 DM_SUMMARY_ARMED=1 \
+    DM_PREFLIGHT_DONE=1 DM_RESTORE_DECISIONS="$decisions" \
     bash "${BUNDLE_DIR}/restore.sh"
   rc=$?
   set -e

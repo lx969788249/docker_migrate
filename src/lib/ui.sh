@@ -26,12 +26,12 @@ print_restore_result_summary() {
     FAILED_ROLLED_BACK)
       printf '结果：❌ 恢复失败，已安全回滚\n'
       printf '失败阶段：%s\n' "${stage:-未知阶段}"
-      printf '目标端状态：旧服务与原数据已恢复\n'
+      printf '新服务器：原来的服务和数据已还原\n'
       ;;
     INTERRUPTED_ROLLED_BACK)
       printf '结果：⚠️ 恢复已中断，已安全回滚\n'
       printf '中断阶段：%s\n' "${stage:-未知阶段}"
-      printf '目标端状态：旧服务与原数据已恢复\n'
+      printf '新服务器：原来的服务和数据已还原\n'
       ;;
     FAILED_ROLLBACK_INCOMPLETE | INTERRUPTED_ROLLBACK_INCOMPLETE)
       if [[ "$status" == INTERRUPTED_* ]]; then
@@ -61,6 +61,7 @@ print_restore_result_summary() {
   [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
   [[ -z "$diagnostic_dir" ]] || printf '诊断目录：%s\n' "$diagnostic_dir"
   [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+  print_decision_summary "${DM_RESTORE_DECISIONS:-}"
   if [[ "$status" != "SUCCESS" ]]; then
     print_warning_summary
     print_failure_details
@@ -121,9 +122,9 @@ print_transfer_instructions() {
   printf '使用方法：在新服务器运行同一脚本 → 选择「2) 下载备份并恢复」→ 粘贴上面的完整链接。\n'
   print_firewall_hint "$port"
   if [[ "$mode" == "interactive" ]]; then
-    printf '目标端恢复成功后，回到此窗口按回车停止传输服务并清理临时文件。\n'
+    printf '新服务器恢复成功后，回到这个窗口按回车，停止传输并清理临时文件。\n'
   else
-    printf '传输服务将保持运行；目标端恢复完成后执行：kill -TERM %s\n' "$source_pid"
+    printf '传输服务会一直运行；新服务器恢复完成后执行：kill -TERM %s\n' "$source_pid"
   fi
   printf '%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 }
@@ -153,6 +154,7 @@ show_help() {
 
   --verbose                 在屏幕上显示每一步的细节（默认只写进日志）
   --diagnose                收集系统、Docker 与最近日志，生成可附到 issue 的诊断文件
+  --check=URL               只做迁移前预检（端口、磁盘、CPU 类型等），不下载也不修改任何东西
 
 环境变量:
   PORT=8080                 HTTP 端口（被占用会自动递增）
@@ -168,6 +170,8 @@ show_help() {
   DOCKER_MIGRATE_LOG_DIR    日志目录（默认 ~/docker_migrate_logs）；成功后日志自动删除，
                             失败时保留并在结果中给出路径
   DOCKER_MIGRATE_KEEP_LOG=1 成功后也保留日志
+  RESTORE_AUTO_RESOLVE=1    非交互模式下，预检发现的问题自动采用推荐处理（如自动换端口）
+  RESTORE_SKIP_PREFLIGHT=1  跳过迁移前预检
 
 宿主机系统路径（如 /etc/localtime、/proc、/sys、/dev）只在新服务器重建挂载，不迁移内容。
 不带参数运行时仍使用原有交互菜单。

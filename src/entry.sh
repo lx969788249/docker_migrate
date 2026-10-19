@@ -17,6 +17,11 @@ for ((arg_i = 0; arg_i < ${#ORIGINAL_ARGS[@]}; arg_i++)); do
     --backup) REQUESTED_MODE=1 ;;
     --diagnose) REQUESTED_MODE=diagnose ;;
     --verbose | -v) DOCKER_MIGRATE_VERBOSE=1 ;;
+    --check=*)
+      REQUESTED_MODE=2
+      export RESTORE_CHECK_ONLY=1
+      RESTORE_URL="${ORIGINAL_ARGS[$arg_i]#*=}"
+      ;;
     --restore=*)
       REQUESTED_MODE=2
       RESTORE_URL="${ORIGINAL_ARGS[$arg_i]#*=}"

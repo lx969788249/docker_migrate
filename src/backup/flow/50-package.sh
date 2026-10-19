@@ -21,7 +21,8 @@ fi
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | awk 'NF' | sort -u)
 if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
-  if progress_docker_save "${OUT_IMG}" "$(images_total_bytes "${IMAGES[@]}")" \
+  IMAGES_TOTAL_BYTES="$(images_total_bytes "${IMAGES[@]}")"
+  if progress_docker_save "${OUT_IMG}" "$IMAGES_TOTAL_BYTES" \
     docker image save "${IMAGES[@]}"; then
     detail "images.tar 已生成：$(human "$(progress_file_size "$OUT_IMG")")"
     if ! cleanup_snapshot_images; then
@@ -134,6 +135,11 @@ README
 
 stage_begin 6 7 "加密打包"
 generate_manifest_and_restore
+# 迁移计划：新服务器下载前据此预检（端口、磁盘、CPU 类型等）。
+if ! plan_build "$BUNDLE" "${IMAGES_TOTAL_BYTES:-0}" >"${BUNDLE}/plan.json"; then
+  rm -f "${BUNDLE}/plan.json"
+  warn_user "迁移计划生成失败，新服务器将跳过迁移前预检"
+fi
 run_with_activity "计算文件校验值" generate_bundle_checksums "$BUNDLE"
 
 #####################################
@@ -183,6 +189,15 @@ if ! mv "$ENCRYPTED_PARTIAL_PATH" "$ENCRYPTED_TAR_PATH"; then
   error_user "无法保存加密迁移包" "执行 df -h 检查磁盘空间后重试"
   exit 1
 fi
+# 迁移计划单独加密，与迁移包放在同一随机路径下，新服务器从同一个链接推算地址。
+PLAN_NAME="${BUNDLE_BASENAME}.plan"
+PLAN_PATH="${BUNDLE_ROOT}/${PLAN_NAME}"
+if [[ -f "${BUNDLE}/plan.json" ]] && ! plan_encrypt "${BUNDLE}/plan.json" "$PLAN_PATH" \
+  "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_MAC_KEY" "$BUNDLE_IV"; then
+  rm -f "$PLAN_PATH"
+  warn_user "迁移计划加密失败，新服务器将跳过迁移前预检"
+fi
+[[ -f "$PLAN_PATH" ]] || PLAN_PATH=""
 # 明文目录已全部进入加密包：立即删除，释放磁盘并减少明文数据停留时间。
 rm -rf "$BUNDLE" 2>/dev/null || detail "明文迁移目录暂未删除，退出时会再次清理：$BUNDLE"
 TRANSFER_NAME="${BUNDLE_BASENAME}.tar.gz.enc"

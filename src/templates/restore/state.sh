@@ -59,11 +59,11 @@ restore_print_final_result() {
       ;;
     FAILED_ROLLED_BACK)
       printf '结果：❌ 恢复失败，已安全回滚\n失败阶段：%s\n' "$RESTORE_STAGE"
-      printf '目标端状态：旧服务与原数据已恢复\n诊断目录：%s\n' "$BUNDLE_DIR"
+      printf '新服务器：原来的服务和数据已还原\n诊断目录：%s\n' "$BUNDLE_DIR"
       ;;
     INTERRUPTED_ROLLED_BACK)
       printf '结果：⚠️ 恢复已中断，已安全回滚\n中断阶段：%s\n' "$RESTORE_STAGE"
-      printf '目标端状态：旧服务与原数据已恢复\n诊断目录：%s\n' "$BUNDLE_DIR"
+      printf '新服务器：原来的服务和数据已还原\n诊断目录：%s\n' "$BUNDLE_DIR"
       ;;
     FAILED_ROLLBACK_INCOMPLETE | INTERRUPTED_ROLLBACK_INCOMPLETE)
       if [[ "$status" == INTERRUPTED_* ]]; then
@@ -88,6 +88,7 @@ restore_print_final_result() {
       ;;
   esac
   printf '耗时：%s\n' "$elapsed"
+  print_decision_summary "${DM_RESTORE_DECISIONS:-}"
   if [[ "$status" != "SUCCESS" ]]; then
     print_warning_summary
     print_failure_details

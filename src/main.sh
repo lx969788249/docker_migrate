@@ -36,7 +36,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -67,6 +67,12 @@ declare -a TEMP_IMAGES=()
 # @include lib/crypto.sh
 
 # @include lib/bundle.sh
+
+# @include lib/plan.sh
+
+# @include lib/preflight.sh
+
+# @include lib/decisions.sh
 
 # @include backup/http.sh
 

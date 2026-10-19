@@ -100,7 +100,7 @@ compose_prepare_networks() {
           warn " · 外部网络缺失且迁移包没有其配置，拒绝创建默认错误网络：$net"
           return 1
         else
-          warn " · 迁移包没有该外部网络的配置，复用目标端已有网络：$net"
+          warn " · 迁移包里没有网络 ${net} 的设置，沿用新服务器上已有的这个网络"
         fi
         ;;
       false)
@@ -132,6 +132,11 @@ create_network_from_record() {
   name="$(jq -r '.name' <<<"$row")"
   driver="$(jq -r '.driver // "bridge"' <<<"$row")"
   [[ -n "$name" && "$name" != "null" ]] || return 1
+  # 迁移前预检中选择了沿用新服务器上已有的同名网络。
+  if decision_listed reuse_network "$name" && docker network inspect "$name" >/dev/null 2>&1; then
+    log_line "按预检时的选择沿用已有网络：$name"
+    return 0
+  fi
 
   desired_core="$(jq -cS '{
     driver: (.driver // "bridge"),
@@ -166,7 +171,7 @@ create_network_from_record() {
     desired_labels="$(jq -cS '.labels // {}' <<<"$row")"
     actual_labels="$(docker network inspect "$name" | jq -cS '.[0].Labels // {}')"
     if [[ "$actual_labels" != "$desired_labels" ]]; then
-      warn " 已存在网络的 labels 与迁移记录不同，继续复用且不修改：$name"
+      warn " 网络 ${name} 已存在，只是标签和旧服务器不同，直接沿用，不做修改"
     fi
     return 0
   fi
@@ -187,6 +192,8 @@ create_network_from_record() {
 
   while IFS= read -r cfg; do
     [[ -n "$cfg" ]] || continue
+    # 迁移前预检中选择了让 Docker 自动选择网段。
+    decision_listed auto_subnet "$name" && break
     subnet="$(jq -r '.Subnet // empty' <<<"$cfg")"
     ip_range="$(jq -r '.IPRange // empty' <<<"$cfg")"
     gateway="$(jq -r '.Gateway // empty' <<<"$cfg")"
