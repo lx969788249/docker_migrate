@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.3.0
+
+### Restore fidelity
+
+- Recreate host system bind mounts (`/etc/localtime`, `/proc`, `/sys`, `/dev`, `/var/log`, and similar) without migrating or overwriting them; restores no longer fail on the `/etc/localtime` symlink.
+- Back up the real data behind symlinked bind sources and recreate the link on the target.
+- Restore standalone containers that share another container's network namespace: skip conflicting hostname, DNS, hosts and port options, restore dependencies first, and include the dependency automatically during backup.
+- Keep the image's own healthcheck instead of rewriting exec-form checks to shell form, so images without `/bin/sh` pass health verification.
+- Snapshot a container's writable layer only when it has real changes (or the image tag moved); other containers keep their original image name for normal upgrades. `DOCKER_MIGRATE_SNAPSHOT=always|never` overrides this.
+
+### Usability
+
+- Support IPv6-only servers: bracket IPv6 hosts in links, serve downloads on IPv4 and IPv6, and warn instead of silently advertising `127.0.0.1`.
+- Do not abort non-interactive `--backup` runs at the downtime prompt; ask for `--include` instead of failing at the container menu.
+- Show which TCP port to open in the firewall or security group next to the download link.
+- Check free disk space before encrypting and decrypting, and delete the plaintext bundle and the downloaded ciphertext as soon as they are no longer needed.
+
 ## 2.0.0
 
 ### Reliability

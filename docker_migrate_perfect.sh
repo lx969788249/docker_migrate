@@ -24,6 +24,7 @@
 # RESTORE_CLEAN_ALL=1   恢复失败也强制清理文件
 # RESTORE_BASE=/path    新服务器恢复目录
 # RESTORE_ROLLBACK_BASE=/path 失败回滚后需保留的 Compose 配置目录（默认 ~/.docker_migrate_rollback）
+# DOCKER_MIGRATE_SNAPSHOT=auto|always|never 容器可写层快照策略（默认仅在有改动时快照）
 #
 # 参数：
 # --no-stop             不停机备份（可能不一致，数据库慎用）
@@ -39,7 +40,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -155,11 +156,29 @@ print_source_result_summary() {
   result_end_rule
 }
 
+# 下载失败最常见的原因是端口没放行。只给出提示与命令，不擅自修改防火墙。
+print_firewall_hint() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  printf '新服务器下载失败时，请确认旧服务器防火墙和云厂商安全组已放行 TCP %s 端口' "$port"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    printf '（检测到 ufw：ufw allow %s/tcp）' "$port"
+  elif command -v firewall-cmd >/dev/null 2>&1 &&
+    [[ "$(firewall-cmd --state 2>/dev/null || true)" == "running" ]]; then
+    printf '（检测到 firewalld：firewall-cmd --add-port=%s/tcp）' "$port"
+  fi
+  printf '。\n'
+}
+
 print_transfer_instructions() {
-  local url="$1" mode="${2:-interactive}" source_pid="${3:-}"
+  local url="$1" mode="${2:-interactive}" source_pid="${3:-}" port
+  port="${url#*://}"
+  port="${port%%/*}"
+  port="${port##*:}"
   printf '\n%s\n' '━━━━━━━━━━ 迁移包已就绪 ━━━━━━━━━━'
   printf '下载链接（请完整复制）：\n%s\n\n' "$url"
   printf '使用方法：在新服务器运行同一脚本 → 选择「2) 下载备份并恢复」→ 粘贴上面的完整链接。\n'
+  print_firewall_hint "$port"
   if [[ "$mode" == "interactive" ]]; then
     printf '目标端恢复成功后，回到此窗口按回车停止传输服务并清理临时文件。\n'
   else
@@ -298,7 +317,12 @@ show_help() {
   RESTORE_KEEP=1            恢复后保留文件
   RESTORE_CLEAN_ALL=1       恢复失败也强制删除文件
   RESTORE_BASE=/path        自定义恢复目录
+  DOCKER_MIGRATE_SNAPSHOT=auto
+                            可写层快照：auto 仅在容器内有改动时快照（默认），
+                            always 总是快照，never 不迁移容器内未挂载的改动
+  STOP_SHARED_MOUNTS=1      非交互模式下允许临时停止共享挂载的其他容器
 
+宿主机系统路径（如 /etc/localtime、/proc、/sys、/dev）只在新服务器重建挂载，不迁移内容。
 不带参数运行时仍使用原有交互菜单。
 HLP
 }
@@ -423,6 +447,21 @@ human() {
     i=$((i + 1))
   done
   echo "${b}${units[$i]}"
+}
+
+# 目录所在文件系统的可用字节数；无法获取时输出空。
+free_disk_bytes() {
+  df -Pk "$1" 2>/dev/null | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }'
+}
+
+# 可用空间不足 need 字节时返回 1 并打印提示；无法判断时放行。
+ensure_free_space() {
+  local dir="$1" need="$2" label="$3" free
+  free="$(free_disk_bytes "$dir")"
+  [[ "$free" =~ ^[0-9]+$ && "$need" =~ ^[0-9]+$ ]] || return 0
+  ((free >= need)) && return 0
+  RED "[ERR] ${label}需要约 $(human "$need") 可用空间，${dir} 所在磁盘只剩 $(human "$free")。"
+  return 1
 }
 
 progress_file_size() {
@@ -618,6 +657,31 @@ get_public_ip_external() {
   return 1
 }
 
+get_public_ipv6() {
+  local ip
+  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  if [[ "$ip" == *:* && "$ip" != fe80:* && "$ip" != fd* && "$ip" != fc* && "$ip" != ::1 ]]; then
+    echo "$ip"
+    return 0
+  fi
+  ip="$(curl -6 -fsS --max-time 2 https://api64.ipify.org 2>/dev/null | tr -d '\r\n' || true)"
+  if [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* ]]; then
+    echo "$ip"
+    return 0
+  fi
+  return 1
+}
+
+# URL 中的 IPv6 地址必须加方括号，否则端口会被当成地址的一部分。
+url_host() {
+  local host="$1"
+  if [[ "$host" == *:* && "$host" != \[* ]]; then
+    printf '[%s]\n' "$host"
+  else
+    printf '%s\n' "$host"
+  fi
+}
+
 pick_advertise_url() {
   local port="$1"
   local host=""
@@ -630,10 +694,15 @@ pick_advertise_url() {
       host="$via_route"
     fi
     [[ -z "$host" ]] && host="$(get_public_ip_external || true)"
+    # 纯 IPv6 服务器没有可用的 IPv4 地址。
+    [[ -z "$host" ]] && host="$(get_public_ipv6 || true)"
     [[ -z "$host" ]] && host="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1 || true)"
-    : "${host:=127.0.0.1}"
+    if [[ -z "$host" ]]; then
+      host="127.0.0.1"
+      YEL "[WARN] 无法探测本机对外地址，链接暂用 127.0.0.1，新服务器无法访问；请用 ADVERTISE_HOST=公网IP或域名 重新运行。" >&2
+    fi
   fi
-  echo "http://${host}:${port}"
+  echo "http://$(url_host "$host"):${port}"
 }
 
 pick_free_port() {
@@ -717,6 +786,44 @@ mount_paths_overlap() {
   [[ "$left" == "$right" || "$left" == "${right}/"* || "$right" == "${left}/"* ]]
 }
 
+# 宿主机系统路径只在目标端重建挂载关系，不迁移其内容：这些路径属于宿主机
+# 本身（时区、DNS、内核模块、伪文件系统等），覆盖目标端会破坏新服务器。
+# 第一组匹配自身及其子路径；第二组是只在完全相同时才算系统路径的大目录。
+SYSTEM_BIND_PREFIXES=(
+  /proc /sys /dev /run /var/run /boot /lib/modules /usr/lib/modules
+  /var/lib/docker /var/lib/containerd /var/log /etc/docker /etc/systemd
+  /lib/systemd /usr/lib/systemd /etc/localtime /etc/timezone /usr/share/zoneinfo
+  /etc/hostname /etc/hosts /etc/resolv.conf /etc/machine-id /etc/os-release
+  /usr/lib/os-release /etc/passwd /etc/group /etc/shadow /etc/gshadow
+  /etc/ssl /etc/pki /etc/ca-certificates
+)
+SYSTEM_BIND_EXACT=(
+  / /etc /usr /usr/lib /usr/bin /usr/local /var /var/lib /lib /lib64 /bin /sbin
+  /opt /home /root /srv /mnt /media /tmp
+)
+
+bind_path_is_system() {
+  local path="$1" prefix
+  [[ "$path" == "/" ]] || path="${path%/}"
+  for prefix in "${SYSTEM_BIND_EXACT[@]}"; do
+    [[ "$path" != "$prefix" ]] || return 0
+  done
+  for prefix in "${SYSTEM_BIND_PREFIXES[@]}"; do
+    [[ "$path" != "$prefix" && "$path" != "${prefix}/"* ]] || return 0
+  done
+  return 1
+}
+
+# bind 源本身是软链接时（如 /srv/app -> /data/app），Docker 挂载的是链接目标。
+# 返回真实路径，供备份真实数据；无法解析时原样返回。
+bind_resolve_source() {
+  local path="$1" resolved=""
+  if [[ -L "$path" ]]; then
+    resolved="$(realpath "$path" 2>/dev/null || readlink -f "$path" 2>/dev/null || true)"
+  fi
+  printf '%s\n' "${resolved:-$path}"
+}
+
 collect_shared_running_containers() {
   local selected_id selected_full_id id name inspect mount type source selected_path reason
   declare -A selected_ids=() selected_volumes=()
@@ -737,7 +844,10 @@ collect_shared_running_containers() {
       [[ -n "$source" ]] && selected_volumes["$source"]=1
     done < <(jq -r '.[0].Mounts[]? | select(.Type == "volume") | .Name' <<<"$inspect")
     while IFS= read -r source; do
-      [[ -n "$source" ]] && selected_binds+=("$source")
+      # 系统路径不迁移数据，共享它们的容器（如都挂载 /etc/localtime）无需停机。
+      if [[ -n "$source" ]] && ! bind_path_is_system "$source"; then
+        selected_binds+=("$(bind_resolve_source "$source")")
+      fi
     done < <(jq -r '.[0].Mounts[]? | select(.Type == "bind") | .Source' <<<"$inspect")
   done
 
@@ -760,6 +870,8 @@ collect_shared_running_containers() {
           ;;
         bind)
           source="$(jq -r '.Source' <<<"$mount")"
+          bind_path_is_system "$source" && continue
+          source="$(bind_resolve_source "$source")"
           for selected_path in "${selected_binds[@]}"; do
             if mount_paths_overlap "$source" "$selected_path"; then
               reason="bind:${source}"
@@ -1130,6 +1242,58 @@ snapshot_container_image() {
   mv "$tmp" "$metadata_file"
 }
 
+# docker diff 中是否有值得迁移的可写层改动。只列出因子项变化而被标记为
+# C 的父目录、以及运行时临时目录，都不算改动。无法判断时保守地返回“有改动”。
+container_writable_layer_changed() {
+  local container_id="$1" diff_output
+  diff_output="$(docker diff "$container_id" 2>/dev/null)" || return 0
+  awk '
+    NF >= 2 {
+      kind[NR] = $1
+      path = substr($0, index($0, " ") + 1)
+      paths[NR] = path
+      parent = path
+      while (sub(/\/[^\/]*$/, "", parent) && parent != "") parents[parent] = 1
+    }
+    END {
+      for (i in paths) {
+        p = paths[i]
+        if (kind[i] == "C" && (p in parents)) continue
+        if (p ~ /^\/(tmp|var\/tmp|run|var\/run|var\/cache|root\/\.cache|dev|proc|sys)(\/|$)/) continue
+        found = 1
+        exit
+      }
+      exit found ? 0 : 1
+    }
+  ' <<<"$diff_output"
+}
+
+# 输出需要为容器创建可写层快照的原因；无需快照时输出为空。默认只在可写层
+# 确有改动、或原镜像标签已指向别的版本时快照，其余容器保留原镜像名，便于
+# 之后用 docker pull / compose pull / watchtower 正常升级。
+# DOCKER_MIGRATE_SNAPSHOT=always 恢复旧行为；never 放弃可写层改动。
+container_snapshot_reason() {
+  local container_id="$1" metadata_file="$2" mode="${DOCKER_MIGRATE_SNAPSHOT:-auto}"
+  local original_image container_image_id tag_id
+  original_image="$(jq -r '.[0].Config.Image' "$metadata_file")"
+  container_image_id="$(jq -r '.[0].Image // empty' "$metadata_file")"
+  tag_id="$(docker image inspect -f '{{.Id}}' "$original_image" 2>/dev/null || true)"
+  if [[ -z "$tag_id" || "$tag_id" != "$container_image_id" ]]; then
+    printf '原镜像标签已不存在或指向其他版本\n'
+    return 0
+  fi
+  case "$mode" in
+    always)
+      printf 'DOCKER_MIGRATE_SNAPSHOT=always\n'
+      return 0
+      ;;
+    never) return 0 ;;
+  esac
+  if container_writable_layer_changed "$container_id"; then
+    printf '可写层有改动\n'
+  fi
+}
+
 write_compose_snapshot_override() {
   local file="$1" service="$2" image="$3" tmp
   if [[ ! -f "$file" ]]; then
@@ -1245,7 +1409,10 @@ bundle_manifest_is_safe() {
       (.host | type == "string" and startswith("/") and . != "/" and
         (test("(^|/)\\.\\.(/|$)") | not) and
         all(explode[]; . >= 32 and . != 127)) and
-      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$"))
+      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$")) and
+      ((.link // null) == null or (.link | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not) and
+        all(explode[]; . >= 32 and . != 127)))
     )
   ' "$manifest" >/dev/null || return 1
 
@@ -1401,6 +1568,7 @@ resolve_container_mode() {
       return 0
     fi
   done
+  echo "[WARN] 依附的容器 ${ref:0:12} 不在迁移包中，请在源服务器把它一起迁移" >&2
   printf '%s\n' "$mode"
 }
 
@@ -1619,15 +1787,25 @@ user="$(jq -r '.[0].Config.User // empty' "$META")"
 workdir="$(jq -r '.[0].Config.WorkingDir // empty' "$META")"
 [[ -n "$workdir" ]] && args+=(-w "$workdir")
 
+# 共享 host 或其他容器的网络命名空间时，hostname、DNS、hosts 与端口都继承自
+# 宿主机/被依附容器：inspect 里记录的是对方的值，再传给 docker run 会被拒绝
+# （conflicting options: hostname and the network mode）或在新服务器上失真。
+raw_network_mode="$(jq -r '.[0].HostConfig.NetworkMode // empty' "$META")"
+netns_shared=""
+case "$raw_network_mode" in
+  host) netns_shared="host" ;;
+  container:*) netns_shared="container" ;;
+esac
+
 cid="$(jq -r '.[0].Id' "$META")"
 default_host="${cid:0:12}"
 hostname="$(jq -r '.[0].Config.Hostname // empty' "$META")"
-if [[ -n "$hostname" && "$hostname" != "$default_host" ]]; then
+if [[ -z "$netns_shared" && -n "$hostname" && "$hostname" != "$default_host" ]]; then
   args+=(--hostname "$hostname")
 fi
 
 domainname="$(jq -r '.[0].Config.Domainname // empty' "$META")"
-[[ -n "$domainname" ]] && args+=(--domainname "$domainname")
+[[ -n "$netns_shared" || -z "$domainname" ]] || args+=(--domainname "$domainname")
 
 mapfile -t envs < <(jq -r '.[0].Config.Env[]?' "$META")
 for e in "${envs[@]}"; do args+=(-e "$e"); done
@@ -1709,14 +1887,22 @@ if [[ -n "$uts_mode" && "$uts_mode" != "null" && "$uts_mode" != "default" ]]; th
 fi
 
 # --- 健康检查: 正确区分 NONE / CMD / CMD-SHELL ---
+# 镜像（含 docker commit 生成的快照镜像）已带有相同的健康检查时不再传参：
+# docker run 只能表达 CMD-SHELL，把 exec 形式的 CMD 改写成 shell 形式会让
+# 没有 /bin/sh 的镜像（如 distroless）健康检查永远失败。
 hc_kind="$(jq -r '.[0].Config.Healthcheck.Test[0] // empty' "$META" 2>/dev/null || true)"
-if [[ "$hc_kind" == "NONE" ]]; then
+meta_hc="$(jq -cS '.[0].Config.Healthcheck // null' "$META" 2>/dev/null || echo null)"
+image_hc="$(docker image inspect "$image" 2>/dev/null | jq -cS '.[0].Config.Healthcheck // null' 2>/dev/null || echo null)"
+if [[ "$meta_hc" == "$image_hc" ]]; then
+  :
+elif [[ "$hc_kind" == "NONE" ]]; then
   args+=(--no-healthcheck)
 elif [[ "$hc_kind" == "CMD" || "$hc_kind" == "CMD-SHELL" ]]; then
   if [[ "$hc_kind" == "CMD-SHELL" ]]; then
     hc_test="$(jq -r '.[0].Config.Healthcheck.Test[1] // empty' "$META")"
   else
     hc_test="$(jq -r '.[0].Config.Healthcheck.Test[1:] | map(@sh) | join(" ")' "$META")"
+    echo "[WARN] docker run 只支持 shell 形式健康检查，已改写为：$hc_test（镜像需包含 /bin/sh）" >&2
   fi
   hc_interval="$(jq -r '.[0].Config.Healthcheck.Interval // 30000000000' "$META")"
   hc_timeout="$(jq -r '.[0].Config.Healthcheck.Timeout // 30000000000' "$META")"
@@ -1747,15 +1933,17 @@ for g in "${group_add[@]}"; do args+=(--group-add "$g"); done
 mapfile -t storage_opts < <(jq -r '.[0].HostConfig.StorageOpt // {} | to_entries[]? | "\(.key)=\(.value)"' "$META")
 for s in "${storage_opts[@]}"; do args+=(--storage-opt "$s"); done
 
-mapfile -t extra_hosts < <(jq -r '.[0].HostConfig.ExtraHosts[]?' "$META")
-for h in "${extra_hosts[@]}"; do args+=(--add-host "$h"); done
+if [[ "$netns_shared" != "container" ]]; then
+  mapfile -t extra_hosts < <(jq -r '.[0].HostConfig.ExtraHosts[]?' "$META")
+  for h in "${extra_hosts[@]}"; do args+=(--add-host "$h"); done
 
-mapfile -t dns_list < <(jq -r '.[0].HostConfig.Dns[]?' "$META")
-for d in "${dns_list[@]}"; do args+=(--dns "$d"); done
-mapfile -t dns_search < <(jq -r '.[0].HostConfig.DnsSearch[]?' "$META")
-for d in "${dns_search[@]}"; do args+=(--dns-search "$d"); done
-mapfile -t dns_opts < <(jq -r '.[0].HostConfig.DnsOptions[]?' "$META")
-for d in "${dns_opts[@]}"; do args+=(--dns-option "$d"); done
+  mapfile -t dns_list < <(jq -r '.[0].HostConfig.Dns[]?' "$META")
+  for d in "${dns_list[@]}"; do args+=(--dns "$d"); done
+  mapfile -t dns_search < <(jq -r '.[0].HostConfig.DnsSearch[]?' "$META")
+  for d in "${dns_search[@]}"; do args+=(--dns-search "$d"); done
+  mapfile -t dns_opts < <(jq -r '.[0].HostConfig.DnsOptions[]?' "$META")
+  for d in "${dns_opts[@]}"; do args+=(--dns-option "$d"); done
+fi
 
 mapfile -t cap_add < <(jq -r '.[0].HostConfig.CapAdd[]?' "$META")
 for c in "${cap_add[@]}"; do args+=(--cap-add "$c"); done
@@ -1778,13 +1966,18 @@ mapfile -t log_opts < <(jq -r '.[0].HostConfig.LogConfig.Config // {} | to_entri
 for o in "${log_opts[@]}"; do args+=(--log-opt "$o"); done
 
 publish_all="$(jq -r '.[0].HostConfig.PublishAllPorts // false' "$META")"
-if [[ "$publish_all" == "true" ]]; then
+if [[ "$publish_all" == "true" && -z "$netns_shared" ]]; then
   args+=(-P)
 fi
 
 # 关键修复：稳健还原 PortBindings。
 # 旧脚本在 HostPort 为空或 IPv6 HostIp 场景下容易生成无效 -p；这里跳过空 HostPort，并给 IPv6 加 []。
-mapfile -t port_bindings < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[]? | .key as $c | .value[]? | "\(.HostIp // "")|\(.HostPort // "")|\($c)"' "$META")
+port_bindings=()
+# host 网络下端口直接暴露在宿主机，container 网络下端口属于被依附容器；
+# 两种模式都不能（也无需）再 -p 发布。
+if [[ -z "$netns_shared" ]]; then
+  mapfile -t port_bindings < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[]? | .key as $c | .value[]? | "\(.HostIp // "")|\(.HostPort // "")|\($c)"' "$META")
+fi
 published_ports=()
 for p in "${port_bindings[@]}"; do
   host_ip="${p%%|*}"
@@ -1996,6 +2189,11 @@ elif [[ "$original_running" == "true" ]]; then
     sleep 1
   done
   echo "[完成] 容器启动验证：$name · $((SECONDS - startup_started))秒" >&2
+fi
+
+snapshot_original="$(jq -r '.[0].DockerMigrate.original_image // empty' "$META")"
+if [[ -n "$snapshot_original" ]]; then
+  echo "[INFO] ${name} 使用迁移快照镜像 ${image} 以保留容器内改动；原镜像为 ${snapshot_original}，以后升级请用原镜像重建容器。"
 fi
 
 if [[ "$original_paused" == "true" ]]; then
@@ -2730,7 +2928,10 @@ restore_manifest_is_safe() {
       (.host | type == "string" and startswith("/") and . != "/" and
         (test("(^|/)\\.\\.(/|$)") | not) and
         all(explode[]; . >= 32 and . != 127)) and
-      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$"))
+      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$")) and
+      ((.link // null) == null or (.link | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not) and
+        all(explode[]; . >= 32 and . != 127)))
     )
   ' manifest.json >/dev/null || return 1
   while IFS= read -r run; do
@@ -3043,6 +3244,58 @@ restore_bind_exact() {
   if [[ -z "${RESTORE_TRANSACTION_DIR:-}" && $had_old -eq 1 ]]; then
     root_exec rm -rf "$old" || true
   fi
+}
+
+# 与主脚本 bind_path_is_system 保持一致：旧版迁移包可能仍记录了系统路径，
+# 恢复时一律跳过，绝不覆盖目标端宿主机文件。
+RESTORE_SYSTEM_BIND_PREFIXES=(
+  /proc /sys /dev /run /var/run /boot /lib/modules /usr/lib/modules
+  /var/lib/docker /var/lib/containerd /var/log /etc/docker /etc/systemd
+  /lib/systemd /usr/lib/systemd /etc/localtime /etc/timezone /usr/share/zoneinfo
+  /etc/hostname /etc/hosts /etc/resolv.conf /etc/machine-id /etc/os-release
+  /usr/lib/os-release /etc/passwd /etc/group /etc/shadow /etc/gshadow
+  /etc/ssl /etc/pki /etc/ca-certificates
+)
+RESTORE_SYSTEM_BIND_EXACT=(
+  / /etc /usr /usr/lib /usr/bin /usr/local /var /var/lib /lib /lib64 /bin /sbin
+  /opt /home /root /srv /mnt /media /tmp
+)
+
+restore_bind_is_system() {
+  local path="$1" prefix
+  [[ "$path" == "/" ]] || path="${path%/}"
+  for prefix in "${RESTORE_SYSTEM_BIND_EXACT[@]}"; do
+    [[ "$path" != "$prefix" ]] || return 0
+  done
+  for prefix in "${RESTORE_SYSTEM_BIND_PREFIXES[@]}"; do
+    [[ "$path" != "$prefix" && "$path" != "${prefix}/"* ]] || return 0
+  done
+  return 1
+}
+
+# 源端 bind 是软链接时，数据已恢复到真实路径；在原路径重建同一个链接，
+# 让容器按原挂载路径看到数据。新建的链接登记进 binds.tsv，回滚时删除。
+restore_bind_link() {
+  local link="$1" host="$2" current
+  [[ -n "$link" ]] || return 0
+  if root_exec test -L "$link"; then
+    current="$(root_exec readlink "$link" 2>/dev/null || true)"
+    [[ "$current" != "$host" ]] || return 0
+    current="$(root_exec readlink -f "$link" 2>/dev/null || true)"
+    [[ -z "$current" || "$current" != "$(root_exec readlink -f "$host" 2>/dev/null || true)" ]] ||
+      return 0
+    warn " 目标端已有同名软链接但指向不同：$link -> ${current:-未知}（期望 $host）"
+    return 1
+  fi
+  if root_exec test -e "$link"; then
+    warn " 目标端 $link 已存在且不是软链接，无法指向迁移的数据目录：$host"
+    return 1
+  fi
+  if [[ -n "${RESTORE_TRANSACTION_DIR:-}" ]]; then
+    printf '%s\t0\t\n' "$link" >>"${RESTORE_TRANSACTION_DIR}/binds.tsv" || return 1
+  fi
+  root_exec mkdir -p "$(dirname "$link")" || return 1
+  root_exec ln -s "$host" "$link"
 }
 
 compose_networks_from_meta_all() {
@@ -3491,6 +3744,7 @@ transaction_internal_paths_are_safe() {
 
   while IFS= read -r host; do
     [[ -n "$host" ]] || continue
+    restore_bind_is_system "$host" && continue
     normalized_host="$(transaction_normalize_path "$host")" || return 1
     for ((protected_i = 0; protected_i < ${#protected_paths[@]}; protected_i += 2)); do
       label="${protected_paths[$protected_i]}"
@@ -3503,7 +3757,7 @@ transaction_internal_paths_are_safe() {
         return 1
       fi
     done
-  done < <(jq -r '.binds[].host' manifest.json)
+  done < <(jq -r '.binds[] | .host, (.link // empty)' manifest.json)
 }
 
 transaction_container_exists() {
@@ -4133,7 +4387,11 @@ transaction_prepare() {
     [[ -n "$name" ]] || continue
     SELECTED_TRANSACTION_VOLUMES["$name"]=1
   done < <(jq -r '.volumes[].name' manifest.json)
-  mapfile -t SELECTED_TRANSACTION_BINDS < <(jq -r '.binds[].host' manifest.json)
+  SELECTED_TRANSACTION_BINDS=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    restore_bind_is_system "$name" || SELECTED_TRANSACTION_BINDS+=("$name")
+  done < <(jq -r '.binds[] | .host, (.link // empty)' manifest.json)
 
   # restore.sh 也可在挂载 Docker socket 的工具容器中运行；绝不能把执行自身停掉。
   if docker container inspect "$(hostname)" >/dev/null 2>&1; then
@@ -4155,7 +4413,7 @@ transaction_prepare() {
         matched=1
         break
       fi
-      if [[ "$type" == "bind" ]]; then
+      if [[ "$type" == "bind" ]] && ((${#SELECTED_TRANSACTION_BINDS[@]} > 0)); then
         for selected_path in "${SELECTED_TRANSACTION_BINDS[@]}"; do
           if transaction_mount_paths_overlap "$source" "$selected_path"; then
             matched=1
@@ -4299,7 +4557,9 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     host="$(jq -r '.host' <<<"$row")"
     file="$(jq -r '.file' <<<"$row")"
     bind_prefix="${host#/}"
-    if [[ ! -f "binds/$file" ]]; then
+    if restore_bind_is_system "$host"; then
+      warn " 跳过宿主机系统路径，只重建挂载、不覆盖目标端：$host"
+    elif [[ ! -f "binds/$file" ]]; then
       warn " 绑定目录缺少备份文件：$host（binds/$file）"
       FAILED_BINDS+=("$host")
     elif ! dm_run_with_activity "预检绑定目录归档：$host" \
@@ -4399,6 +4659,8 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r row; do
     host=$(jq -r '.host' <<<"$row")
     file=$(jq -r '.file' <<<"$row")
+    bind_link=$(jq -r '.link // empty' <<<"$row")
+    restore_bind_is_system "$host" && continue
     if [[ ! -f "binds/$file" ]]; then
       warn " 绑定目录缺少备份文件：$host（binds/$file）"
       FAILED_BINDS+=("$host")
@@ -4410,6 +4672,11 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
       restore_bind_exact "$host" "$PWD/binds/${file}" 1; then
       warn " 恢复绑定目录失败，终止恢复：$host"
       FAILED_BINDS+=("$host")
+      break
+    fi
+    if ! restore_bind_link "$bind_link" "$host"; then
+      warn " 无法在原路径重建软链接，终止恢复：$bind_link -> $host"
+      FAILED_BINDS+=("$bind_link")
       break
     fi
   done < <(jq -c '.binds[]' manifest.json)
@@ -4573,6 +4840,56 @@ if ((${#FAILED_NETWORKS[@]} > 0)); then
   exit 1
 fi
 
+# --network/--pid/--ipc container:X 要求 X 先存在。按依赖排序独立容器的恢复
+# 顺序；被依附者若是 Compose 容器，已在 [D] 启动，不构成阻塞。循环依赖时按原顺序。
+restore_runs_in_dependency_order() {
+  local run name f id cname mode ref dep blocked progressed
+  local -a pending=() next=()
+  local -A name_of_id=() run_names=() done_names=()
+  for f in meta/*.inspect.json; do
+    [[ -f "$f" ]] || continue
+    id="$(jq -r '.[0].Id' "$f")"
+    cname="$(jq -r '.[0].Name | ltrimstr("/")' "$f")"
+    name_of_id["$id"]="$cname"
+    name_of_id["${id:0:12}"]="$cname"
+  done
+  mapfile -t pending < <(jq -r '.runs[]' manifest.json)
+  for run in "${pending[@]}"; do
+    name="${run#runs/}"
+    run_names["${name%.sh}"]=1
+  done
+  while ((${#pending[@]} > 0)); do
+    next=()
+    progressed=0
+    for run in "${pending[@]}"; do
+      name="${run#runs/}"
+      name="${name%.sh}"
+      blocked=0
+      while IFS= read -r mode; do
+        [[ "$mode" == container:* ]] || continue
+        ref="${mode#container:}"
+        dep="${name_of_id[$ref]:-${name_of_id[${ref:0:12}]:-$ref}}"
+        if [[ "$dep" != "$name" && -n "${run_names[$dep]:-}" && -z "${done_names[$dep]:-}" ]]; then
+          blocked=1
+        fi
+      done < <(jq -r '.[0].HostConfig | .NetworkMode, .PidMode, .IpcMode | values' \
+        "meta/${name}.inspect.json" 2>/dev/null || true)
+      if ((blocked == 1)); then
+        next+=("$run")
+      else
+        printf '%s\n' "$run"
+        done_names["$name"]=1
+        progressed=1
+      fi
+    done
+    if ((progressed == 0)); then
+      printf '%s\n' "${next[@]}"
+      break
+    fi
+    pending=("${next[@]+"${next[@]}"}")
+  done
+}
+
 RESTORE_STAGE="恢复独立容器"
 say "[F] 恢复单容器（非 Compose）"
 if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
@@ -4591,7 +4908,7 @@ if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
       print_failure_summary
       exit 1
     fi
-  done < <(jq -r '.runs[]' manifest.json)
+  done < <(restore_runs_in_dependency_order)
 fi
 
 if restore_has_failures; then
@@ -4766,7 +5083,7 @@ restore_ensure_deps() {
 
 restore_main() {
   local URL DOWNLOAD_URL EXPECTED_SHA256 ENCRYPTION_SCHEME ENCRYPTION_SECRET
-  local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY encrypted=0
+  local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY encrypted=0 tgz_bytes free_bytes
   local restore_started=$SECONDS
   URL="$(restore_prompt_url "${1:-}")"
   DOWNLOAD_URL="$(bundle_download_url "$URL")"
@@ -4843,7 +5160,7 @@ restore_main() {
   local OUTDIR="${SESSION_DIR}/unpacked"
 
   BLUE "[INFO] 下载：$DOWNLOAD_URL"
-  if ! curl -fL --progress-bar --retry 5 --retry-delay 10 --retry-max-time 300 \
+  if ! curl -fL --globoff --progress-bar --retry 5 --retry-delay 10 --retry-max-time 300 \
     --connect-timeout 30 --output "$DOWNLOAD_PARTIAL" --url "$DOWNLOAD_URL"; then
     RED "[ERR] 下载失败：$DOWNLOAD_URL"
     exit 1
@@ -4864,6 +5181,9 @@ restore_main() {
       exit 1
     fi
     OK "[OK] 加密迁移包来源摘要与认证均通过"
+    if ! ensure_free_space "$SESSION_DIR" "$(progress_file_size "$ENCRYPTED_BUNDLE")" "解密迁移包"; then
+      exit 1
+    fi
     if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
       "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
       "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
@@ -4875,6 +5195,8 @@ restore_main() {
     ENCRYPTION_KEY=""
     MAC_KEY=""
     OK "[OK] 迁移包解密完成"
+    # 密文已通过认证并解密，后续只用明文包；尽早释放一份完整包的空间。
+    [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$ENCRYPTED_BUNDLE"
   elif [[ -n "$EXPECTED_SHA256" ]]; then
     if ! run_with_activity "校验下载包 SHA-256" \
       verify_archive_sha256 "$DOWNLOAD_FILE" "$EXPECTED_SHA256"; then
@@ -4890,6 +5212,12 @@ restore_main() {
     exit 1
   fi
   mkdir -p "$OUTDIR"
+  # 解压后体积未知；镜像归档通常压缩率不高，按 1.5 倍估算仅作提醒。
+  tgz_bytes="$(progress_file_size "$TGZ")"
+  free_bytes="$(free_disk_bytes "$SESSION_DIR")"
+  if [[ "$free_bytes" =~ ^[0-9]+$ ]] && ((free_bytes < tgz_bytes * 3 / 2)); then
+    YEL "[WARN] 磁盘剩余空间可能不足以解压迁移包（约需 $(human "$((tgz_bytes * 3 / 2))")），解压失败时请先清理磁盘。"
+  fi
   if ! run_with_activity "解压迁移包" tar -xzf "$TGZ" -C "$OUTDIR"; then
     RED "[ERR] 解压失败，请检查磁盘空间或确认文件是否完整。"
     exit 1
@@ -5543,10 +5871,14 @@ else
   fi
 
   if ((idx == 0)); then
-    RED "[ERR] 没有运行中的容器"
+    RED "[ERR] 没有可迁移的容器"
     exit 1
   fi
 
+  if [[ ! -t 0 ]]; then
+    RED "[ERR] 非交互模式无法选择容器，请用 --include=容器名1,容器名2 指定要迁移的容器。"
+    exit 1
+  fi
   read -rp "请输入要迁移的序号 [回车=全部 / 逗号分隔，如 1,3]： " PICK
   if [[ -z "$PICK" ]]; then
     IDS=("${STANDALONE_IDS[@]}")
@@ -5591,6 +5923,38 @@ else
     }
   fi
 fi
+
+#####################################
+# 自动纳入被依附的容器
+#####################################
+# --network/--pid/--ipc container:X 的容器离开 X 无法启动，自动把 X 一并迁移。
+dependency_added=1
+while ((dependency_added == 1)); do
+  dependency_added=0
+  for id in "${IDS[@]}"; do
+    while IFS= read -r dep_mode; do
+      [[ "$dep_mode" == container:* ]] || continue
+      dep_ref="${dep_mode#container:}"
+      dep_id="$(docker inspect -f '{{.Id}}' "$dep_ref" 2>/dev/null || true)"
+      if [[ -z "$dep_id" ]]; then
+        BACKUP_FAILURES+=("容器 ${id} 依附的容器 ${dep_ref:0:12} 不存在")
+        continue
+      fi
+      dep_selected=0
+      for existing in "${IDS[@]}"; do
+        [[ "$dep_id" != "$existing"* ]] || dep_selected=1
+      done
+      ((dep_selected == 0)) || continue
+      dep_name="$(docker inspect -f '{{.Name}}' "$dep_id" 2>/dev/null | sed 's#^/##')"
+      YEL "[INFO] 自动加入被依附的容器：${dep_name:-${dep_id:0:12}}（其他所选容器共享它的命名空间）"
+      IDS+=("${dep_id:0:12}")
+      dependency_added=1
+    done < <(docker inspect -f '{{.HostConfig.NetworkMode}}
+{{.HostConfig.PidMode}}
+{{.HostConfig.IpcMode}}' "$id" 2>/dev/null || true)
+    ((dependency_added == 0)) || break
+  done
+done
 
 #####################################
 # 元数据采集
@@ -5871,7 +6235,10 @@ fi
 if ((NO_STOP == 1)); then
   YEL "[WARN] 使用 --no-stop：不停机备份，数据可能不一致（尤其数据库类容器）。"
 else
-  read -rp "是否现在停机以确保一致性备份？[Y/n] " STOPNOW
+  # 非交互运行（定时任务、nohup、管道）时 stdin 可能已关闭；read 读到 EOF
+  # 不能触发 set -e 中止，按默认的一致性停机备份继续。
+  STOPNOW=""
+  read -rp "是否现在停机以确保一致性备份？[Y/n] " STOPNOW || true
   STOPNOW=${STOPNOW:-Y}
   if [[ "$STOPNOW" =~ ^[Yy]$ ]]; then
     total_count=${#IDS[@]}
@@ -5929,7 +6296,15 @@ for id in "${IDS[@]}"; do
   snapshot_index=$((snapshot_index + 1))
   n="${CONTAINER_NAME[$id]}"
   snapshot_image="$(snapshot_image_ref "$RID" "$id")"
-  printf " [SNAPSHOT] (%d/%d) %s\n" "$snapshot_index" "$snapshot_total" "$n"
+  snapshot_reason="$(container_snapshot_reason "$id" "${BUNDLE}/meta/${n}.inspect.json")"
+  if [[ -z "$snapshot_reason" ]]; then
+    original_image="$(jq -r '.[0].Config.Image' "${BUNDLE}/meta/${n}.inspect.json")"
+    printf " [IMAGE] (%d/%d) %s：可写层无改动，沿用原镜像 %s\n" \
+      "$snapshot_index" "$snapshot_total" "$n" "$original_image"
+    IMGSET["$original_image"]=1
+    continue
+  fi
+  printf " [SNAPSHOT] (%d/%d) %s（%s）\n" "$snapshot_index" "$snapshot_total" "$n" "$snapshot_reason"
   if ! run_with_activity "创建容器可写层快照：$n" \
     snapshot_container_image "$id" "${BUNDLE}/meta/${n}.inspect.json" "$snapshot_image"; then
     BACKUP_FAILURES+=("容器可写层快照失败：$n")
@@ -6017,6 +6392,23 @@ for id in "${IDS[@]}"; do
             ;;
         esac
         b_idx=$((b_idx + 1))
+        if bind_path_is_system "$src"; then
+          YEL " [SKIP] 宿主机系统路径只在新服务器重建挂载、不迁移内容：$src"
+          continue
+        fi
+        # 软链接 bind 必须备份链接指向的真实数据；只打包链接本身会丢数据，
+        # 恢复端也会拒绝以链接作为绑定根。恢复时在原路径重建同一个链接。
+        bind_link=""
+        real_src="$(bind_resolve_source "$src")"
+        if [[ "$real_src" != "$src" ]]; then
+          if bind_path_is_system "$real_src"; then
+            YEL " [SKIP] 软链接指向宿主机系统路径，只重建挂载：$src -> $real_src"
+            continue
+          fi
+          bind_link="$src"
+          src="$real_src"
+          YEL " [INFO] bind 源是软链接，备份真实目录：${bind_link} -> ${src}"
+        fi
         [[ -z "${BACKED_BINDS[$src]:-}" ]] || continue
         BACKED_BINDS["$src"]=1
         esc="$(basename "$src" | tr -c 'A-Za-z0-9_.-' '_')"
@@ -6030,7 +6422,9 @@ for id in "${IDS[@]}"; do
           BACKUP_FAILURES+=("绑定目录备份失败：$src")
           continue
         fi
-        MAN_BIND+=("$(jq -cn --arg host "$src" --arg dest "$dest" --arg file "$(basename "$out")" '{host:$host,dest:$dest,file:$file}')")
+        MAN_BIND+=("$(jq -cn --arg host "$src" --arg link "$bind_link" --arg dest "$dest" \
+          --arg file "$(basename "$out")" \
+          '{host:$host,dest:$dest,file:$file} + (if $link == "" then {} else {link:$link} end)')")
         ;;
       *)
         YEL " [SKIP] 未处理的 mount 类型：$t (dest=$dest)"
@@ -6222,6 +6616,11 @@ BUNDLE_ENCRYPTION_KEY="$(bundle_secret_encryption_key "$BUNDLE_SECRET")"
 BUNDLE_MAC_KEY="$(bundle_secret_mac_key "$BUNDLE_SECRET")"
 ENCRYPTED_TAR_PATH="${SINGLE_TAR_PATH}.enc"
 ENCRYPTED_PARTIAL_PATH="${ENCRYPTED_TAR_PATH}.partial.$$"
+# 加密包最大约等于明文目录大小（镜像层通常已压缩）。
+bundle_plain_bytes="$(du -sk "$BUNDLE" 2>/dev/null | awk '{ printf "%.0f\n", $1 * 1024 }')"
+if ! ensure_free_space "$BUNDLE_ROOT" "${bundle_plain_bytes:-0}" "生成加密迁移包"; then
+  exit 1
+fi
 if ! BUNDLE_DIGESTS="$(run_with_file_progress "压缩并加密迁移包" \
   "$ENCRYPTED_PARTIAL_PATH" 0 bundle_pack_encrypt_directory \
   "$BUNDLE_ROOT" "$RID" "$ENCRYPTED_PARTIAL_PATH" \
@@ -6239,6 +6638,8 @@ if ! mv "$ENCRYPTED_PARTIAL_PATH" "$ENCRYPTED_TAR_PATH"; then
   RED "[ERR] 无法提交已完成的加密迁移包。"
   exit 1
 fi
+# 明文目录已全部进入加密包：立即删除，释放磁盘并减少明文数据停留时间。
+rm -rf "$BUNDLE" 2>/dev/null || YEL "[WARN] 明文迁移目录暂未删除，退出时会再次清理：$BUNDLE"
 TRANSFER_NAME="${BUNDLE_BASENAME}.tar.gz.enc"
 TRANSFER_PATH="$ENCRYPTED_TAR_PATH"
 TRANSFER_FRAGMENT="#sha256=${BUNDLE_SHA256}&enc=${BUNDLE_ENCRYPTION_SCHEME}&secret=${BUNDLE_SECRET}&iv=${BUNDLE_IV}&mac=${BUNDLE_HMAC}"
@@ -6332,9 +6733,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
         sys.stderr.flush()
 
-from socketserver import ThreadingTCPServer
+import socket
 
-with ThreadingTCPServer(("", port), Handler) as httpd:
+
+class Server(ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        # 同时监听 IPv4 与 IPv6，纯 IPv6 服务器也能提供下载。
+        if self.address_family == socket.AF_INET6:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):
+                pass
+        super().server_bind()
+
+
+try:
+    Server.address_family = socket.AF_INET6
+    httpd = Server(("::", port), Handler)
+except OSError:
+    Server.address_family = socket.AF_INET
+    httpd = Server(("", port), Handler)
+
+with httpd:
     httpd.serve_forever()
 PY
   SHPID=$!

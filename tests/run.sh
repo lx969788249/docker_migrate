@@ -986,6 +986,162 @@ test_manifest_validates_compose_working_directories() {
   ! bundle_manifest_is_safe "${tmp}/bundle"
 }
 
+test_system_bind_paths_are_not_migrated() {
+  bind_path_is_system /etc/localtime
+  bind_path_is_system /etc/timezone
+  bind_path_is_system /proc
+  bind_path_is_system /sys/fs/cgroup
+  bind_path_is_system /dev/dri
+  bind_path_is_system /var/run/docker.sock
+  bind_path_is_system /lib/modules/
+  bind_path_is_system /
+  bind_path_is_system /etc
+  bind_path_is_system /home
+  ! bind_path_is_system /etc/nginx
+  ! bind_path_is_system /home/app/data
+  ! bind_path_is_system /opt/app
+  ! bind_path_is_system /var/lib/mysql
+  ! bind_path_is_system /srv/data
+  ! bind_path_is_system /procdata
+}
+
+test_restore_skips_system_binds_like_backup() {
+  local tmp path
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bundle"
+  write_bundle_restore_script "${tmp}/bundle/restore.sh"
+  awk '/^RESTORE_SYSTEM_BIND_PREFIXES=\(/{f=1} f{print} f&&/^}$/{exit}' \
+    "${tmp}/bundle/restore.sh" >"${tmp}/system.sh"
+  # shellcheck disable=SC1091
+  source "${tmp}/system.sh"
+  for path in /etc/localtime /proc /var/log/nginx / /opt /etc/nginx /srv/data /home/app; do
+    if bind_path_is_system "$path"; then
+      restore_bind_is_system "$path"
+    else
+      ! restore_bind_is_system "$path"
+    fi
+  done
+}
+
+test_symlink_bind_source_resolves_to_real_data() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/real/app"
+  ln -s "${tmp}/real/app" "${tmp}/link"
+  [[ "$(bind_resolve_source "${tmp}/link")" == "$(cd "${tmp}/real/app" && pwd -P)" ]]
+  [[ "$(bind_resolve_source "${tmp}/real/app")" == "${tmp}/real/app" ]]
+  [[ "$(bind_resolve_source "${tmp}/missing")" == "${tmp}/missing" ]]
+}
+
+test_manifest_validates_bind_links() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bundle"
+  jq -n '{
+    images:[],networks:[],projects:[],volumes:[],runs:[],
+    binds:[{host:"/data/app",link:"/srv/app",dest:"/data",file:"bind_app_1.tgz"}]
+  }' >"${tmp}/bundle/manifest.json"
+  bundle_manifest_is_safe "${tmp}/bundle"
+
+  jq '.binds[0].link = "relative"' "${tmp}/bundle/manifest.json" >"${tmp}/m.json"
+  mv "${tmp}/m.json" "${tmp}/bundle/manifest.json"
+  ! bundle_manifest_is_safe "${tmp}/bundle"
+
+  jq '.binds[0].link = "/srv/../etc"' "${tmp}/bundle/manifest.json" >"${tmp}/m.json"
+  mv "${tmp}/m.json" "${tmp}/bundle/manifest.json"
+  ! bundle_manifest_is_safe "${tmp}/bundle"
+}
+
+test_advertise_url_brackets_ipv6() {
+  [[ "$(url_host 2001:db8::1)" == "[2001:db8::1]" ]]
+  [[ "$(url_host '[2001:db8::1]')" == "[2001:db8::1]" ]]
+  [[ "$(url_host 203.0.113.5)" == "203.0.113.5" ]]
+  [[ "$(ADVERTISE_HOST=2001:db8::1 pick_advertise_url 8080)" == "http://[2001:db8::1]:8080" ]]
+  [[ "$(ADVERTISE_HOST=example.com pick_advertise_url 8080)" == "http://example.com:8080" ]]
+}
+
+test_transfer_instructions_mention_firewall_port() {
+  local output
+  output="$(print_transfer_instructions 'http://[2001:db8::1]:18080/t/b.tar.gz.enc#sha256=abc' interactive)"
+  grep -Fq '放行 TCP 18080 端口' <<<"$output"
+}
+
+writable_layer_probe() {
+  local probe_diff="$1"
+  docker() { printf '%s\n' "$probe_diff"; }
+  container_writable_layer_changed demo
+}
+
+test_writable_layer_change_detection() {
+  # 只有运行时临时文件与因子项变化而被标记的父目录：沿用原镜像。
+  ! writable_layer_probe $'C /run\nA /run/nginx.pid\nC /tmp\nA /tmp/x\nC /var\nC /var/cache\nA /var/cache/apk'
+  ! writable_layer_probe ''
+  writable_layer_probe $'C /etc\nA /etc/app.conf'
+  writable_layer_probe $'D /usr/share/doc'
+  writable_layer_probe $'C /etc/hosts.allow'
+}
+
+snapshot_reason_probe() {
+  # 变量名不能与被测函数的 local 变量重名，否则桩函数读到的是被测函数的值。
+  local meta="$1" probe_tag_id="$2" probe_diff="$3"
+  docker() {
+    case "$1" in
+      image) [[ -z "$probe_tag_id" ]] || printf '%s\n' "$probe_tag_id" ;;
+      diff) printf '%s\n' "$probe_diff" ;;
+    esac
+  }
+  container_snapshot_reason demo "$meta"
+}
+
+test_snapshot_only_when_needed() {
+  local tmp meta
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  meta="${tmp}/demo.inspect.json"
+  jq -n '[{Image:"sha256:aaa",Config:{Image:"nginx:1.27"}}]' >"$meta"
+  [[ -z "$(snapshot_reason_probe "$meta" sha256:aaa '')" ]]
+  [[ -n "$(snapshot_reason_probe "$meta" sha256:aaa $'A /etc/nginx/conf.d/site.conf')" ]]
+  # 标签已被重新拉取指向新版本：只保存标签会让新服务器运行另一个版本。
+  [[ -n "$(snapshot_reason_probe "$meta" sha256:bbb '')" ]]
+  [[ -n "$(snapshot_reason_probe "$meta" '' '')" ]]
+  [[ -n "$(DOCKER_MIGRATE_SNAPSHOT=always snapshot_reason_probe "$meta" sha256:aaa '')" ]]
+  [[ -z "$(DOCKER_MIGRATE_SNAPSHOT=never snapshot_reason_probe "$meta" sha256:aaa $'A /etc/x')" ]]
+}
+
+test_restore_orders_namespace_dependencies() {
+  local tmp order
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bundle/meta"
+  write_bundle_restore_script "${tmp}/bundle/restore.sh"
+  awk '/^restore_runs_in_dependency_order\(\)/{f=1} f{print} f&&/^}$/{exit}' \
+    "${tmp}/bundle/restore.sh" >"${tmp}/order.sh"
+  jq -n '[{Id:"aaaaaaaaaaaa1111",Name:"/sidecar",HostConfig:{NetworkMode:"container:bbbbbbbbbbbb2222"}}]' \
+    >"${tmp}/bundle/meta/sidecar.inspect.json"
+  jq -n '[{Id:"bbbbbbbbbbbb2222",Name:"/vpn",HostConfig:{NetworkMode:"bridge",PidMode:"container:cccccccccccc3333"}}]' \
+    >"${tmp}/bundle/meta/vpn.inspect.json"
+  jq -n '[{Id:"cccccccccccc3333",Name:"/base",HostConfig:{NetworkMode:"default"}}]' \
+    >"${tmp}/bundle/meta/base.inspect.json"
+  jq -n '{runs:["runs/sidecar.sh","runs/vpn.sh","runs/base.sh"]}' >"${tmp}/bundle/manifest.json"
+  order="$(cd "${tmp}/bundle" && bash -c 'source "$1"; restore_runs_in_dependency_order' _ "${tmp}/order.sh" | paste -sd, -)"
+  [[ "$order" == "runs/base.sh,runs/vpn.sh,runs/sidecar.sh" ]]
+}
+
+test_generated_run_script_respects_shared_network_namespace() {
+  local tmp script
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bundle/runs" "${tmp}/bundle/meta"
+  write_run_script demo "${tmp}/bundle/runs/demo.sh"
+  script="${tmp}/bundle/runs/demo.sh"
+  grep -Fq 'netns_shared="container"' "$script"
+  grep -Fq '[[ -z "$netns_shared" && -n "$hostname"' "$script"
+  grep -Fq 'if [[ "$meta_hc" == "$image_hc" ]]; then' "$script"
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
@@ -1020,6 +1176,16 @@ run_test "bind mount overlap detection respects path boundaries" test_mount_path
 run_test "manifest rejects executable paths outside runs" test_manifest_rejects_unsafe_run_paths
 run_test "manifest rejects control characters in bind paths" test_manifest_rejects_control_characters_in_bind_paths
 run_test "manifest validates Compose working directories" test_manifest_validates_compose_working_directories
+run_test "system bind paths are recreated but never migrated" test_system_bind_paths_are_not_migrated
+run_test "restore script skips the same system bind paths" test_restore_skips_system_binds_like_backup
+run_test "symlink bind sources resolve to their real data" test_symlink_bind_source_resolves_to_real_data
+run_test "manifest validates optional bind links" test_manifest_validates_bind_links
+run_test "advertised URLs bracket IPv6 hosts" test_advertise_url_brackets_ipv6
+run_test "transfer instructions mention the port to open" test_transfer_instructions_mention_firewall_port
+run_test "writable layer detection ignores runtime-only changes" test_writable_layer_change_detection
+run_test "snapshots are created only when needed" test_snapshot_only_when_needed
+run_test "restore orders container namespace dependencies" test_restore_orders_namespace_dependencies
+run_test "run script respects shared network namespaces and image healthchecks" test_generated_run_script_respects_shared_network_namespace
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

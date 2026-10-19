@@ -37,5 +37,7 @@ jobs:
         run: tests/archive_parser_compat.sh
       - name: Docker integration test
         run: tests/integration_docker.sh
+      - name: Shared namespace and system bind restore test
+        run: tests/integration_netns.sh
       - name: End-to-end migration test
         run: tests/end_to_end.sh
