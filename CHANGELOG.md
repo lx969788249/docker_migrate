@@ -16,7 +16,7 @@
 ### Testing
 
 - Add a real-world configuration fidelity test that migrates eight differently configured containers end to end and compares their `docker inspect` output.
-- Run unit tests on bash 4.0, 4.2 and 4.4, Alpine, Debian 11 and Rocky Linux 8.
+- Run unit tests on bash 4.0, 4.2 and 4.4, Alpine, Debian 12 and Rocky Linux 8.
 - Add a manual two-server test checklist in `docs/manual-vps-test.md`.
 
 ### Usability
