@@ -1,0 +1,11 @@
+# @include templates/restore/base.sh
+# @include templates/restore/state.sh
+# @include templates/restore/compose.sh
+# @include templates/restore/verify.sh
+# @include templates/restore/data.sh
+# @include templates/restore/networks.sh
+# @include templates/restore/tx-files.sh
+# @include templates/restore/tx-containers.sh
+# @include templates/restore/tx-rollback.sh
+# @include templates/restore/tx-prepare.sh
+# @include templates/restore/flow.sh

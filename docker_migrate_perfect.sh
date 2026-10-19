@@ -48,13 +48,19 @@ declare -a STOPPED_ON_BACKUP=()
 declare -a BACKUP_FAILURES=()
 declare -a TEMP_IMAGES=()
 
+# 终端输出：颜色、耗时、结果摘要与帮助信息。
+
 #####################################
 # 基础函数 & 依赖管理
 #####################################
 BLUE() { echo -e "\033[1;34m$*\033[0m"; }
+
 YEL() { echo -e "\033[1;33m$*\033[0m"; }
+
 RED() { echo -e "\033[1;31m$*\033[0m"; }
+
 OK() { echo -e "\033[1;32m$*\033[0m"; }
+
 CYA() { echo -e "\033[1;36m$*\033[0m"; }
 
 format_elapsed() {
@@ -187,107 +193,6 @@ print_transfer_instructions() {
   printf '%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 }
 
-http_log_event() {
-  local message="$1"
-  [[ -n "${HTTP_LOG:-}" ]] || return 0
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$message" >>"$HTTP_LOG"
-}
-
-print_http_diagnostics() {
-  local log_file="${1:-}"
-  printf 'HTTP 服务诊断（最后 20 行）：\n' >&2
-  if [[ -n "$log_file" && -s "$log_file" ]]; then
-    tail -n 20 "$log_file" >&2 || true
-  else
-    printf 'HTTP 服务未提供额外日志。\n' >&2
-  fi
-  [[ -z "$log_file" ]] || printf '完整日志：%s\n' "$log_file" >&2
-}
-
-print_http_diagnostics_once() {
-  local log_file="${1:-}"
-  ((${HTTP_DIAGNOSTICS_SHOWN:-0} == 0)) || return 0
-  HTTP_DIAGNOSTICS_SHOWN=1
-  print_http_diagnostics "$log_file"
-}
-
-netcat_http_serve() {
-  local port="$1" response_file="$2" transfer_file="$3"
-  while true; do
-    if {
-      cat "$response_file"
-      cat "$transfer_file"
-    } | nc -l -p "$port" -q 0; then
-      continue
-    fi
-    if {
-      cat "$response_file"
-      cat "$transfer_file"
-    } | nc -l -p "$port"; then
-      continue
-    fi
-    if {
-      cat "$response_file"
-      cat "$transfer_file"
-    } | nc -l "$port"; then
-      continue
-    fi
-    return 1
-  done
-}
-
-restore_target_container_names() {
-  local bundle_dir="$1" run project service found_service inspect_file
-  [[ -f "${bundle_dir}/manifest.json" ]] || return 0
-  while IFS= read -r run; do
-    [[ -n "$run" ]] || continue
-    basename "${run%.sh}"
-  done < <(jq -r '.runs[]?' "${bundle_dir}/manifest.json" 2>/dev/null || true)
-  while IFS= read -r project; do
-    [[ -n "$project" ]] || continue
-    found_service=0
-    for inspect_file in "${bundle_dir}"/meta/*.inspect.json; do
-      [[ -f "$inspect_file" ]] || continue
-      service="$(jq -r --arg project "$project" '
-        if (.[0].Config.Labels["com.docker.compose.project"] // "") == $project
-        then .[0].Config.Labels["com.docker.compose.service"] // empty
-        else empty end
-      ' "$inspect_file" 2>/dev/null || true)"
-      [[ -n "$service" ]] || continue
-      found_service=1
-      docker ps -a --filter "label=com.docker.compose.project=${project}" \
-        --filter "label=com.docker.compose.service=${service}" \
-        --format '{{.Names}}' 2>/dev/null || true
-    done
-    if ((found_service == 0)); then
-      docker ps -a --filter "label=com.docker.compose.project=${project}" \
-        --format '{{.Names}}' 2>/dev/null || true
-    fi
-  done < <(jq -r '.projects[]?.name' "${bundle_dir}/manifest.json" 2>/dev/null || true)
-}
-
-collect_restore_result_metrics() {
-  local bundle_dir="$1" name state
-  local total=0 running=0 paused=0 stopped=0 missing=0 volumes=0 binds=0
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    total=$((total + 1))
-    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
-    case "$state" in
-      running | restarting) running=$((running + 1)) ;;
-      paused) paused=$((paused + 1)) ;;
-      created | exited | dead | removing) stopped=$((stopped + 1)) ;;
-      *) missing=$((missing + 1)) ;;
-    esac
-  done < <(restore_target_container_names "$bundle_dir" | awk 'NF && !seen[$0]++')
-  if [[ -f "${bundle_dir}/manifest.json" ]]; then
-    volumes="$(jq -r '.volumes | length' "${bundle_dir}/manifest.json" 2>/dev/null || echo 0)"
-    binds="$(jq -r '.binds | length' "${bundle_dir}/manifest.json" 2>/dev/null || echo 0)"
-  fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$total" "$running" "$paused" "$stopped" "$missing" "$volumes" "$binds"
-}
-
 show_banner() {
   echo -e "\033[1;36m"
   cat <<'BANNER'
@@ -326,6 +231,8 @@ show_help() {
 不带参数运行时仍使用原有交互菜单。
 HLP
 }
+
+# 系统工具：sudo、超时、包管理器、Docker 服务与磁盘空间。
 
 asudo() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -438,17 +345,6 @@ ensure_docker_running() {
   fi
 }
 
-human() {
-  local b="${1:-0}"
-  local -a units=(B KB MB GB TB PB)
-  local i=0
-  while ((b >= 1024 && i < ${#units[@]} - 1)); do
-    b=$((b / 1024))
-    i=$((i + 1))
-  done
-  echo "${b}${units[$i]}"
-}
-
 # 目录所在文件系统的可用字节数；无法获取时输出空。
 free_disk_bytes() {
   df -Pk "$1" 2>/dev/null | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }'
@@ -462,6 +358,19 @@ ensure_free_space() {
   ((free >= need)) && return 0
   RED "[ERR] ${label}需要约 $(human "$need") 可用空间，${dir} 所在磁盘只剩 $(human "$free")。"
   return 1
+}
+
+# 进度显示：主脚本与生成的恢复脚本共用。
+
+human() {
+  local b="${1:-0}"
+  local -a units=(B KB MB GB TB PB)
+  local i=0
+  while ((b >= 1024 && i < ${#units[@]} - 1)); do
+    b=$((b / 1024))
+    i=$((i + 1))
+  done
+  echo "${b}${units[$i]}"
 }
 
 progress_file_size() {
@@ -610,173 +519,7 @@ progress_capture_stdout() {
   "$@" >"$outfile"
 }
 
-progress_docker_save() {
-  local outfile="$1"
-  shift
-  local rc=0 started=$SECONDS current=0 restore_errexit=0
-  if command -v pv >/dev/null 2>&1; then
-    case $- in *e*) restore_errexit=1 ;; esac
-    set +e
-    # -f 保证日志被重定向时也持续输出；pipefail 保留 docker save 的失败状态。
-    "$@" | pv -f -b >"$outfile"
-    rc=$?
-    ((restore_errexit == 0)) || set -e
-    current="$(progress_file_size "$outfile")"
-    progress_finish "保存镜像 images.tar" "$rc" "$((SECONDS - started))" "$current"
-  else
-    if run_with_file_progress "保存镜像 images.tar" "$outfile" 0 \
-      progress_capture_stdout "$outfile" "$@"; then
-      rc=0
-    else
-      rc=$?
-    fi
-  fi
-  return "$rc"
-}
-
-is_private_ipv4() {
-  local ip="$1"
-  [[ "$ip" =~ ^10\. ]] && return 0
-  [[ "$ip" =~ ^192\.168\. ]] && return 0
-  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
-  [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] && return 0
-  [[ "$ip" =~ ^127\. ]] && return 0
-  [[ "$ip" =~ ^169\.254\. ]] && return 0
-  return 1
-}
-
-get_public_ip_external() {
-  local ip
-  for svc in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me; do
-    ip="$(curl -fsS --max-time 2 "$svc" 2>/dev/null | tr -d '\r\n' || true)"
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$ip"
-      return 0
-    fi
-  done
-  return 1
-}
-
-get_public_ipv6() {
-  local ip
-  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-  if [[ "$ip" == *:* && "$ip" != fe80:* && "$ip" != fd* && "$ip" != fc* && "$ip" != ::1 ]]; then
-    echo "$ip"
-    return 0
-  fi
-  ip="$(curl -6 -fsS --max-time 2 https://api64.ipify.org 2>/dev/null | tr -d '\r\n' || true)"
-  if [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* ]]; then
-    echo "$ip"
-    return 0
-  fi
-  return 1
-}
-
-# URL 中的 IPv6 地址必须加方括号，否则端口会被当成地址的一部分。
-url_host() {
-  local host="$1"
-  if [[ "$host" == *:* && "$host" != \[* ]]; then
-    printf '[%s]\n' "$host"
-  else
-    printf '%s\n' "$host"
-  fi
-}
-
-pick_advertise_url() {
-  local port="$1"
-  local host=""
-  if [[ -n "${ADVERTISE_HOST:-}" ]]; then
-    host="$ADVERTISE_HOST"
-  else
-    local via_route=""
-    via_route="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-    if [[ -n "$via_route" ]] && ! is_private_ipv4 "$via_route"; then
-      host="$via_route"
-    fi
-    [[ -z "$host" ]] && host="$(get_public_ip_external || true)"
-    # 纯 IPv6 服务器没有可用的 IPv4 地址。
-    [[ -z "$host" ]] && host="$(get_public_ipv6 || true)"
-    [[ -z "$host" ]] && host="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1 || true)"
-    if [[ -z "$host" ]]; then
-      host="127.0.0.1"
-      YEL "[WARN] 无法探测本机对外地址，链接暂用 127.0.0.1，新服务器无法访问；请用 ADVERTISE_HOST=公网IP或域名 重新运行。" >&2
-    fi
-  fi
-  echo "http://$(url_host "$host"):${port}"
-}
-
-pick_free_port() {
-  local p="${1:-8080}"
-  local i
-  for i in $(seq 0 50); do
-    if command -v ss >/dev/null 2>&1; then
-      if ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$"; then
-        echo "$p"
-        return 0
-      fi
-    elif command -v netstat >/dev/null 2>&1; then
-      if ! netstat -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$"; then
-        echo "$p"
-        return 0
-      fi
-    else
-      echo "$p"
-      return 0
-    fi
-    p=$((p + 1))
-  done
-  echo "${1:-8080}"
-}
-
-json_array_from_lines() {
-  if [[ $# -eq 0 ]]; then
-    echo '[]'
-    return 0
-  fi
-  # 过滤空行，避免空数组被序列化成 [""]。
-  printf '%s\n' "$@" | awk 'NF' | jq -R . | jq -cs .
-}
-
-compose_env_file_refs() {
-  # Best-effort fallback parser for common Compose env_file scalar/list/long syntax.
-  # 正常情况下恢复使用 `docker compose config` 生成的已解析配置。
-  awk '
-    function trim(v) {
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-      gsub(/^["'"'"']|["'"'"']$/, "", v)
-      return v
-    }
-    /^[[:space:]]*env_file[[:space:]]*:/ {
-      in_env = 1
-      value = $0
-      sub(/^[^:]*:[[:space:]]*/, "", value)
-      value = trim(value)
-      if (value != "") {
-        print value
-        in_env = 0
-      }
-      next
-    }
-    in_env && /^[[:space:]]*-[[:space:]]*/ {
-      value = $0
-      sub(/^[[:space:]]*-[[:space:]]*/, "", value)
-      if (value ~ /^path[[:space:]]*:/) {
-        sub(/^path[[:space:]]*:[[:space:]]*/, "", value)
-      }
-      value = trim(value)
-      if (value != "" && value !~ /^(required|format)[[:space:]]*:/) print value
-      next
-    }
-    in_env && /^[[:space:]]*path[[:space:]]*:/ {
-      value = $0
-      sub(/^[[:space:]]*path[[:space:]]*:[[:space:]]*/, "", value)
-      value = trim(value)
-      if (value != "") print value
-      next
-    }
-    in_env && /^[^[:space:]#]/ { in_env = 0 }
-  ' "$1"
-}
+# 挂载路径判断：重叠检测、宿主机系统路径与软链接解析。
 
 mount_paths_overlap() {
   local left="$1" right="$2"
@@ -824,66 +567,7 @@ bind_resolve_source() {
   printf '%s\n' "${resolved:-$path}"
 }
 
-collect_shared_running_containers() {
-  local selected_id selected_full_id id name inspect mount type source selected_path reason
-  declare -A selected_ids=() selected_volumes=()
-  local -a selected_binds=()
-
-  for selected_id in "$@"; do
-    selected_ids["$selected_id"]=1
-    if declare -p SELECTED_INSPECT_JSON >/dev/null 2>&1 &&
-      [[ -n "${SELECTED_INSPECT_JSON[$selected_id]+cached}" ]]; then
-      inspect="${SELECTED_INSPECT_JSON[$selected_id]}"
-    else
-      inspect="$(docker inspect "$selected_id")" || return 1
-    fi
-    selected_full_id="$(jq -r '.[0].Id' <<<"$inspect")"
-    selected_ids["$selected_full_id"]=1
-    selected_ids["${selected_full_id:0:12}"]=1
-    while IFS= read -r source; do
-      [[ -n "$source" ]] && selected_volumes["$source"]=1
-    done < <(jq -r '.[0].Mounts[]? | select(.Type == "volume") | .Name' <<<"$inspect")
-    while IFS= read -r source; do
-      # 系统路径不迁移数据，共享它们的容器（如都挂载 /etc/localtime）无需停机。
-      if [[ -n "$source" ]] && ! bind_path_is_system "$source"; then
-        selected_binds+=("$(bind_resolve_source "$source")")
-      fi
-    done < <(jq -r '.[0].Mounts[]? | select(.Type == "bind") | .Source' <<<"$inspect")
-  done
-
-  while IFS=$'\t' read -r id name; do
-    [[ -n "$id" && -z "${selected_ids[$id]:-}" ]] || continue
-    case ",${DOCKER_MIGRATE_IGNORE_CONTAINERS:-}," in
-      *,"$name",*) continue ;;
-    esac
-    inspect="$(docker inspect "$id")" || return 1
-    reason=""
-    while IFS= read -r mount; do
-      type="$(jq -r '.Type' <<<"$mount")"
-      case "$type" in
-        volume)
-          source="$(jq -r '.Name' <<<"$mount")"
-          if [[ -n "${selected_volumes[$source]:-}" ]]; then
-            reason="volume:${source}"
-            break
-          fi
-          ;;
-        bind)
-          source="$(jq -r '.Source' <<<"$mount")"
-          bind_path_is_system "$source" && continue
-          source="$(bind_resolve_source "$source")"
-          for selected_path in "${selected_binds[@]}"; do
-            if mount_paths_overlap "$source" "$selected_path"; then
-              reason="bind:${source}"
-              break 2
-            fi
-          done
-          ;;
-      esac
-    done < <(jq -c '.[0].Mounts[]?' <<<"$inspect")
-    [[ -z "$reason" ]] || printf '%s\t%s\t%s\n' "$id" "$name" "$reason"
-  done < <(docker ps --format '{{.ID}}\t{{.Names}}')
-}
+# 迁移包摘要、加密与解密。
 
 sha256_file() {
   local file="$1"
@@ -1046,56 +730,6 @@ gzip_compress_stream() {
   fi
 }
 
-archive_volume_to_gzip() {
-  local volume="$1" output="$2" rc=0
-  rm -f -- "$output"
-  if docker run --rm -v "${volume}:/from:ro" alpine:3.20 \
-    tar -C /from -cf - . | gzip_compress_stream >"$output"; then
-    return 0
-  else
-    rc=$?
-  fi
-  rm -f -- "$output"
-  return "$rc"
-}
-
-archive_bind_to_gzip() {
-  local source="$1" output="$2" rc=0
-  rm -f -- "$output"
-  if tar -C / -cf - "${source#/}" | gzip_compress_stream >"$output"; then
-    return 0
-  else
-    rc=$?
-  fi
-  rm -f -- "$output"
-  return "$rc"
-}
-
-docker_stop_batch_verified() {
-  local label="$1"
-  shift
-  local name running stop_rc=0 verify_rc=0
-  (($# > 0)) || return 0
-
-  run_with_activity "$label" docker stop "$@" >/dev/null || stop_rc=$?
-  # Docker CLI 的聚合退出码无法指出具体失败项；以 daemon 的最终状态为准，
-  # 同时逐个确认，避免部分停止后误以为已经取得一致性快照。
-  for name in "$@"; do
-    if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)"; then
-      RED "[ERR] 停机后无法确认容器状态：$name"
-      verify_rc=1
-    elif [[ "$running" != "false" ]]; then
-      RED "[ERR] 容器仍在运行：$name"
-      verify_rc=1
-    fi
-  done
-  ((verify_rc == 0)) || return 1
-  if ((stop_rc != 0)); then
-    YEL "[WARN] docker stop 返回异常，但已逐个确认所有目标容器停止。"
-  fi
-  return 0
-}
-
 bundle_pack_encrypt_directory() {
   local bundle_root="$1" member="$2" output="$3"
   local encryption_key="$4" mac_key="$5" iv="$6"
@@ -1205,6 +839,509 @@ verify_archive_sha256() {
   valid_sha256 "$expected" || return 2
   actual="$(sha256_file "$file")" || return 1
   [[ "${actual,,}" == "${expected,,}" ]]
+}
+
+# 迁移包结构：校验清单、manifest 与归档安全检查、恢复结果统计。
+
+json_array_from_lines() {
+  if [[ $# -eq 0 ]]; then
+    echo '[]'
+    return 0
+  fi
+  # 过滤空行，避免空数组被序列化成 [""]。
+  printf '%s\n' "$@" | awk 'NF' | jq -R . | jq -cs .
+}
+
+generate_bundle_checksums() {
+  local bundle_dir="$1"
+  local manifest="${bundle_dir}/checksums.sha256"
+  local file rel digest
+  : >"$manifest"
+  while IFS= read -r -d '' file; do
+    rel="${file#"${bundle_dir}/"}"
+    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
+    digest="$(sha256_file "$file")" || {
+      RED "[ERR] 系统缺少 SHA-256 工具（sha256sum/shasum/openssl）。"
+      return 1
+    }
+    printf '%s\t%s\n' "$digest" "$rel" >>"$manifest"
+  done < <(find "$bundle_dir" -type f -print0)
+}
+
+verify_bundle_checksums() {
+  local bundle_dir="$1"
+  local manifest="${bundle_dir}/checksums.sha256"
+  local expected rel file actual count=0
+  local -A verified_paths=()
+  [[ -f "$manifest" ]] || {
+    RED "[ERR] 迁移包缺少 checksums.sha256。"
+    return 1
+  }
+  while IFS=$'\t' read -r expected rel; do
+    [[ -n "$expected" && -n "$rel" ]] || continue
+    case "$rel" in
+      /* | .. | ../* | */../* | */..)
+        RED "[ERR] 校验清单含危险路径：$rel"
+        return 1
+        ;;
+    esac
+    file="${bundle_dir}/${rel}"
+    [[ -f "$file" ]] || {
+      RED "[ERR] 迁移包缺少文件：$rel"
+      return 1
+    }
+    actual="$(sha256_file "$file")" || return 1
+    [[ "$actual" == "$expected" ]] || {
+      RED "[ERR] 文件完整性校验失败：$rel"
+      return 1
+    }
+    verified_paths["$rel"]=1
+    count=$((count + 1))
+  done <"$manifest"
+  ((count > 0)) || {
+    RED "[ERR] 校验清单为空。"
+    return 1
+  }
+  while IFS= read -r -d '' file; do
+    rel="${file#"${bundle_dir}/"}"
+    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
+    if [[ -z "${verified_paths["$rel"]+present}" ]]; then
+      RED "[ERR] 迁移包含未纳入校验清单的文件：$rel"
+      return 1
+    fi
+  done < <(find "$bundle_dir" -type f -print0)
+}
+
+bundle_manifest_is_safe() {
+  local bundle_dir="$1" manifest run name metadata_name
+  manifest="${bundle_dir}/manifest.json"
+  [[ -f "$manifest" ]] || return 1
+  jq -e '
+    type == "object" and
+    (.images | type == "array") and
+    (.networks | type == "array") and
+    (.projects | type == "array") and
+    (.volumes | type == "array") and
+    (.binds | type == "array") and
+    (.runs | type == "array") and
+    all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
+    all(.projects[];
+      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+      (.working_dir // "" | type == "string" and
+        (. == "" or (startswith("/") and (test("(^|/)\\.\\.(/|$)") | not) and
+          all(explode[]; . >= 32 and . != 127))))
+    ) and
+    all(.volumes[]; (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
+    all(.binds[];
+      (.host | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not) and
+        all(explode[]; . >= 32 and . != 127)) and
+      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$")) and
+      ((.link // null) == null or (.link | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not) and
+        all(explode[]; . >= 32 and . != 127)))
+    )
+  ' "$manifest" >/dev/null || return 1
+
+  while IFS= read -r run; do
+    [[ -f "${bundle_dir}/${run}" ]] || return 1
+    name="${run#runs/}"
+    name="${name%.sh}"
+    [[ -f "${bundle_dir}/meta/${name}.inspect.json" ]] || return 1
+    metadata_name="$(jq -r '.[0].Name | ltrimstr("/")' \
+      "${bundle_dir}/meta/${name}.inspect.json" 2>/dev/null || true)"
+    [[ "$metadata_name" == "$name" ]] || return 1
+  done < <(jq -r '.runs[]' "$manifest")
+}
+
+archive_layout_is_safe() {
+  local archive="$1"
+  local entry
+  # 在同一次成员列表扫描中同时确认归档可读并校验路径；pipefail 会保留 tar
+  # 解压列表失败的状态，避免为了取得退出码再完整解压一遍 gzip 流。
+  tar -tzf "$archive" 2>/dev/null |
+    while IFS= read -r entry; do
+      case "$entry" in
+        /* | .. | ../* | */../* | */..) exit 1 ;;
+      esac
+    done || return 1
+  # 顶层迁移包不需要符号链接或硬链接；拒绝它们可避免解压路径绕过。
+  ! tar -tvzf "$archive" | awk 'substr($1,1,1) ~ /^[lh]$/ { bad=1 } END { exit bad ? 0 : 1 }'
+}
+
+restore_target_container_names() {
+  local bundle_dir="$1" run project service found_service inspect_file
+  [[ -f "${bundle_dir}/manifest.json" ]] || return 0
+  while IFS= read -r run; do
+    [[ -n "$run" ]] || continue
+    basename "${run%.sh}"
+  done < <(jq -r '.runs[]?' "${bundle_dir}/manifest.json" 2>/dev/null || true)
+  while IFS= read -r project; do
+    [[ -n "$project" ]] || continue
+    found_service=0
+    for inspect_file in "${bundle_dir}"/meta/*.inspect.json; do
+      [[ -f "$inspect_file" ]] || continue
+      service="$(jq -r --arg project "$project" '
+        if (.[0].Config.Labels["com.docker.compose.project"] // "") == $project
+        then .[0].Config.Labels["com.docker.compose.service"] // empty
+        else empty end
+      ' "$inspect_file" 2>/dev/null || true)"
+      [[ -n "$service" ]] || continue
+      found_service=1
+      docker ps -a --filter "label=com.docker.compose.project=${project}" \
+        --filter "label=com.docker.compose.service=${service}" \
+        --format '{{.Names}}' 2>/dev/null || true
+    done
+    if ((found_service == 0)); then
+      docker ps -a --filter "label=com.docker.compose.project=${project}" \
+        --format '{{.Names}}' 2>/dev/null || true
+    fi
+  done < <(jq -r '.projects[]?.name' "${bundle_dir}/manifest.json" 2>/dev/null || true)
+}
+
+collect_restore_result_metrics() {
+  local bundle_dir="$1" name state
+  local total=0 running=0 paused=0 stopped=0 missing=0 volumes=0 binds=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    total=$((total + 1))
+    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    case "$state" in
+      running | restarting) running=$((running + 1)) ;;
+      paused) paused=$((paused + 1)) ;;
+      created | exited | dead | removing) stopped=$((stopped + 1)) ;;
+      *) missing=$((missing + 1)) ;;
+    esac
+  done < <(restore_target_container_names "$bundle_dir" | awk 'NF && !seen[$0]++')
+  if [[ -f "${bundle_dir}/manifest.json" ]]; then
+    volumes="$(jq -r '.volumes | length' "${bundle_dir}/manifest.json" 2>/dev/null || echo 0)"
+    binds="$(jq -r '.binds | length' "${bundle_dir}/manifest.json" 2>/dev/null || echo 0)"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$total" "$running" "$paused" "$stopped" "$missing" "$volumes" "$binds"
+}
+
+# 源端 HTTP 下载服务与对外地址探测。
+
+http_log_event() {
+  local message="$1"
+  [[ -n "${HTTP_LOG:-}" ]] || return 0
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$message" >>"$HTTP_LOG"
+}
+
+print_http_diagnostics() {
+  local log_file="${1:-}"
+  printf 'HTTP 服务诊断（最后 20 行）：\n' >&2
+  if [[ -n "$log_file" && -s "$log_file" ]]; then
+    tail -n 20 "$log_file" >&2 || true
+  else
+    printf 'HTTP 服务未提供额外日志。\n' >&2
+  fi
+  [[ -z "$log_file" ]] || printf '完整日志：%s\n' "$log_file" >&2
+}
+
+print_http_diagnostics_once() {
+  local log_file="${1:-}"
+  ((${HTTP_DIAGNOSTICS_SHOWN:-0} == 0)) || return 0
+  HTTP_DIAGNOSTICS_SHOWN=1
+  print_http_diagnostics "$log_file"
+}
+
+netcat_http_serve() {
+  local port="$1" response_file="$2" transfer_file="$3"
+  while true; do
+    if {
+      cat "$response_file"
+      cat "$transfer_file"
+    } | nc -l -p "$port" -q 0; then
+      continue
+    fi
+    if {
+      cat "$response_file"
+      cat "$transfer_file"
+    } | nc -l -p "$port"; then
+      continue
+    fi
+    if {
+      cat "$response_file"
+      cat "$transfer_file"
+    } | nc -l "$port"; then
+      continue
+    fi
+    return 1
+  done
+}
+
+is_private_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^10\. ]] && return 0
+  [[ "$ip" =~ ^192\.168\. ]] && return 0
+  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
+  [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] && return 0
+  [[ "$ip" =~ ^127\. ]] && return 0
+  [[ "$ip" =~ ^169\.254\. ]] && return 0
+  return 1
+}
+
+get_public_ip_external() {
+  local ip
+  for svc in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me; do
+    ip="$(curl -fsS --max-time 2 "$svc" 2>/dev/null | tr -d '\r\n' || true)"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+get_public_ipv6() {
+  local ip
+  ip="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  if [[ "$ip" == *:* && "$ip" != fe80:* && "$ip" != fd* && "$ip" != fc* && "$ip" != ::1 ]]; then
+    echo "$ip"
+    return 0
+  fi
+  ip="$(curl -6 -fsS --max-time 2 https://api64.ipify.org 2>/dev/null | tr -d '\r\n' || true)"
+  if [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* ]]; then
+    echo "$ip"
+    return 0
+  fi
+  return 1
+}
+
+# URL 中的 IPv6 地址必须加方括号，否则端口会被当成地址的一部分。
+url_host() {
+  local host="$1"
+  if [[ "$host" == *:* && "$host" != \[* ]]; then
+    printf '[%s]\n' "$host"
+  else
+    printf '%s\n' "$host"
+  fi
+}
+
+pick_advertise_url() {
+  local port="$1"
+  local host=""
+  if [[ -n "${ADVERTISE_HOST:-}" ]]; then
+    host="$ADVERTISE_HOST"
+  else
+    local via_route=""
+    via_route="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    if [[ -n "$via_route" ]] && ! is_private_ipv4 "$via_route"; then
+      host="$via_route"
+    fi
+    [[ -z "$host" ]] && host="$(get_public_ip_external || true)"
+    # 纯 IPv6 服务器没有可用的 IPv4 地址。
+    [[ -z "$host" ]] && host="$(get_public_ipv6 || true)"
+    [[ -z "$host" ]] && host="$(ip -4 -o addr show 2>/dev/null | awk '!/ lo| docker| veth| br-| kube/ {print $4}' | cut -d/ -f1 | head -n1 || true)"
+    if [[ -z "$host" ]]; then
+      host="127.0.0.1"
+      YEL "[WARN] 无法探测本机对外地址，链接暂用 127.0.0.1，新服务器无法访问；请用 ADVERTISE_HOST=公网IP或域名 重新运行。" >&2
+    fi
+  fi
+  echo "http://$(url_host "$host"):${port}"
+}
+
+pick_free_port() {
+  local p="${1:-8080}"
+  local i
+  for i in $(seq 0 50); do
+    if command -v ss >/dev/null 2>&1; then
+      if ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$"; then
+        echo "$p"
+        return 0
+      fi
+    elif command -v netstat >/dev/null 2>&1; then
+      if ! netstat -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p$"; then
+        echo "$p"
+        return 0
+      fi
+    else
+      echo "$p"
+      return 0
+    fi
+    p=$((p + 1))
+  done
+  echo "${1:-8080}"
+}
+
+# 源端数据采集：共享挂载检测、卷与目录归档、停机与可写层快照。
+
+compose_env_file_refs() {
+  # Best-effort fallback parser for common Compose env_file scalar/list/long syntax.
+  # 正常情况下恢复使用 `docker compose config` 生成的已解析配置。
+  awk '
+    function trim(v) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      gsub(/^["'"'"']|["'"'"']$/, "", v)
+      return v
+    }
+    /^[[:space:]]*env_file[[:space:]]*:/ {
+      in_env = 1
+      value = $0
+      sub(/^[^:]*:[[:space:]]*/, "", value)
+      value = trim(value)
+      if (value != "") {
+        print value
+        in_env = 0
+      }
+      next
+    }
+    in_env && /^[[:space:]]*-[[:space:]]*/ {
+      value = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", value)
+      if (value ~ /^path[[:space:]]*:/) {
+        sub(/^path[[:space:]]*:[[:space:]]*/, "", value)
+      }
+      value = trim(value)
+      if (value != "" && value !~ /^(required|format)[[:space:]]*:/) print value
+      next
+    }
+    in_env && /^[[:space:]]*path[[:space:]]*:/ {
+      value = $0
+      sub(/^[[:space:]]*path[[:space:]]*:[[:space:]]*/, "", value)
+      value = trim(value)
+      if (value != "") print value
+      next
+    }
+    in_env && /^[^[:space:]#]/ { in_env = 0 }
+  ' "$1"
+}
+
+collect_shared_running_containers() {
+  local selected_id selected_full_id id name inspect mount type source selected_path reason
+  declare -A selected_ids=() selected_volumes=()
+  local -a selected_binds=()
+
+  for selected_id in "$@"; do
+    selected_ids["$selected_id"]=1
+    if declare -p SELECTED_INSPECT_JSON >/dev/null 2>&1 &&
+      [[ -n "${SELECTED_INSPECT_JSON[$selected_id]+cached}" ]]; then
+      inspect="${SELECTED_INSPECT_JSON[$selected_id]}"
+    else
+      inspect="$(docker inspect "$selected_id")" || return 1
+    fi
+    selected_full_id="$(jq -r '.[0].Id' <<<"$inspect")"
+    selected_ids["$selected_full_id"]=1
+    selected_ids["${selected_full_id:0:12}"]=1
+    while IFS= read -r source; do
+      [[ -n "$source" ]] && selected_volumes["$source"]=1
+    done < <(jq -r '.[0].Mounts[]? | select(.Type == "volume") | .Name' <<<"$inspect")
+    while IFS= read -r source; do
+      # 系统路径不迁移数据，共享它们的容器（如都挂载 /etc/localtime）无需停机。
+      if [[ -n "$source" ]] && ! bind_path_is_system "$source"; then
+        selected_binds+=("$(bind_resolve_source "$source")")
+      fi
+    done < <(jq -r '.[0].Mounts[]? | select(.Type == "bind") | .Source' <<<"$inspect")
+  done
+
+  while IFS=$'\t' read -r id name; do
+    [[ -n "$id" && -z "${selected_ids[$id]:-}" ]] || continue
+    case ",${DOCKER_MIGRATE_IGNORE_CONTAINERS:-}," in
+      *,"$name",*) continue ;;
+    esac
+    inspect="$(docker inspect "$id")" || return 1
+    reason=""
+    while IFS= read -r mount; do
+      type="$(jq -r '.Type' <<<"$mount")"
+      case "$type" in
+        volume)
+          source="$(jq -r '.Name' <<<"$mount")"
+          if [[ -n "${selected_volumes[$source]:-}" ]]; then
+            reason="volume:${source}"
+            break
+          fi
+          ;;
+        bind)
+          source="$(jq -r '.Source' <<<"$mount")"
+          bind_path_is_system "$source" && continue
+          source="$(bind_resolve_source "$source")"
+          for selected_path in "${selected_binds[@]}"; do
+            if mount_paths_overlap "$source" "$selected_path"; then
+              reason="bind:${source}"
+              break 2
+            fi
+          done
+          ;;
+      esac
+    done < <(jq -c '.[0].Mounts[]?' <<<"$inspect")
+    [[ -z "$reason" ]] || printf '%s\t%s\t%s\n' "$id" "$name" "$reason"
+  done < <(docker ps --format '{{.ID}}\t{{.Names}}')
+}
+
+archive_volume_to_gzip() {
+  local volume="$1" output="$2" rc=0
+  rm -f -- "$output"
+  if docker run --rm -v "${volume}:/from:ro" alpine:3.20 \
+    tar -C /from -cf - . | gzip_compress_stream >"$output"; then
+    return 0
+  else
+    rc=$?
+  fi
+  rm -f -- "$output"
+  return "$rc"
+}
+
+archive_bind_to_gzip() {
+  local source="$1" output="$2" rc=0
+  rm -f -- "$output"
+  if tar -C / -cf - "${source#/}" | gzip_compress_stream >"$output"; then
+    return 0
+  else
+    rc=$?
+  fi
+  rm -f -- "$output"
+  return "$rc"
+}
+
+docker_stop_batch_verified() {
+  local label="$1"
+  shift
+  local name running stop_rc=0 verify_rc=0
+  (($# > 0)) || return 0
+
+  run_with_activity "$label" docker stop "$@" >/dev/null || stop_rc=$?
+  # Docker CLI 的聚合退出码无法指出具体失败项；以 daemon 的最终状态为准，
+  # 同时逐个确认，避免部分停止后误以为已经取得一致性快照。
+  for name in "$@"; do
+    if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)"; then
+      RED "[ERR] 停机后无法确认容器状态：$name"
+      verify_rc=1
+    elif [[ "$running" != "false" ]]; then
+      RED "[ERR] 容器仍在运行：$name"
+      verify_rc=1
+    fi
+  done
+  ((verify_rc == 0)) || return 1
+  if ((stop_rc != 0)); then
+    YEL "[WARN] docker stop 返回异常，但已逐个确认所有目标容器停止。"
+  fi
+  return 0
+}
+
+progress_docker_save() {
+  local outfile="$1"
+  shift
+  local rc=0 started=$SECONDS current=0 restore_errexit=0
+  if command -v pv >/dev/null 2>&1; then
+    case $- in *e*) restore_errexit=1 ;; esac
+    set +e
+    # -f 保证日志被重定向时也持续输出；pipefail 保留 docker save 的失败状态。
+    "$@" | pv -f -b >"$outfile"
+    rc=$?
+    ((restore_errexit == 0)) || set -e
+    current="$(progress_file_size "$outfile")"
+    progress_finish "保存镜像 images.tar" "$rc" "$((SECONDS - started))" "$current"
+  else
+    if run_with_file_progress "保存镜像 images.tar" "$outfile" 0 \
+      progress_capture_stdout "$outfile" "$@"; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
+  return "$rc"
 }
 
 snapshot_image_ref() {
@@ -1323,123 +1460,6 @@ cleanup_snapshot_images() {
   done
   TEMP_IMAGES=("${remaining[@]}")
   return "$rc"
-}
-
-generate_bundle_checksums() {
-  local bundle_dir="$1"
-  local manifest="${bundle_dir}/checksums.sha256"
-  local file rel digest
-  : >"$manifest"
-  while IFS= read -r -d '' file; do
-    rel="${file#"${bundle_dir}/"}"
-    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
-    digest="$(sha256_file "$file")" || {
-      RED "[ERR] 系统缺少 SHA-256 工具（sha256sum/shasum/openssl）。"
-      return 1
-    }
-    printf '%s\t%s\n' "$digest" "$rel" >>"$manifest"
-  done < <(find "$bundle_dir" -type f -print0)
-}
-
-verify_bundle_checksums() {
-  local bundle_dir="$1"
-  local manifest="${bundle_dir}/checksums.sha256"
-  local expected rel file actual count=0
-  local -A verified_paths=()
-  [[ -f "$manifest" ]] || {
-    RED "[ERR] 迁移包缺少 checksums.sha256。"
-    return 1
-  }
-  while IFS=$'\t' read -r expected rel; do
-    [[ -n "$expected" && -n "$rel" ]] || continue
-    case "$rel" in
-      /* | .. | ../* | */../* | */..)
-        RED "[ERR] 校验清单含危险路径：$rel"
-        return 1
-        ;;
-    esac
-    file="${bundle_dir}/${rel}"
-    [[ -f "$file" ]] || {
-      RED "[ERR] 迁移包缺少文件：$rel"
-      return 1
-    }
-    actual="$(sha256_file "$file")" || return 1
-    [[ "$actual" == "$expected" ]] || {
-      RED "[ERR] 文件完整性校验失败：$rel"
-      return 1
-    }
-    verified_paths["$rel"]=1
-    count=$((count + 1))
-  done <"$manifest"
-  ((count > 0)) || {
-    RED "[ERR] 校验清单为空。"
-    return 1
-  }
-  while IFS= read -r -d '' file; do
-    rel="${file#"${bundle_dir}/"}"
-    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
-    if [[ -z "${verified_paths["$rel"]+present}" ]]; then
-      RED "[ERR] 迁移包含未纳入校验清单的文件：$rel"
-      return 1
-    fi
-  done < <(find "$bundle_dir" -type f -print0)
-}
-
-bundle_manifest_is_safe() {
-  local bundle_dir="$1" manifest run name metadata_name
-  manifest="${bundle_dir}/manifest.json"
-  [[ -f "$manifest" ]] || return 1
-  jq -e '
-    type == "object" and
-    (.images | type == "array") and
-    (.networks | type == "array") and
-    (.projects | type == "array") and
-    (.volumes | type == "array") and
-    (.binds | type == "array") and
-    (.runs | type == "array") and
-    all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
-    all(.projects[];
-      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
-      (.working_dir // "" | type == "string" and
-        (. == "" or (startswith("/") and (test("(^|/)\\.\\.(/|$)") | not) and
-          all(explode[]; . >= 32 and . != 127))))
-    ) and
-    all(.volumes[]; (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
-    all(.binds[];
-      (.host | type == "string" and startswith("/") and . != "/" and
-        (test("(^|/)\\.\\.(/|$)") | not) and
-        all(explode[]; . >= 32 and . != 127)) and
-      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$")) and
-      ((.link // null) == null or (.link | type == "string" and startswith("/") and . != "/" and
-        (test("(^|/)\\.\\.(/|$)") | not) and
-        all(explode[]; . >= 32 and . != 127)))
-    )
-  ' "$manifest" >/dev/null || return 1
-
-  while IFS= read -r run; do
-    [[ -f "${bundle_dir}/${run}" ]] || return 1
-    name="${run#runs/}"
-    name="${name%.sh}"
-    [[ -f "${bundle_dir}/meta/${name}.inspect.json" ]] || return 1
-    metadata_name="$(jq -r '.[0].Name | ltrimstr("/")' \
-      "${bundle_dir}/meta/${name}.inspect.json" 2>/dev/null || true)"
-    [[ "$metadata_name" == "$name" ]] || return 1
-  done < <(jq -r '.runs[]' "$manifest")
-}
-
-archive_layout_is_safe() {
-  local archive="$1"
-  local entry
-  # 在同一次成员列表扫描中同时确认归档可读并校验路径；pipefail 会保留 tar
-  # 解压列表失败的状态，避免为了取得退出码再完整解压一遍 gzip 流。
-  tar -tzf "$archive" 2>/dev/null |
-    while IFS= read -r entry; do
-      case "$entry" in
-        /* | .. | ../* | */../* | */..) exit 1 ;;
-      esac
-    done || return 1
-  # 顶层迁移包不需要符号链接或硬链接；拒绝它们可避免解压路径绕过。
-  ! tar -tvzf "$archive" | awk 'substr($1,1,1) ~ /^[lh]$/ { bad=1 } END { exit bad ? 0 : 1 }'
 }
 
 #####################################
