@@ -18,14 +18,16 @@ jobs:
           sudo apt-get install -y shellcheck
           go install mvdan.cc/sh/v3/cmd/shfmt@v3.10.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Release script matches src/
+        run: ./build.sh --check
       - name: Bash syntax
-        run: bash -n docker_migrate_perfect.sh tests/*.sh
+        run: bash -n docker_migrate_perfect.sh build.sh tests/*.sh
       - name: ShellCheck tracked scripts
-        run: shellcheck -S warning docker_migrate_perfect.sh tests/*.sh
+        run: shellcheck -S warning docker_migrate_perfect.sh build.sh tests/*.sh
       - name: ShellCheck generated scripts
         run: tests/lint-generated.sh
       - name: Formatting
-        run: shfmt -d -i 2 -ci docker_migrate_perfect.sh tests/*.sh
+        run: shfmt -d -i 2 -ci docker_migrate_perfect.sh build.sh tests/*.sh src
       - name: Unit tests
         run: tests/run.sh
 

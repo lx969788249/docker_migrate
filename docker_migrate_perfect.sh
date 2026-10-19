@@ -48,32 +48,41 @@ declare -a STOPPED_ON_BACKUP=()
 declare -a BACKUP_FAILURES=()
 declare -a TEMP_IMAGES=()
 
-# 终端输出：颜色、耗时、结果摘要与帮助信息。
-
-#####################################
-# 基础函数 & 依赖管理
-#####################################
+# 彩色输出：主脚本与生成的恢复脚本共用。
 BLUE() { echo -e "\033[1;34m$*\033[0m"; }
-
 YEL() { echo -e "\033[1;33m$*\033[0m"; }
-
 RED() { echo -e "\033[1;31m$*\033[0m"; }
-
 OK() { echo -e "\033[1;32m$*\033[0m"; }
-
 CYA() { echo -e "\033[1;36m$*\033[0m"; }
 
-format_elapsed() {
-  local seconds="${1:-0}"
-  ((seconds < 0)) && seconds=0
-  if ((seconds >= 3600)); then
-    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
-  elif ((seconds >= 60)); then
-    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
+# 通用工具：主脚本与生成的恢复脚本共用。
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
   else
-    printf '%d 秒\n' "$seconds"
+    "$@"
   fi
 }
+
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$file" | awk '{print $NF}'
+  else
+    return 127
+  fi
+}
+
+# 终端输出：颜色、耗时、结果摘要与帮助信息。
 
 result_rule() {
   printf '%s\n' '━━━━━━━━━━ Docker 迁移结果 ━━━━━━━━━━'
@@ -242,18 +251,6 @@ asudo() {
   fi
 }
 
-run_with_timeout() {
-  local seconds="$1"
-  shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$seconds" "$@"
-  else
-    "$@"
-  fi
-}
-
 pm_detect() {
   if command -v apt-get >/dev/null 2>&1; then
     echo apt
@@ -360,7 +357,19 @@ ensure_free_space() {
   return 1
 }
 
-# 进度显示：主脚本与生成的恢复脚本共用。
+# 进度显示与耗时格式化：主脚本与生成的恢复脚本共用。
+
+format_elapsed() {
+  local seconds="${1:-0}"
+  ((seconds < 0)) && seconds=0
+  if ((seconds >= 3600)); then
+    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+  elif ((seconds >= 60)); then
+    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
+  else
+    printf '%d 秒\n' "$seconds"
+  fi
+}
 
 human() {
   local b="${1:-0}"
@@ -519,12 +528,12 @@ progress_capture_stdout() {
   "$@" >"$outfile"
 }
 
-# 挂载路径判断：重叠检测、宿主机系统路径与软链接解析。
+# 挂载路径判断：重叠检测、宿主机系统路径与软链接解析。主脚本与恢复脚本共用。
 
 mount_paths_overlap() {
   local left="$1" right="$2"
-  [[ "$left" == "/" ]] || left="${left%/}"
-  [[ "$right" == "/" ]] || right="${right%/}"
+  while [[ "$left" != "/" && "$left" == */ ]]; do left="${left%/}"; done
+  while [[ "$right" != "/" && "$right" == */ ]]; do right="${right%/}"; done
   [[ "$left" != "/" && "$right" != "/" ]] || return 0
   [[ "$left" == "$right" || "$left" == "${right}/"* || "$right" == "${left}/"* ]]
 }
@@ -567,20 +576,48 @@ bind_resolve_source() {
   printf '%s\n' "${resolved:-$path}"
 }
 
-# 迁移包摘要、加密与解密。
+# 容器改名与网络重连：单容器恢复脚本与恢复事务共用，供失败时还原旧容器。
 
-sha256_file() {
-  local file="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" | awk '{print $1}'
-  elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$file" | awk '{print $NF}'
-  else
-    return 127
-  fi
+rename_container_with_retry() {
+  local old_name="$1" new_name="$2"
+  for _ in {1..20}; do
+    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
+
+restore_container_networks() {
+  local container="$1" metadata_file="$2" entry network ip ip6 alias
+  local -a connect_args=()
+  [[ -f "$metadata_file" ]] || return 1
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    network="$(jq -r '.key' <<<"$entry")"
+    case "$network" in "" | host | none) continue ;; esac
+    if docker inspect "$container" | jq -e --arg network "$network" \
+      '.[0].NetworkSettings.Networks[$network] != null' >/dev/null 2>&1; then
+      continue
+    fi
+    connect_args=()
+    if [[ "$network" == "bridge" ]]; then
+      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
+      continue
+    fi
+    ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
+    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // empty' <<<"$entry")"
+    [[ -z "$ip" ]] || connect_args+=(--ip "$ip")
+    [[ -z "$ip6" ]] || connect_args+=(--ip6 "$ip6")
+    while IFS= read -r alias; do
+      [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
+    done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
+    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
+  done < <(jq -c 'to_entries[]?' "$metadata_file")
+}
+
+# 迁移包摘要、加密与解密。
 
 bundle_download_url() {
   printf '%s\n' "${1%%#*}"
@@ -1476,26 +1513,99 @@ umask 077
 BUNDLE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 META="${BUNDLE_DIR}/meta/__NAME__.inspect.json"
 
-dm_format_elapsed() {
+# 进度显示与耗时格式化：主脚本与生成的恢复脚本共用。
+
+format_elapsed() {
   local seconds="${1:-0}"
-  if ((seconds >= 60)); then
-    printf '%d 分 %d 秒' "$((seconds / 60))" "$((seconds % 60))"
+  ((seconds < 0)) && seconds=0
+  if ((seconds >= 3600)); then
+    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+  elif ((seconds >= 60)); then
+    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
   else
-    printf '%d 秒' "$seconds"
+    printf '%d 秒\n' "$seconds"
   fi
 }
 
-dm_tty_draw() {
+human() {
+  local b="${1:-0}"
+  local -a units=(B KB MB GB TB PB)
+  local i=0
+  while ((b >= 1024 && i < ${#units[@]} - 1)); do
+    b=$((b / 1024))
+    i=$((i + 1))
+  done
+  echo "${b}${units[$i]}"
+}
+
+progress_file_size() {
+  local file="$1"
+  stat -c %s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
+}
+
+# 只在确实知道总字节数时显示百分比；未知总量时仅报告已处理字节和耗时，
+# 避免用“假进度条”误导用户。该函数保持纯输出，便于单元测试。
+progress_render() {
+  local label="$1" current="${2:-0}" total="${3:-0}" elapsed="${4:-0}"
+  local percent filled empty bar
+  [[ "$current" =~ ^[0-9]+$ ]] || current=0
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  [[ "$elapsed" =~ ^[0-9]+$ ]] || elapsed=0
+  if ((total > 0)); then
+    ((current <= total)) || current=$total
+    percent=$((current * 100 / total))
+    filled=$((percent * 24 / 100))
+    empty=$((24 - filled))
+    printf -v bar '%*s' "$filled" ''
+    bar=${bar// /#}
+    printf -v empty '%*s' "$empty" ''
+    empty=${empty// /-}
+    printf '[进度] %s [%s%s] %d%% · %s/%s · %s' \
+      "$label" "$bar" "$empty" "$percent" "$(human "$current")" \
+      "$(human "$total")" "$(format_elapsed "$elapsed")"
+  elif ((current > 0)); then
+    printf '[进度] %s · %s · %s' \
+      "$label" "$(human "$current")" "$(format_elapsed "$elapsed")"
+  else
+    printf '[进度] %s · %s' "$label" "$(format_elapsed "$elapsed")"
+  fi
+}
+
+progress_tty_draw() {
+  # 用一次写入覆盖旧内容，再清除新内容右侧的残留；不要先输出一整行空格，
+  # 否则 SSH 或刷新较慢的终端会把中间空帧显示成闪烁。
   printf '\r%s\033[K' "$1" >&2
 }
 
-dm_tty_clear() {
+progress_tty_clear() {
   printf '\r\033[K' >&2
 }
 
-dm_progress_watch() {
-  local label="$1" started="$2" owner_pid="$3"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval elapsed line timer_pid=""
+progress_finish() {
+  local label="$1" rc="$2" elapsed="$3" current="${4:-0}"
+  local suffix=""
+  ((rc != 0)) || return 0
+  [[ "$current" =~ ^[0-9]+$ ]] || current=0
+  ((current == 0)) || suffix=" · $(human "$current")"
+  printf '[失败] %s · %s%s\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
+}
+
+progress_count() {
+  local label="$1" current="$2" total="$3" item="${4:-}"
+  local suffix="" line
+  [[ -z "$item" ]] || suffix="（${item}）"
+  if [[ -t 2 ]]; then
+    printf -v line '[进度] %s：%d/%d%s' "$label" "$current" "$total" "$suffix"
+    progress_tty_draw "$line"
+    ((current < total)) || printf '\n' >&2
+  elif ((current == 1 || current == total || current % 10 == 0)); then
+    printf '[进度] %s：%d/%d%s\n' "$label" "$current" "$total" "$suffix" >&2
+  fi
+}
+
+progress_watch() {
+  local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed line timer_pid=""
   [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -1505,6 +1615,8 @@ dm_progress_watch() {
     interval=10
   fi
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  # watcher 被主流程终止时，也必须立即终止其 sleep 子进程。否则 sleep 会继续
+  # 持有命令替换/进程替换的管道，使已经完成的步骤一直等到 interval 到期。
   trap '
     if [[ -n "${timer_pid:-}" ]]; then
       kill "$timer_pid" 2>/dev/null || true
@@ -1513,31 +1625,34 @@ dm_progress_watch() {
     exit 0
   ' TERM INT HUP
   while kill -0 "$owner_pid" 2>/dev/null; do
-    # 关闭 timer 继承的 stdin 管道。
+    # timer 不需要任何标准流；显式断开可避免它延长调用方管道的生命周期。
+    # stdin 重定向用于关闭继承的管道，不是供 sleep 读取。
     # shellcheck disable=SC2217
     sleep "$interval" </dev/null >/dev/null 2>&1 &
     timer_pid=$!
     wait "$timer_pid" 2>/dev/null || true
     timer_pid=""
     kill -0 "$owner_pid" 2>/dev/null || break
+    current=0
+    [[ -z "$file" ]] || current="$(progress_file_size "$file")"
     elapsed=$((SECONDS - started))
     if [[ -t 2 ]]; then
-      printf -v line '[进度] %s · %s' "$label" "$(dm_format_elapsed "$elapsed")"
-      dm_tty_draw "$line"
+      line="$(progress_render "$label" "$current" "$total" "$elapsed")"
+      progress_tty_draw "$line"
     else
-      printf '[进度] %s · %s\n' \
-        "$label" "$(dm_format_elapsed "$elapsed")" >&2
+      progress_render "$label" "$current" "$total" "$elapsed" >&2
+      printf '\n' >&2
     fi
   done
   trap - TERM INT HUP
 }
 
-dm_run_with_activity() {
-  local label="$1"
-  shift
-  local started=$SECONDS watcher_pid rc restore_errexit=0
+run_with_progress() {
+  local label="$1" file="$2" total="$3"
+  shift 3
+  local started=$SECONDS watcher_pid rc current=0 restore_errexit=0
   case $- in *e*) restore_errexit=1 ;; esac
-  dm_progress_watch "$label" "$started" "$$" &
+  progress_watch "$label" "$file" "$total" "$started" "$$" &
   watcher_pid=$!
   set +e
   "$@"
@@ -1545,11 +1660,69 @@ dm_run_with_activity() {
   ((restore_errexit == 0)) || set -e
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || dm_tty_clear
-  if ((rc != 0)); then
-    printf '[失败] %s · %s\n' "$label" "$(dm_format_elapsed "$((SECONDS - started))")" >&2
-  fi
+  [[ ! -t 2 ]] || progress_tty_clear
+  [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+  progress_finish "$label" "$rc" "$((SECONDS - started))" "$current"
   return "$rc"
+}
+
+run_with_activity() {
+  local label="$1"
+  shift
+  run_with_progress "$label" "" 0 "$@"
+}
+
+run_with_file_progress() {
+  local label="$1" file="$2" total="${3:-0}"
+  shift 3
+  run_with_progress "$label" "$file" "$total" "$@"
+}
+
+progress_capture_stdout() {
+  local outfile="$1"
+  shift
+  "$@" >"$outfile"
+}
+
+# 容器改名与网络重连：单容器恢复脚本与恢复事务共用，供失败时还原旧容器。
+
+rename_container_with_retry() {
+  local old_name="$1" new_name="$2"
+  for _ in {1..20}; do
+    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+restore_container_networks() {
+  local container="$1" metadata_file="$2" entry network ip ip6 alias
+  local -a connect_args=()
+  [[ -f "$metadata_file" ]] || return 1
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    network="$(jq -r '.key' <<<"$entry")"
+    case "$network" in "" | host | none) continue ;; esac
+    if docker inspect "$container" | jq -e --arg network "$network" \
+      '.[0].NetworkSettings.Networks[$network] != null' >/dev/null 2>&1; then
+      continue
+    fi
+    connect_args=()
+    if [[ "$network" == "bridge" ]]; then
+      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
+      continue
+    fi
+    ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
+    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // empty' <<<"$entry")"
+    [[ -z "$ip" ]] || connect_args+=(--ip "$ip")
+    [[ -z "$ip6" ]] || connect_args+=(--ip6 "$ip6")
+    while IFS= read -r alias; do
+      [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
+    done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
+    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
+  done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
 dm_capture_command() {
@@ -1616,45 +1789,6 @@ if [[ -n "${RESTORE_TRANSACTION_DIR:-}" && -d "${RESTORE_TRANSACTION_DIR}" ]]; t
   transaction_mode=1
 fi
 
-rename_container_with_retry() {
-  local old_name="$1" new_name="$2"
-  for _ in {1..20}; do
-    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  return 1
-}
-
-restore_container_networks() {
-  local container="$1" metadata_file="$2" entry network ip ip6 alias
-  local -a connect_args=()
-  [[ -f "$metadata_file" ]] || return 1
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
-    network="$(jq -r '.key' <<<"$entry")"
-    case "$network" in "" | host | none) continue ;; esac
-    if docker inspect "$container" | jq -e --arg network "$network" \
-      '.[0].NetworkSettings.Networks[$network] != null' >/dev/null 2>&1; then
-      continue
-    fi
-    connect_args=()
-    if [[ "$network" == "bridge" ]]; then
-      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
-      continue
-    fi
-    ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
-    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // empty' <<<"$entry")"
-    [[ -z "$ip" ]] || connect_args+=(--ip "$ip")
-    [[ -z "$ip6" ]] || connect_args+=(--ip6 "$ip6")
-    while IFS= read -r alias; do
-      [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
-    done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
-    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
-  done < <(jq -c 'to_entries[]?' "$metadata_file")
-}
-
 disconnect_container_networks() {
   local container="$1" metadata_file="$2" network
   while IFS= read -r network; do
@@ -1708,7 +1842,7 @@ trap replacement_exit_handler EXIT
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then
   echo "[INFO] image is not loaded; pull before changing any existing container: $image"
-  dm_run_with_activity "拉取容器镜像：$image" docker pull "$image" || {
+  run_with_activity "拉取容器镜像：$image" docker pull "$image" || {
     echo "[WARN] image is unavailable; existing container was left unchanged: $image" >&2
     exit 1
   }
@@ -1749,7 +1883,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
       [[ "$existing_state" == "paused" ]] && docker unpause "$name" >/dev/null 2>&1 || true
       case "$existing_state" in
         running | restarting | paused)
-          dm_run_with_activity "停止目标端旧容器：$name" docker stop "$name" >/dev/null || {
+          run_with_activity "停止目标端旧容器：$name" docker stop "$name" >/dev/null || {
             echo "[WARN] failed to stop existing container; it was left unchanged: $name" >&2
             exit 1
           }
@@ -2029,7 +2163,7 @@ done
 
 mapfile -t mounts < <(jq -r '.[0].Mounts[]? | @base64' "$META")
 for m in "${mounts[@]}"; do
-  _jq(){ echo "$m" | decode_base64 | jq -r "$1"; }
+  _jq() { echo "$m" | decode_base64 | jq -r "$1"; }
   m_type="$(_jq '.Type')"
   dest="$(_jq '.Destination')"
   rw="$(_jq '.RW')"
@@ -2054,7 +2188,10 @@ for m in "${mounts[@]}"; do
   fi
   [[ "$rw" != "true" ]] && opts+=(ro)
   if ((${#opts[@]})); then
-    optstr="$(IFS=,; echo "${opts[*]}")"
+    optstr="$(
+      IFS=,
+      echo "${opts[*]}"
+    )"
     args+=(-v "${src}:${dest}:${optstr}")
   else
     args+=(-v "${src}:${dest}")
@@ -2073,7 +2210,7 @@ else
 fi
 
 if [[ "$primary_net" != "bridge" && "$primary_net" != "host" &&
-      "$primary_net" != "none" && "$primary_net" != container:* ]]; then
+  "$primary_net" != "none" && "$primary_net" != container:* ]]; then
   # 只还原用户显式指定的静态 IP（IPAMConfig）。Docker 动态分配的地址若被
   # 固定下来，会与目标端同网络的其他容器冲突，也改变了原有配置。
   primary_ip="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv4Address // empty' "$META")"
@@ -2094,7 +2231,7 @@ fi
 run_output=""
 run_log="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-run.XXXXXX")" || exit 1
 set +e
-dm_run_with_activity "创建并启动容器：$name" dm_capture_command "$run_log" "${args[@]}"
+run_with_activity "创建并启动容器：$name" dm_capture_command "$run_log" "${args[@]}"
 run_rc=$?
 set -e
 run_output="$(cat "$run_log")"
@@ -2122,7 +2259,7 @@ network_restore_failed=0
 if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" != container:* ]]; then
   mapfile -t net_entries < <(jq -r '.[0].NetworkSettings.Networks | to_entries[]? | @base64' "$META")
   for entry in "${net_entries[@]}"; do
-    _net(){ echo "$entry" | decode_base64 | jq -r "$1"; }
+    _net() { echo "$entry" | decode_base64 | jq -r "$1"; }
     net_name="$(_net '.key')"
     [[ -z "$net_name" || "$net_name" == "$primary_net" || "$net_name" == "bridge" ]] && continue
     ip="$(_net '.value.IPAMConfig.IPv4Address // empty')"
@@ -2138,7 +2275,7 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
       network_restore_failed=1
       echo "[WARN] 连接额外网络失败：$net_name，容器可能缺少网络" >&2
       case "$net_name" in
-        macvlan*|ipvlan*|overlay*)
+        macvlan* | ipvlan* | overlay*)
           echo "[WARN] → 网络 $net_name 需管理员在目标服务器预创建（macvlan/ipvlan/overlay 不自动创建）" >&2
           ;;
       esac
@@ -2154,7 +2291,7 @@ fi
 # 容器在一个短暂窗口内持续为 running。
 health_kind="$(jq -r '.[0].Config.Healthcheck.Test[0] // empty' "$META" 2>/dev/null || true)"
 if [[ "$original_running" == "true" &&
-      ("$health_kind" == "CMD" || "$health_kind" == "CMD-SHELL") ]]; then
+  ("$health_kind" == "CMD" || "$health_kind" == "CMD-SHELL") ]]; then
   health_timeout="${RESTORE_HEALTH_TIMEOUT:-60}"
   if ! [[ "$health_timeout" =~ ^[1-9][0-9]*$ ]] || ((health_timeout > 3600)); then
     echo "[WARN] invalid RESTORE_HEALTH_TIMEOUT: $health_timeout (expected 1-3600 seconds)" >&2
@@ -2266,53 +2403,136 @@ umask 077
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$BUNDLE_DIR"
 
-say(){ echo -e "\033[1;34m$*\033[0m"; }
-warn(){ echo -e "\033[1;33m$*\033[0m"; }
+say() { echo -e "\033[1;34m$*\033[0m"; }
+warn() { echo -e "\033[1;33m$*\033[0m"; }
 
-dm_format_elapsed() {
-  local seconds="${1:-0}"
-  if ((seconds >= 60)); then
-    printf '%d 分 %d 秒' "$((seconds / 60))" "$((seconds % 60))"
+# 彩色输出：主脚本与生成的恢复脚本共用。
+BLUE() { echo -e "\033[1;34m$*\033[0m"; }
+YEL() { echo -e "\033[1;33m$*\033[0m"; }
+RED() { echo -e "\033[1;31m$*\033[0m"; }
+OK() { echo -e "\033[1;32m$*\033[0m"; }
+CYA() { echo -e "\033[1;36m$*\033[0m"; }
+
+# 通用工具：主脚本与生成的恢复脚本共用。
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
   else
-    printf '%d 秒' "$seconds"
+    "$@"
   fi
 }
 
-dm_tty_draw() {
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$file" | awk '{print $NF}'
+  else
+    return 127
+  fi
+}
+
+# 进度显示与耗时格式化：主脚本与生成的恢复脚本共用。
+
+format_elapsed() {
+  local seconds="${1:-0}"
+  ((seconds < 0)) && seconds=0
+  if ((seconds >= 3600)); then
+    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+  elif ((seconds >= 60)); then
+    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
+  else
+    printf '%d 秒\n' "$seconds"
+  fi
+}
+
+human() {
+  local b="${1:-0}"
+  local -a units=(B KB MB GB TB PB)
+  local i=0
+  while ((b >= 1024 && i < ${#units[@]} - 1)); do
+    b=$((b / 1024))
+    i=$((i + 1))
+  done
+  echo "${b}${units[$i]}"
+}
+
+progress_file_size() {
+  local file="$1"
+  stat -c %s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
+}
+
+# 只在确实知道总字节数时显示百分比；未知总量时仅报告已处理字节和耗时，
+# 避免用“假进度条”误导用户。该函数保持纯输出，便于单元测试。
+progress_render() {
+  local label="$1" current="${2:-0}" total="${3:-0}" elapsed="${4:-0}"
+  local percent filled empty bar
+  [[ "$current" =~ ^[0-9]+$ ]] || current=0
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  [[ "$elapsed" =~ ^[0-9]+$ ]] || elapsed=0
+  if ((total > 0)); then
+    ((current <= total)) || current=$total
+    percent=$((current * 100 / total))
+    filled=$((percent * 24 / 100))
+    empty=$((24 - filled))
+    printf -v bar '%*s' "$filled" ''
+    bar=${bar// /#}
+    printf -v empty '%*s' "$empty" ''
+    empty=${empty// /-}
+    printf '[进度] %s [%s%s] %d%% · %s/%s · %s' \
+      "$label" "$bar" "$empty" "$percent" "$(human "$current")" \
+      "$(human "$total")" "$(format_elapsed "$elapsed")"
+  elif ((current > 0)); then
+    printf '[进度] %s · %s · %s' \
+      "$label" "$(human "$current")" "$(format_elapsed "$elapsed")"
+  else
+    printf '[进度] %s · %s' "$label" "$(format_elapsed "$elapsed")"
+  fi
+}
+
+progress_tty_draw() {
+  # 用一次写入覆盖旧内容，再清除新内容右侧的残留；不要先输出一整行空格，
+  # 否则 SSH 或刷新较慢的终端会把中间空帧显示成闪烁。
   printf '\r%s\033[K' "$1" >&2
 }
 
-dm_tty_clear() {
+progress_tty_clear() {
   printf '\r\033[K' >&2
 }
 
-dm_human() {
-  local bytes="${1:-0}" unit=0
-  local -a units=(B KB MB GB TB)
-  while ((bytes >= 1024 && unit < ${#units[@]} - 1)); do
-    bytes=$((bytes / 1024))
-    unit=$((unit + 1))
-  done
-  printf '%s%s' "$bytes" "${units[$unit]}"
+progress_finish() {
+  local label="$1" rc="$2" elapsed="$3" current="${4:-0}"
+  local suffix=""
+  ((rc != 0)) || return 0
+  [[ "$current" =~ ^[0-9]+$ ]] || current=0
+  ((current == 0)) || suffix=" · $(human "$current")"
+  printf '[失败] %s · %s%s\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
 }
 
-dm_file_size() {
-  stat -c %s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
-}
-
-restore_load_images() {
-  local archive="$1" total
-  if command -v pv >/dev/null 2>&1; then
-    total="$(dm_file_size "$archive")"
-    pv -f -s "$total" "$archive" | docker load
-  else
-    docker load -i "$archive"
+progress_count() {
+  local label="$1" current="$2" total="$3" item="${4:-}"
+  local suffix="" line
+  [[ -z "$item" ]] || suffix="（${item}）"
+  if [[ -t 2 ]]; then
+    printf -v line '[进度] %s：%d/%d%s' "$label" "$current" "$total" "$suffix"
+    progress_tty_draw "$line"
+    ((current < total)) || printf '\n' >&2
+  elif ((current == 1 || current == total || current % 10 == 0)); then
+    printf '[进度] %s：%d/%d%s\n' "$label" "$current" "$total" "$suffix" >&2
   fi
 }
 
-dm_progress_watch() {
+progress_watch() {
   local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed percent message timer_pid=""
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed line timer_pid=""
   [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -2322,6 +2542,8 @@ dm_progress_watch() {
     interval=10
   fi
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  # watcher 被主流程终止时，也必须立即终止其 sleep 子进程。否则 sleep 会继续
+  # 持有命令替换/进程替换的管道，使已经完成的步骤一直等到 interval 到期。
   trap '
     if [[ -n "${timer_pid:-}" ]]; then
       kill "$timer_pid" 2>/dev/null || true
@@ -2330,7 +2552,8 @@ dm_progress_watch() {
     exit 0
   ' TERM INT HUP
   while kill -0 "$owner_pid" 2>/dev/null; do
-    # 关闭 timer 继承的 stdin 管道。
+    # timer 不需要任何标准流；显式断开可避免它延长调用方管道的生命周期。
+    # stdin 重定向用于关闭继承的管道，不是供 sleep 读取。
     # shellcheck disable=SC2217
     sleep "$interval" </dev/null >/dev/null 2>&1 &
     timer_pid=$!
@@ -2338,32 +2561,25 @@ dm_progress_watch() {
     timer_pid=""
     kill -0 "$owner_pid" 2>/dev/null || break
     current=0
-    [[ -z "$file" ]] || current="$(dm_file_size "$file")"
+    [[ -z "$file" ]] || current="$(progress_file_size "$file")"
     elapsed=$((SECONDS - started))
-    if ((total > 0)); then
-      ((current <= total)) || current=$total
-      percent=$((current * 100 / total))
-      message="[进度] ${label} · ${percent}% · $(dm_human "$current")/$(dm_human "$total") · $(dm_format_elapsed "$elapsed")"
-    elif ((current > 0)); then
-      message="[进度] ${label} · $(dm_human "$current") · $(dm_format_elapsed "$elapsed")"
-    else
-      message="[进度] ${label} · $(dm_format_elapsed "$elapsed")"
-    fi
     if [[ -t 2 ]]; then
-      dm_tty_draw "$message"
+      line="$(progress_render "$label" "$current" "$total" "$elapsed")"
+      progress_tty_draw "$line"
     else
-      printf '%s\n' "$message" >&2
+      progress_render "$label" "$current" "$total" "$elapsed" >&2
+      printf '\n' >&2
     fi
   done
   trap - TERM INT HUP
 }
 
-dm_run_with_progress() {
+run_with_progress() {
   local label="$1" file="$2" total="$3"
   shift 3
-  local started=$SECONDS watcher_pid rc current=0 restore_errexit=0 suffix=""
+  local started=$SECONDS watcher_pid rc current=0 restore_errexit=0
   case $- in *e*) restore_errexit=1 ;; esac
-  dm_progress_watch "$label" "$file" "$total" "$started" "$$" &
+  progress_watch "$label" "$file" "$total" "$started" "$$" &
   watcher_pid=$!
   set +e
   "$@"
@@ -2371,28 +2587,308 @@ dm_run_with_progress() {
   ((restore_errexit == 0)) || set -e
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || dm_tty_clear
-  [[ -z "$file" ]] || current="$(dm_file_size "$file")"
-  ((current == 0)) || suffix=" · $(dm_human "$current")"
-  if ((rc != 0)); then
-    printf '[失败] %s · %s%s\n' "$label" \
-      "$(dm_format_elapsed "$((SECONDS - started))")" "$suffix" >&2
-  fi
+  [[ ! -t 2 ]] || progress_tty_clear
+  [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+  progress_finish "$label" "$rc" "$((SECONDS - started))" "$current"
   return "$rc"
 }
 
-dm_run_with_activity() {
+run_with_activity() {
   local label="$1"
   shift
-  dm_run_with_progress "$label" "" 0 "$@"
+  run_with_progress "$label" "" 0 "$@"
 }
 
-dm_run_with_file_progress() {
+run_with_file_progress() {
   local label="$1" file="$2" total="${3:-0}"
   shift 3
-  dm_run_with_progress "$label" "$file" "$total" "$@"
+  run_with_progress "$label" "$file" "$total" "$@"
 }
 
+progress_capture_stdout() {
+  local outfile="$1"
+  shift
+  "$@" >"$outfile"
+}
+
+# 挂载路径判断：重叠检测、宿主机系统路径与软链接解析。主脚本与恢复脚本共用。
+
+mount_paths_overlap() {
+  local left="$1" right="$2"
+  while [[ "$left" != "/" && "$left" == */ ]]; do left="${left%/}"; done
+  while [[ "$right" != "/" && "$right" == */ ]]; do right="${right%/}"; done
+  [[ "$left" != "/" && "$right" != "/" ]] || return 0
+  [[ "$left" == "$right" || "$left" == "${right}/"* || "$right" == "${left}/"* ]]
+}
+
+# 宿主机系统路径只在目标端重建挂载关系，不迁移其内容：这些路径属于宿主机
+# 本身（时区、DNS、内核模块、伪文件系统等），覆盖目标端会破坏新服务器。
+# 第一组匹配自身及其子路径；第二组是只在完全相同时才算系统路径的大目录。
+SYSTEM_BIND_PREFIXES=(
+  /proc /sys /dev /run /var/run /boot /lib/modules /usr/lib/modules
+  /var/lib/docker /var/lib/containerd /var/log /etc/docker /etc/systemd
+  /lib/systemd /usr/lib/systemd /etc/localtime /etc/timezone /usr/share/zoneinfo
+  /etc/hostname /etc/hosts /etc/resolv.conf /etc/machine-id /etc/os-release
+  /usr/lib/os-release /etc/passwd /etc/group /etc/shadow /etc/gshadow
+  /etc/ssl /etc/pki /etc/ca-certificates
+)
+SYSTEM_BIND_EXACT=(
+  / /etc /usr /usr/lib /usr/bin /usr/local /var /var/lib /lib /lib64 /bin /sbin
+  /opt /home /root /srv /mnt /media /tmp
+)
+
+bind_path_is_system() {
+  local path="$1" prefix
+  [[ "$path" == "/" ]] || path="${path%/}"
+  for prefix in "${SYSTEM_BIND_EXACT[@]}"; do
+    [[ "$path" != "$prefix" ]] || return 0
+  done
+  for prefix in "${SYSTEM_BIND_PREFIXES[@]}"; do
+    [[ "$path" != "$prefix" && "$path" != "${prefix}/"* ]] || return 0
+  done
+  return 1
+}
+
+# bind 源本身是软链接时（如 /srv/app -> /data/app），Docker 挂载的是链接目标。
+# 返回真实路径，供备份真实数据；无法解析时原样返回。
+bind_resolve_source() {
+  local path="$1" resolved=""
+  if [[ -L "$path" ]]; then
+    resolved="$(realpath "$path" 2>/dev/null || readlink -f "$path" 2>/dev/null || true)"
+  fi
+  printf '%s\n' "${resolved:-$path}"
+}
+
+# 迁移包结构：校验清单、manifest 与归档安全检查、恢复结果统计。
+
+json_array_from_lines() {
+  if [[ $# -eq 0 ]]; then
+    echo '[]'
+    return 0
+  fi
+  # 过滤空行，避免空数组被序列化成 [""]。
+  printf '%s\n' "$@" | awk 'NF' | jq -R . | jq -cs .
+}
+
+generate_bundle_checksums() {
+  local bundle_dir="$1"
+  local manifest="${bundle_dir}/checksums.sha256"
+  local file rel digest
+  : >"$manifest"
+  while IFS= read -r -d '' file; do
+    rel="${file#"${bundle_dir}/"}"
+    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
+    digest="$(sha256_file "$file")" || {
+      RED "[ERR] 系统缺少 SHA-256 工具（sha256sum/shasum/openssl）。"
+      return 1
+    }
+    printf '%s\t%s\n' "$digest" "$rel" >>"$manifest"
+  done < <(find "$bundle_dir" -type f -print0)
+}
+
+verify_bundle_checksums() {
+  local bundle_dir="$1"
+  local manifest="${bundle_dir}/checksums.sha256"
+  local expected rel file actual count=0
+  local -A verified_paths=()
+  [[ -f "$manifest" ]] || {
+    RED "[ERR] 迁移包缺少 checksums.sha256。"
+    return 1
+  }
+  while IFS=$'\t' read -r expected rel; do
+    [[ -n "$expected" && -n "$rel" ]] || continue
+    case "$rel" in
+      /* | .. | ../* | */../* | */..)
+        RED "[ERR] 校验清单含危险路径：$rel"
+        return 1
+        ;;
+    esac
+    file="${bundle_dir}/${rel}"
+    [[ -f "$file" ]] || {
+      RED "[ERR] 迁移包缺少文件：$rel"
+      return 1
+    }
+    actual="$(sha256_file "$file")" || return 1
+    [[ "$actual" == "$expected" ]] || {
+      RED "[ERR] 文件完整性校验失败：$rel"
+      return 1
+    }
+    verified_paths["$rel"]=1
+    count=$((count + 1))
+  done <"$manifest"
+  ((count > 0)) || {
+    RED "[ERR] 校验清单为空。"
+    return 1
+  }
+  while IFS= read -r -d '' file; do
+    rel="${file#"${bundle_dir}/"}"
+    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
+    if [[ -z "${verified_paths["$rel"]+present}" ]]; then
+      RED "[ERR] 迁移包含未纳入校验清单的文件：$rel"
+      return 1
+    fi
+  done < <(find "$bundle_dir" -type f -print0)
+}
+
+bundle_manifest_is_safe() {
+  local bundle_dir="$1" manifest run name metadata_name
+  manifest="${bundle_dir}/manifest.json"
+  [[ -f "$manifest" ]] || return 1
+  jq -e '
+    type == "object" and
+    (.images | type == "array") and
+    (.networks | type == "array") and
+    (.projects | type == "array") and
+    (.volumes | type == "array") and
+    (.binds | type == "array") and
+    (.runs | type == "array") and
+    all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
+    all(.projects[];
+      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+      (.working_dir // "" | type == "string" and
+        (. == "" or (startswith("/") and (test("(^|/)\\.\\.(/|$)") | not) and
+          all(explode[]; . >= 32 and . != 127))))
+    ) and
+    all(.volumes[]; (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
+    all(.binds[];
+      (.host | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not) and
+        all(explode[]; . >= 32 and . != 127)) and
+      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$")) and
+      ((.link // null) == null or (.link | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not) and
+        all(explode[]; . >= 32 and . != 127)))
+    )
+  ' "$manifest" >/dev/null || return 1
+
+  while IFS= read -r run; do
+    [[ -f "${bundle_dir}/${run}" ]] || return 1
+    name="${run#runs/}"
+    name="${name%.sh}"
+    [[ -f "${bundle_dir}/meta/${name}.inspect.json" ]] || return 1
+    metadata_name="$(jq -r '.[0].Name | ltrimstr("/")' \
+      "${bundle_dir}/meta/${name}.inspect.json" 2>/dev/null || true)"
+    [[ "$metadata_name" == "$name" ]] || return 1
+  done < <(jq -r '.runs[]' "$manifest")
+}
+
+archive_layout_is_safe() {
+  local archive="$1"
+  local entry
+  # 在同一次成员列表扫描中同时确认归档可读并校验路径；pipefail 会保留 tar
+  # 解压列表失败的状态，避免为了取得退出码再完整解压一遍 gzip 流。
+  tar -tzf "$archive" 2>/dev/null |
+    while IFS= read -r entry; do
+      case "$entry" in
+        /* | .. | ../* | */../* | */..) exit 1 ;;
+      esac
+    done || return 1
+  # 顶层迁移包不需要符号链接或硬链接；拒绝它们可避免解压路径绕过。
+  ! tar -tvzf "$archive" | awk 'substr($1,1,1) ~ /^[lh]$/ { bad=1 } END { exit bad ? 0 : 1 }'
+}
+
+restore_target_container_names() {
+  local bundle_dir="$1" run project service found_service inspect_file
+  [[ -f "${bundle_dir}/manifest.json" ]] || return 0
+  while IFS= read -r run; do
+    [[ -n "$run" ]] || continue
+    basename "${run%.sh}"
+  done < <(jq -r '.runs[]?' "${bundle_dir}/manifest.json" 2>/dev/null || true)
+  while IFS= read -r project; do
+    [[ -n "$project" ]] || continue
+    found_service=0
+    for inspect_file in "${bundle_dir}"/meta/*.inspect.json; do
+      [[ -f "$inspect_file" ]] || continue
+      service="$(jq -r --arg project "$project" '
+        if (.[0].Config.Labels["com.docker.compose.project"] // "") == $project
+        then .[0].Config.Labels["com.docker.compose.service"] // empty
+        else empty end
+      ' "$inspect_file" 2>/dev/null || true)"
+      [[ -n "$service" ]] || continue
+      found_service=1
+      docker ps -a --filter "label=com.docker.compose.project=${project}" \
+        --filter "label=com.docker.compose.service=${service}" \
+        --format '{{.Names}}' 2>/dev/null || true
+    done
+    if ((found_service == 0)); then
+      docker ps -a --filter "label=com.docker.compose.project=${project}" \
+        --format '{{.Names}}' 2>/dev/null || true
+    fi
+  done < <(jq -r '.projects[]?.name' "${bundle_dir}/manifest.json" 2>/dev/null || true)
+}
+
+collect_restore_result_metrics() {
+  local bundle_dir="$1" name state
+  local total=0 running=0 paused=0 stopped=0 missing=0 volumes=0 binds=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    total=$((total + 1))
+    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    case "$state" in
+      running | restarting) running=$((running + 1)) ;;
+      paused) paused=$((paused + 1)) ;;
+      created | exited | dead | removing) stopped=$((stopped + 1)) ;;
+      *) missing=$((missing + 1)) ;;
+    esac
+  done < <(restore_target_container_names "$bundle_dir" | awk 'NF && !seen[$0]++')
+  if [[ -f "${bundle_dir}/manifest.json" ]]; then
+    volumes="$(jq -r '.volumes | length' "${bundle_dir}/manifest.json" 2>/dev/null || echo 0)"
+    binds="$(jq -r '.binds | length' "${bundle_dir}/manifest.json" 2>/dev/null || echo 0)"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$total" "$running" "$paused" "$stopped" "$missing" "$volumes" "$binds"
+}
+
+# 容器改名与网络重连：单容器恢复脚本与恢复事务共用，供失败时还原旧容器。
+
+rename_container_with_retry() {
+  local old_name="$1" new_name="$2"
+  for _ in {1..20}; do
+    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+restore_container_networks() {
+  local container="$1" metadata_file="$2" entry network ip ip6 alias
+  local -a connect_args=()
+  [[ -f "$metadata_file" ]] || return 1
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    network="$(jq -r '.key' <<<"$entry")"
+    case "$network" in "" | host | none) continue ;; esac
+    if docker inspect "$container" | jq -e --arg network "$network" \
+      '.[0].NetworkSettings.Networks[$network] != null' >/dev/null 2>&1; then
+      continue
+    fi
+    connect_args=()
+    if [[ "$network" == "bridge" ]]; then
+      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
+      continue
+    fi
+    ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
+    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // empty' <<<"$entry")"
+    [[ -z "$ip" ]] || connect_args+=(--ip "$ip")
+    [[ -z "$ip6" ]] || connect_args+=(--ip6 "$ip6")
+    while IFS= read -r alias; do
+      [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
+    done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
+    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
+  done < <(jq -c 'to_entries[]?' "$metadata_file")
+}
+
+restore_load_images() {
+  local archive="$1" total
+  if command -v pv >/dev/null 2>&1; then
+    total="$(progress_file_size "$archive")"
+    pv -f -s "$total" "$archive" | docker load
+  else
+    docker load -i "$archive"
+  fi
+}
 # Failure tracking
 FAILED_VOLUMES=()
 FAILED_BINDS=()
@@ -2414,66 +2910,6 @@ RESTORE_STARTED_AT=$SECONDS
 RESTORE_COMMIT_STARTED=0
 RESTORE_ACTIVE_DATA_LOG=""
 
-restore_format_elapsed() {
-  local seconds="${1:-0}"
-  ((seconds < 0)) && seconds=0
-  if ((seconds >= 3600)); then
-    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
-  elif ((seconds >= 60)); then
-    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
-  else
-    printf '%d 秒\n' "$seconds"
-  fi
-}
-
-restore_target_container_names() {
-  local run project service found_service inspect_file
-  while IFS= read -r run; do
-    [[ -n "$run" ]] || continue
-    basename "${run%.sh}"
-  done < <(jq -r '.runs[]?' manifest.json 2>/dev/null || true)
-  while IFS= read -r project; do
-    [[ -n "$project" ]] || continue
-    found_service=0
-    for inspect_file in meta/*.inspect.json; do
-      [[ -f "$inspect_file" ]] || continue
-      service="$(jq -r --arg project "$project" '
-        if (.[0].Config.Labels["com.docker.compose.project"] // "") == $project
-        then .[0].Config.Labels["com.docker.compose.service"] // empty
-        else empty end
-      ' "$inspect_file" 2>/dev/null || true)"
-      [[ -n "$service" ]] || continue
-      found_service=1
-      docker ps -a --filter "label=com.docker.compose.project=${project}" \
-        --filter "label=com.docker.compose.service=${service}" \
-        --format '{{.Names}}' 2>/dev/null || true
-    done
-    if ((found_service == 0)); then
-      docker ps -a --filter "label=com.docker.compose.project=${project}" \
-        --format '{{.Names}}' 2>/dev/null || true
-    fi
-  done < <(jq -r '.projects[]?.name' manifest.json 2>/dev/null || true)
-}
-
-restore_result_metrics() {
-  local name state total=0 running=0 paused=0 stopped=0 missing=0 volumes=0 binds=0
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    total=$((total + 1))
-    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
-    case "$state" in
-      running | restarting) running=$((running + 1)) ;;
-      paused) paused=$((paused + 1)) ;;
-      created | exited | dead | removing) stopped=$((stopped + 1)) ;;
-      *) missing=$((missing + 1)) ;;
-    esac
-  done < <(restore_target_container_names | awk 'NF && !seen[$0]++')
-  volumes="$(jq -r '.volumes | length' manifest.json 2>/dev/null || echo 0)"
-  binds="$(jq -r '.binds | length' manifest.json 2>/dev/null || echo 0)"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$total" "$running" "$paused" "$stopped" "$missing" "$volumes" "$binds"
-}
-
 restore_record_result() {
   local status="$1" rollback_dir="${2:-}" result_file="${RESTORE_RESULT_FILE:-}" tmp
   [[ -n "$result_file" ]] || return 0
@@ -2491,11 +2927,11 @@ restore_record_result() {
 restore_print_final_result() {
   local status="$1" rollback_dir="${2:-}" metrics total running paused stopped missing volumes binds
   local elapsed container_line data_line
-  elapsed="$(restore_format_elapsed "$((SECONDS - RESTORE_STARTED_AT))")"
+  elapsed="$(format_elapsed "$((SECONDS - RESTORE_STARTED_AT))")"
   container_line=""
   data_line=""
   if [[ "$status" == "SUCCESS" ]]; then
-    metrics="$(restore_result_metrics)"
+    metrics="$(collect_restore_result_metrics "$BUNDLE_DIR")"
     IFS=$'\t' read -r total running paused stopped missing volumes binds <<<"$metrics"
     container_line="容器：${total} 个（运行 ${running} / 暂停 ${paused} / 停止 ${stopped}"
     ((missing == 0)) || container_line+=" / 缺失 ${missing}"
@@ -2568,11 +3004,11 @@ restore_nontransaction_exit_handler() {
 }
 
 restore_has_failures() {
-  (( ${#FAILED_VOLUMES[@]} > 0 ||
-     ${#FAILED_BINDS[@]} > 0 ||
-     ${#FAILED_NETWORKS[@]} > 0 ||
-     ${#FAILED_PROJECTS[@]} > 0 ||
-     ${#FAILED_CONTAINERS[@]} > 0 ))
+  ((${#FAILED_VOLUMES[@]} > 0 || \
+  ${#FAILED_BINDS[@]} > 0 || \
+  ${#FAILED_NETWORKS[@]} > 0 || \
+  ${#FAILED_PROJECTS[@]} > 0 || \
+  ${#FAILED_CONTAINERS[@]} > 0))
 }
 
 print_failure_summary() {
@@ -2590,7 +3026,6 @@ print_failure_summary() {
   fi
   warn "============================================"
 }
-
 compose_run() {
   if [[ "${COMPOSE_IMPL:-}" == "plugin" ]]; then
     docker compose "$@"
@@ -2680,7 +3115,7 @@ compose_capture_rollback_images() {
       return 1
     fi
     image="docker-migrate-rollback:${id:0:12}-$$"
-    if ! dm_run_with_activity "创建 Compose 回滚镜像：$service" \
+    if ! run_with_activity "创建 Compose 回滚镜像：$service" \
       docker commit "$id" "$image" >/dev/null; then
       warn " · 目标端容器回滚镜像创建失败：$service"
       compose_rollback_image_cleanup "$rollback_dir"
@@ -2740,7 +3175,7 @@ compose_restore_rollback() {
       esac
     done <states.tsv
     if [[ "$restore_running" == "1" ]]; then
-      ((${#start_services[@]} == 0)) || \
+      ((${#start_services[@]} == 0)) ||
         compose_run -p "$project" -f config.yml -f images.yml start "${start_services[@]}"
       for service in "${pause_services[@]}"; do
         while IFS= read -r id; do
@@ -2884,93 +3319,6 @@ compose_wait_project_health() {
   done
   return 1
 }
-
-run_with_timeout() {
-  local seconds="$1"
-  shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$seconds" "$@"
-  else
-    "$@"
-  fi
-}
-
-restore_sha256_file() {
-  local file="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" | awk '{print $1}'
-  elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$file" | awk '{print $NF}'
-  else
-    return 127
-  fi
-}
-
-restore_verify_checksums() {
-  local expected rel file actual count=0
-  local -A verified_paths=()
-  [[ -f checksums.sha256 ]] || return 2
-  while IFS=$'\t' read -r expected rel; do
-    [[ -n "$expected" && -n "$rel" ]] || continue
-    case "$rel" in /*|..|../*|*/../*|*/..) return 1 ;; esac
-    file="${BUNDLE_DIR}/${rel}"
-    [[ -f "$file" ]] || return 1
-    actual="$(restore_sha256_file "$file")" || return 1
-    [[ "$actual" == "$expected" ]] || return 1
-    verified_paths["$rel"]=1
-    count=$((count + 1))
-  done <checksums.sha256
-  (( count > 0 )) || return 1
-  while IFS= read -r -d '' file; do
-    rel="${file#"${BUNDLE_DIR}/"}"
-    case "$rel" in checksums.sha256 | restore.sh | .docker_migrate_rollback/*) continue ;; esac
-    [[ -n "${verified_paths["$rel"]+present}" ]] || return 1
-  done < <(find "$BUNDLE_DIR" -type f -print0)
-}
-
-restore_manifest_is_safe() {
-  local run name metadata_name
-  jq -e '
-    type == "object" and
-    (.images | type == "array") and
-    (.networks | type == "array") and
-    (.projects | type == "array") and
-    (.volumes | type == "array") and
-    (.binds | type == "array") and
-    (.runs | type == "array") and
-    all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
-    all(.projects[];
-      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
-      (.working_dir // "" | type == "string" and
-        (. == "" or (startswith("/") and (test("(^|/)\\.\\.(/|$)") | not) and
-          all(explode[]; . >= 32 and . != 127))))
-    ) and
-    all(.volumes[]; (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
-    all(.binds[];
-      (.host | type == "string" and startswith("/") and . != "/" and
-        (test("(^|/)\\.\\.(/|$)") | not) and
-        all(explode[]; . >= 32 and . != 127)) and
-      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$")) and
-      ((.link // null) == null or (.link | type == "string" and startswith("/") and . != "/" and
-        (test("(^|/)\\.\\.(/|$)") | not) and
-        all(explode[]; . >= 32 and . != 127)))
-    )
-  ' manifest.json >/dev/null || return 1
-  while IFS= read -r run; do
-    [[ -f "${BUNDLE_DIR}/${run}" ]] || return 1
-    name="${run#runs/}"
-    name="${name%.sh}"
-    [[ -f "${BUNDLE_DIR}/meta/${name}.inspect.json" ]] || return 1
-    metadata_name="$(jq -r '.[0].Name | ltrimstr("/")' \
-      "${BUNDLE_DIR}/meta/${name}.inspect.json" 2>/dev/null || true)"
-    [[ "$metadata_name" == "$name" ]] || return 1
-  done < <(jq -r '.runs[]' manifest.json)
-}
-
 archive_members_safe() {
   # 只解析元数据，不访问软链接目标。完整建表后检查，避免归档通过成员顺序
   # 或路径重名，让解压程序沿链接写出目标树。gzip 只解压扫描一次。
@@ -3104,7 +3452,6 @@ except (OSError, EOFError, ValueError, tarfile.TarError) as error:
     sys.exit(1)
 STREAM_PY
 }
-
 volume_clear_and_extract() {
   local volume="$1" archive_dir="$2" archive_file="$3" prechecked="${4:-0}"
   # 来自恢复入口的归档已经在停机前预检；本地回滚包仍须先验证再清空卷。
@@ -3112,9 +3459,9 @@ volume_clear_and_extract() {
   printf '清空并解压命名卷：%s（归档：%s）\n' "$volume" "$archive_file" >&2
   if ! archive_normalized_stream "${archive_dir}/${archive_file}" |
     docker run --rm -i --read-only --network none \
-    --security-opt no-new-privileges --cap-drop MKNOD \
-    -v "${volume}:/to" \
-    alpine:3.20 sh -eu -c '
+      --security-opt no-new-privileges --cap-drop MKNOD \
+      -v "${volume}:/to" \
+      alpine:3.20 sh -eu -c '
       find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
       tar -xf - -C /to
     ' sh "$archive_file"; then
@@ -3229,9 +3576,9 @@ restore_bind_exact() {
   printf '解压绑定目录：%s（归档：%s）\n' "$host" "$archive" >&2
   if ! archive_normalized_stream "$archive" |
     docker run --rm -i --read-only --network none \
-    --security-opt no-new-privileges --cap-drop MKNOD \
-    -v "${stage}:/stage" \
-    alpine:3.20 tar -C /stage -xf -; then
+      --security-opt no-new-privileges --cap-drop MKNOD \
+      -v "${stage}:/stage" \
+      alpine:3.20 tar -C /stage -xf -; then
     root_exec rm -rf "$stage" || true
     return 1
   fi
@@ -3276,33 +3623,6 @@ restore_bind_exact() {
   fi
 }
 
-# 与主脚本 bind_path_is_system 保持一致：旧版迁移包可能仍记录了系统路径，
-# 恢复时一律跳过，绝不覆盖目标端宿主机文件。
-RESTORE_SYSTEM_BIND_PREFIXES=(
-  /proc /sys /dev /run /var/run /boot /lib/modules /usr/lib/modules
-  /var/lib/docker /var/lib/containerd /var/log /etc/docker /etc/systemd
-  /lib/systemd /usr/lib/systemd /etc/localtime /etc/timezone /usr/share/zoneinfo
-  /etc/hostname /etc/hosts /etc/resolv.conf /etc/machine-id /etc/os-release
-  /usr/lib/os-release /etc/passwd /etc/group /etc/shadow /etc/gshadow
-  /etc/ssl /etc/pki /etc/ca-certificates
-)
-RESTORE_SYSTEM_BIND_EXACT=(
-  / /etc /usr /usr/lib /usr/bin /usr/local /var /var/lib /lib /lib64 /bin /sbin
-  /opt /home /root /srv /mnt /media /tmp
-)
-
-restore_bind_is_system() {
-  local path="$1" prefix
-  [[ "$path" == "/" ]] || path="${path%/}"
-  for prefix in "${RESTORE_SYSTEM_BIND_EXACT[@]}"; do
-    [[ "$path" != "$prefix" ]] || return 0
-  done
-  for prefix in "${RESTORE_SYSTEM_BIND_PREFIXES[@]}"; do
-    [[ "$path" != "$prefix" && "$path" != "${prefix}/"* ]] || return 0
-  done
-  return 1
-}
-
 # 源端 bind 是软链接时，数据已恢复到真实路径；在原路径重建同一个链接，
 # 让容器按原挂载路径看到数据。新建的链接登记进 binds.tsv，回滚时删除。
 restore_bind_link() {
@@ -3327,7 +3647,6 @@ restore_bind_link() {
   root_exec mkdir -p "$(dirname "$link")" || return 1
   root_exec ln -s "$host" "$link"
 }
-
 compose_networks_from_meta_all() {
   [[ -d meta ]] || return 0
   local f proj
@@ -3383,7 +3702,7 @@ compose_network_records() {
     tmp_cfg="$(mktemp)"
   else
     tmp_cfg="/tmp/docker_migrate_compose_config_$$.json"
-    : > "$tmp_cfg"
+    : >"$tmp_cfg"
   fi
 
   if compose_run "$@" config --format json >"$tmp_cfg" 2>/dev/null; then
@@ -3451,7 +3770,7 @@ compose_prepare_networks() {
     esac
   done < <(compose_network_records "$project" "$@")
 
-  if (( seen == 0 )); then
+  if ((seen == 0)); then
     while IFS= read -r net; do
       [[ -n "$net" ]] || continue
       if [[ "$net" == "${project}_"* ]]; then
@@ -3540,7 +3859,6 @@ create_network_from_record() {
 
   "${create_args[@]}" >/dev/null
 }
-
 transaction_path_is_safe() {
   local path="$1"
   [[ "$path" == /* && "$path" != "/" ]] || return 1
@@ -3687,14 +4005,6 @@ transaction_restore_files() {
   return "$rc"
 }
 
-transaction_mount_paths_overlap() {
-  local first="$1" second="$2"
-  while [[ "$first" != "/" && "$first" == */ ]]; do first="${first%/}"; done
-  while [[ "$second" != "/" && "$second" == */ ]]; do second="${second%/}"; done
-  [[ "$first" == "$second" || "$first" == "/" || "$second" == "/" ||
-    "$first" == "${second}/"* || "$second" == "${first}/"* ]]
-}
-
 transaction_normalize_path() {
   local path="$1" probe component suffix="" resolved parent base component_i last_index
   [[ -n "$path" ]] || return 1
@@ -3774,13 +4084,13 @@ transaction_internal_paths_are_safe() {
 
   while IFS= read -r host; do
     [[ -n "$host" ]] || continue
-    restore_bind_is_system "$host" && continue
+    bind_path_is_system "$host" && continue
     normalized_host="$(transaction_normalize_path "$host")" || return 1
     for ((protected_i = 0; protected_i < ${#protected_paths[@]}; protected_i += 2)); do
       label="${protected_paths[$protected_i]}"
       protected="${protected_paths[$((protected_i + 1))]}"
       normalized_protected="$(transaction_normalize_path "$protected")" || return 1
-      if transaction_mount_paths_overlap "$normalized_host" "$normalized_protected"; then
+      if mount_paths_overlap "$normalized_host" "$normalized_protected"; then
         warn "绑定目录与 ${label} 重叠，已在改动目标数据前拒绝恢复：$host"
         warn "冲突路径：$normalized_protected"
         warn "请把 RESTORE_BASE、RESTORE_ROLLBACK_BASE 与 RESTORE_LOCK_BASE 放到该 bind 之外后重试。"
@@ -3789,59 +4099,19 @@ transaction_internal_paths_are_safe() {
     done
   done < <(jq -r '.binds[] | .host, (.link // empty)' manifest.json)
 }
-
 transaction_container_exists() {
   docker container inspect "$1" >/dev/null 2>&1
-}
-
-transaction_rename_container() {
-  local old_name="$1" new_name="$2"
-  for _ in {1..20}; do
-    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  return 1
-}
-
-transaction_restore_container_networks() {
-  local container="$1" metadata_file="$2" entry network ip ip6 alias
-  local -a connect_args=()
-  [[ -f "$metadata_file" ]] || return 1
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
-    network="$(jq -r '.key' <<<"$entry")"
-    case "$network" in "" | host | none) continue ;; esac
-    if docker inspect "$container" | jq -e --arg network "$network" \
-      '.[0].NetworkSettings.Networks[$network] != null' >/dev/null 2>&1; then
-      continue
-    fi
-    if [[ "$network" == "bridge" ]]; then
-      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
-      continue
-    fi
-    connect_args=()
-    ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
-    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // empty' <<<"$entry")"
-    [[ -z "$ip" ]] || connect_args+=(--ip "$ip")
-    [[ -z "$ip6" ]] || connect_args+=(--ip6 "$ip6")
-    while IFS= read -r alias; do
-      [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
-    done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
-    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
-  done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
 transaction_restore_container_state() {
   local name="$1" state="$2"
   case "$state" in
     running | restarting)
-      dm_run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
+      run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
       [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]]
       ;;
     paused)
-      dm_run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
+      run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
       docker pause "$name" >/dev/null 2>&1
       ;;
   esac
@@ -3862,7 +4132,7 @@ transaction_quiesce_containers() {
   done
   ((${#stop_names[@]} > 0)) || return 0
 
-  dm_run_with_activity "批量停止目标端容器（${#stop_names[@]} 个）" \
+  run_with_activity "批量停止目标端容器（${#stop_names[@]} 个）" \
     docker stop "${stop_names[@]}" >/dev/null || stop_rc=$?
   for name in "${stop_names[@]}"; do
     if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" ||
@@ -3919,7 +4189,6 @@ transaction_discard_prepared() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 }
-
 transaction_remove_new_services() {
   local project had_old name state backup id rc=0
   if [[ -f "${RESTORE_TRANSACTION_DIR}/standalone.tsv" ]]; then
@@ -4046,7 +4315,7 @@ transaction_restore_standalones() {
         "${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv")"
       if [[ -n "$backup" ]] && transaction_container_exists "$backup"; then
         docker rm -f "$name" >/dev/null 2>&1 || true
-        if ! transaction_rename_container "$backup" "$name"; then
+        if ! rename_container_with_retry "$backup" "$name"; then
           warn " · 无法恢复旧单容器名称：$name（回滚点：$backup）"
           rc=1
           continue
@@ -4059,7 +4328,7 @@ transaction_restore_standalones() {
       fi
       if ((restored_from_backup == 1)); then
         network_file="${RESTORE_TRANSACTION_DIR}/standalone_networks/${name}.json"
-        if ! transaction_restore_container_networks "$name" "$network_file"; then
+        if ! restore_container_networks "$name" "$network_file"; then
           warn " · 旧单容器网络恢复失败：$name"
           rc=1
           continue
@@ -4103,7 +4372,7 @@ transaction_restore_shared() {
       warn " · 无法恢复共享挂载容器状态：$name ($state)"
       rc=1
     fi
-    done <"${RESTORE_TRANSACTION_DIR}/shared.tsv"
+  done <"${RESTORE_TRANSACTION_DIR}/shared.tsv"
   return "$rc"
 }
 
@@ -4180,16 +4449,16 @@ transaction_rollback() {
     done <"${RESTORE_TRANSACTION_DIR}/shared.tsv"
   fi
 
-  dm_run_with_activity "自动回滚：停止并移除本次新服务" \
+  run_with_activity "自动回滚：停止并移除本次新服务" \
     transaction_remove_new_services || services_quiet=0
   if ((services_quiet == 1)); then
     # 目标文件最后写入、但可能位于已替换 bind 内；严格按修改逆序回滚，
     # 先撤销单文件覆盖，再整体换回 bind，最后恢复 volume。
-    dm_run_with_activity "自动回滚：恢复被替换的配置文件" \
+    run_with_activity "自动回滚：恢复被替换的配置文件" \
       transaction_restore_files || data_ok=0
-    dm_run_with_activity "自动回滚：恢复绑定目录数据" \
+    run_with_activity "自动回滚：恢复绑定目录数据" \
       transaction_restore_binds || data_ok=0
-    dm_run_with_activity "自动回滚：恢复命名卷数据" \
+    run_with_activity "自动回滚：恢复命名卷数据" \
       transaction_restore_volumes || data_ok=0
     ((data_ok == 1)) || rc=1
 
@@ -4282,7 +4551,6 @@ transaction_exit_handler() {
   restore_finish_result "$status" "$rollback_dir"
   exit "$exit_rc"
 }
-
 transaction_prepare() {
   local policy="${RESTORE_EXISTING:-replace}" has_data=0 existing_targets=0
   local project run name state had_old id inspect mount type source selected_path matched
@@ -4420,7 +4688,7 @@ transaction_prepare() {
   SELECTED_TRANSACTION_BINDS=()
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    restore_bind_is_system "$name" || SELECTED_TRANSACTION_BINDS+=("$name")
+    bind_path_is_system "$name" || SELECTED_TRANSACTION_BINDS+=("$name")
   done < <(jq -r '.binds[] | .host, (.link // empty)' manifest.json)
 
   # restore.sh 也可在挂载 Docker socket 的工具容器中运行；绝不能把执行自身停掉。
@@ -4445,7 +4713,7 @@ transaction_prepare() {
       fi
       if [[ "$type" == "bind" ]] && ((${#SELECTED_TRANSACTION_BINDS[@]} > 0)); then
         for selected_path in "${SELECTED_TRANSACTION_BINDS[@]}"; do
-          if transaction_mount_paths_overlap "$source" "$selected_path"; then
+          if mount_paths_overlap "$source" "$selected_path"; then
             matched=1
             break 2
           fi
@@ -4520,12 +4788,12 @@ transaction_commit() {
   RESTORE_STAGE="提交与清理回滚点"
   RESTORE_COMMIT_STARTED=1
   TRANSACTION_ACTIVE=0
-  if ! dm_run_with_activity "提交事务：清理旧容器、镜像和数据回滚点" \
+  if ! run_with_activity "提交事务：清理旧容器、镜像和数据回滚点" \
     transaction_cleanup_artifacts; then
     warn "服务与数据已恢复，但部分旧回滚资料清理失败：$RESTORE_TRANSACTION_DIR"
     return 1
   fi
-  if ! dm_run_with_activity "提交事务：删除临时事务目录" \
+  if ! run_with_activity "提交事务：删除临时事务目录" \
     rm -rf "$RESTORE_TRANSACTION_DIR"; then
     warn "服务与数据已恢复，但事务目录清理失败：$RESTORE_TRANSACTION_DIR"
     return 1
@@ -4536,7 +4804,6 @@ transaction_commit() {
   RESTORE_STAGE="完成"
   say "所有服务与数据已通过验证，恢复事务已提交。"
 }
-
 trap restore_nontransaction_exit_handler EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -4546,14 +4813,14 @@ if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" == "1" ]]; then
   :
 elif [[ -f checksums.sha256 ]]; then
   say "[0] 验证迁移包完整性"
-  if ! dm_run_with_activity "校验迁移包内全部文件" restore_verify_checksums; then
+  if ! run_with_activity "校验迁移包内全部文件" verify_bundle_checksums "$BUNDLE_DIR"; then
     warn "迁移包完整性校验失败，拒绝恢复。"
     exit 1
   fi
 else
   warn "旧版迁移包未包含校验清单，按兼容模式继续。"
 fi
-if ! restore_manifest_is_safe; then
+if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
   warn "迁移包 manifest 结构或路径不安全，拒绝恢复。"
   exit 1
 fi
@@ -4575,7 +4842,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
     if [[ ! -f "volumes/$file" ]]; then
       warn " 命名卷缺少备份文件：$vname（volumes/$file）"
       FAILED_VOLUMES+=("$vname")
-    elif ! dm_run_with_activity "预检命名卷归档：$vname" \
+    elif ! run_with_activity "预检命名卷归档：$vname" \
       archive_members_safe "volumes/$file"; then
       warn " 命名卷归档结构异常：$vname"
       FAILED_VOLUMES+=("$vname")
@@ -4587,12 +4854,12 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     host="$(jq -r '.host' <<<"$row")"
     file="$(jq -r '.file' <<<"$row")"
     bind_prefix="${host#/}"
-    if restore_bind_is_system "$host"; then
+    if bind_path_is_system "$host"; then
       warn " 跳过宿主机系统路径，只重建挂载、不覆盖目标端：$host"
     elif [[ ! -f "binds/$file" ]]; then
       warn " 绑定目录缺少备份文件：$host（binds/$file）"
       FAILED_BINDS+=("$host")
-    elif ! dm_run_with_activity "预检绑定目录归档：$host" \
+    elif ! run_with_activity "预检绑定目录归档：$host" \
       archive_members_safe "binds/$file" "$bind_prefix"; then
       warn " 绑定目录归档结构异常：$host"
       FAILED_BINDS+=("$host")
@@ -4607,7 +4874,7 @@ fi
 RESTORE_STAGE="加载镜像"
 say "[A] 加载镜像（如 images.tar 存在）"
 if [[ -f images.tar ]]; then
-  dm_run_with_activity "加载镜像归档 images.tar" restore_load_images images.tar || \
+  run_with_activity "加载镜像归档 images.tar" restore_load_images images.tar ||
     warn "部分镜像加载失败，将尝试在线拉取"
 else
   warn "images.tar 不存在，将按需在线拉取镜像。"
@@ -4617,7 +4884,7 @@ RESTORE_STAGE="建立统一回滚事务"
 say "[A.1] 建立目标端服务与数据统一回滚事务"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
-  dm_run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 || {
+  run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 || {
     warn "无法准备 alpine:3.20；为避免在无回滚能力时修改数据，恢复终止。"
     exit 1
   }
@@ -4647,7 +4914,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       actual_volume_driver="$(docker volume inspect "$vname" | jq -r '.[0].Driver // "local"')"
       actual_volume_opts="$(docker volume inspect "$vname" | jq -cS '.[0].Options // {}')"
       if [[ "$actual_volume_driver" != "$v_driver" ||
-            "$actual_volume_opts" != "$desired_volume_opts" ]]; then
+        "$actual_volume_opts" != "$desired_volume_opts" ]]; then
         warn " 已存在同名但 driver/options 不同的卷，拒绝覆盖：$vname"
         FAILED_VOLUMES+=("$vname")
         break
@@ -4665,7 +4932,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
         break
       fi
     fi
-    if ! dm_run_with_activity "回灌命名卷：$vname" \
+    if ! run_with_activity "回灌命名卷：$vname" \
       restore_data_with_diagnostics "命名卷：$vname" \
       restore_volume_exact "$vname" "$PWD/volumes" "$file" \
       "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed" 1; then
@@ -4690,14 +4957,14 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     host=$(jq -r '.host' <<<"$row")
     file=$(jq -r '.file' <<<"$row")
     bind_link=$(jq -r '.link // empty' <<<"$row")
-    restore_bind_is_system "$host" && continue
+    bind_path_is_system "$host" && continue
     if [[ ! -f "binds/$file" ]]; then
       warn " 绑定目录缺少备份文件：$host（binds/$file）"
       FAILED_BINDS+=("$host")
       break
     fi
     echo " - ${host}"
-    if ! dm_run_with_activity "回灌绑定目录：$host" \
+    if ! run_with_activity "回灌绑定目录：$host" \
       restore_data_with_diagnostics "绑定目录：$host" \
       restore_bind_exact "$host" "$PWD/binds/${file}" 1; then
       warn " 恢复绑定目录失败，终止恢复：$host"
@@ -4769,7 +5036,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
         env_stored="$(jq -r '.stored' <<<"$env_map")"
         [[ -n "$env_source" && -f "compose/${name}/${env_stored}" ]] || continue
         transaction_install_file "compose/${name}/${env_stored}" "$env_source"
-      done < "compose/${name}/.env_file_map.jsonl"
+      done <"compose/${name}/.env_file_map.jsonl"
     fi
 
     # 构建多文件 -f 参数：从 manifest 的 config_files 提取 basename
@@ -4851,7 +5118,7 @@ done < <(compose_networks_from_meta_all)
 if jq -e '.networks|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r network_row; do
     n="$(jq -r '.name // empty' <<<"$network_row")"
-    case "$n" in bridge|host|none|"") continue ;; esac
+    case "$n" in bridge | host | none | "") continue ;; esac
     if [[ -n "${COMPOSE_NETS[$n]:-}" ]]; then
       continue
     fi

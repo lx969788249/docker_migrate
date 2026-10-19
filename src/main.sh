@@ -48,6 +48,10 @@ declare -a STOPPED_ON_BACKUP=()
 declare -a BACKUP_FAILURES=()
 declare -a TEMP_IMAGES=()
 
+# @include lib/colors.sh
+
+# @include lib/common.sh
+
 # @include lib/ui.sh
 
 # @include lib/system.sh
@@ -55,6 +59,8 @@ declare -a TEMP_IMAGES=()
 # @include lib/progress.sh
 
 # @include lib/paths.sh
+
+# @include lib/containers.sh
 
 # @include lib/crypto.sh
 

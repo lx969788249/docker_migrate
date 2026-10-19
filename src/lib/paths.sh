@@ -1,9 +1,9 @@
-# 挂载路径判断：重叠检测、宿主机系统路径与软链接解析。
+# 挂载路径判断：重叠检测、宿主机系统路径与软链接解析。主脚本与恢复脚本共用。
 
 mount_paths_overlap() {
   local left="$1" right="$2"
-  [[ "$left" == "/" ]] || left="${left%/}"
-  [[ "$right" == "/" ]] || right="${right%/}"
+  while [[ "$left" != "/" && "$left" == */ ]]; do left="${left%/}"; done
+  while [[ "$right" != "/" && "$right" == */ ]]; do right="${right%/}"; done
   [[ "$left" != "/" && "$right" != "/" ]] || return 0
   [[ "$left" == "$right" || "$left" == "${right}/"* || "$right" == "${left}/"* ]]
 }

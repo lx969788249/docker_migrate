@@ -309,8 +309,11 @@ test_generated_scripts_are_valid_bash() {
   grep -Fq "printf '\\r%s\\033[K'" "${tmp}/bundle/restore.sh"
   grep -Fq "printf '\\r\\033[K'" "${tmp}/bundle/runs/demo.sh"
   grep -Fq "printf '\\r\\033[K'" "${tmp}/bundle/restore.sh"
-  [[ "$(grep -Fc 'dm_tty_clear' "${tmp}/bundle/runs/demo.sh")" -ge 2 ]]
-  [[ "$(grep -Fc 'dm_tty_clear' "${tmp}/bundle/restore.sh")" -ge 2 ]]
+  [[ "$(grep -Fc 'progress_tty_clear' "${tmp}/bundle/runs/demo.sh")" -ge 2 ]]
+  [[ "$(grep -Fc 'progress_tty_clear' "${tmp}/bundle/restore.sh")" -ge 2 ]]
+  # 公共函数由 build.sh 注入，生成的脚本里不能再出现旧的私有副本。
+  ! grep -Eq '^dm_(progress_watch|run_with_activity|format_elapsed)\(\)' "${tmp}/bundle/runs/demo.sh"
+  ! grep -Eq '^(dm_progress_watch|restore_format_elapsed|restore_sha256_file)\(\)' "${tmp}/bundle/restore.sh"
   ! grep -Fq '%-120s' "${tmp}/bundle/runs/demo.sh"
   ! grep -Fq '%-120s' "${tmp}/bundle/restore.sh"
 }
@@ -1006,22 +1009,32 @@ test_system_bind_paths_are_not_migrated() {
 }
 
 test_restore_skips_system_binds_like_backup() {
-  local tmp path
+  local tmp path expected=()
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   mkdir -p "${tmp}/bundle"
   write_bundle_restore_script "${tmp}/bundle/restore.sh"
-  awk '/^RESTORE_SYSTEM_BIND_PREFIXES=\(/{f=1} f{print} f&&/^}$/{exit}' \
-    "${tmp}/bundle/restore.sh" >"${tmp}/system.sh"
-  # shellcheck disable=SC1091
-  source "${tmp}/system.sh"
-  for path in /etc/localtime /proc /var/log/nginx / /opt /etc/nginx /srv/data /home/app; do
-    if bind_path_is_system "$path"; then
-      restore_bind_is_system "$path"
-    else
-      ! restore_bind_is_system "$path"
-    fi
+  local paths=(/etc/localtime /proc /var/log/nginx / /opt /etc/nginx /srv/data /home/app)
+  for path in "${paths[@]}"; do
+    if bind_path_is_system "$path"; then expected+=(1); else expected+=(0); fi
   done
+  # 恢复脚本里注入的是同一份 lib/paths.sh：单独加载它，结果必须与主脚本一致。
+  awk '/^SYSTEM_BIND_PREFIXES=\(/{f=1} f{print} f&&/^bind_path_is_system\(\)/{g=1} g&&/^}$/{exit}' \
+    "${tmp}/bundle/restore.sh" >"${tmp}/system.sh"
+  (
+    unset -f bind_path_is_system
+    unset SYSTEM_BIND_PREFIXES SYSTEM_BIND_EXACT
+    # shellcheck disable=SC1091
+    source "${tmp}/system.sh"
+    local i
+    for i in "${!paths[@]}"; do
+      if bind_path_is_system "${paths[$i]}"; then
+        [[ "${expected[$i]}" == 1 ]]
+      else
+        [[ "${expected[$i]}" == 0 ]]
+      fi
+    done
+  )
 }
 
 test_symlink_bind_source_resolves_to_real_data() {

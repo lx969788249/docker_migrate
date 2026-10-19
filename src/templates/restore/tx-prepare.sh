@@ -135,7 +135,7 @@ transaction_prepare() {
   SELECTED_TRANSACTION_BINDS=()
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    restore_bind_is_system "$name" || SELECTED_TRANSACTION_BINDS+=("$name")
+    bind_path_is_system "$name" || SELECTED_TRANSACTION_BINDS+=("$name")
   done < <(jq -r '.binds[] | .host, (.link // empty)' manifest.json)
 
   # restore.sh 也可在挂载 Docker socket 的工具容器中运行；绝不能把执行自身停掉。
@@ -160,7 +160,7 @@ transaction_prepare() {
       fi
       if [[ "$type" == "bind" ]] && ((${#SELECTED_TRANSACTION_BINDS[@]} > 0)); then
         for selected_path in "${SELECTED_TRANSACTION_BINDS[@]}"; do
-          if transaction_mount_paths_overlap "$source" "$selected_path"; then
+          if mount_paths_overlap "$source" "$selected_path"; then
             matched=1
             break 2
           fi
@@ -235,12 +235,12 @@ transaction_commit() {
   RESTORE_STAGE="提交与清理回滚点"
   RESTORE_COMMIT_STARTED=1
   TRANSACTION_ACTIVE=0
-  if ! dm_run_with_activity "提交事务：清理旧容器、镜像和数据回滚点" \
+  if ! run_with_activity "提交事务：清理旧容器、镜像和数据回滚点" \
     transaction_cleanup_artifacts; then
     warn "服务与数据已恢复，但部分旧回滚资料清理失败：$RESTORE_TRANSACTION_DIR"
     return 1
   fi
-  if ! dm_run_with_activity "提交事务：删除临时事务目录" \
+  if ! run_with_activity "提交事务：删除临时事务目录" \
     rm -rf "$RESTORE_TRANSACTION_DIR"; then
     warn "服务与数据已恢复，但事务目录清理失败：$RESTORE_TRANSACTION_DIR"
     return 1
@@ -251,4 +251,3 @@ transaction_commit() {
   RESTORE_STAGE="完成"
   say "所有服务与数据已通过验证，恢复事务已提交。"
 }
-

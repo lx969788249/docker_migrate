@@ -1,4 +1,16 @@
-# 进度显示：主脚本与生成的恢复脚本共用。
+# 进度显示与耗时格式化：主脚本与生成的恢复脚本共用。
+
+format_elapsed() {
+  local seconds="${1:-0}"
+  ((seconds < 0)) && seconds=0
+  if ((seconds >= 3600)); then
+    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+  elif ((seconds >= 60)); then
+    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
+  else
+    printf '%d 秒\n' "$seconds"
+  fi
+}
 
 human() {
   local b="${1:-0}"

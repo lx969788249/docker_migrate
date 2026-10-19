@@ -1,30 +1,5 @@
 # 终端输出：颜色、耗时、结果摘要与帮助信息。
 
-#####################################
-# 基础函数 & 依赖管理
-#####################################
-BLUE() { echo -e "\033[1;34m$*\033[0m"; }
-
-YEL() { echo -e "\033[1;33m$*\033[0m"; }
-
-RED() { echo -e "\033[1;31m$*\033[0m"; }
-
-OK() { echo -e "\033[1;32m$*\033[0m"; }
-
-CYA() { echo -e "\033[1;36m$*\033[0m"; }
-
-format_elapsed() {
-  local seconds="${1:-0}"
-  ((seconds < 0)) && seconds=0
-  if ((seconds >= 3600)); then
-    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
-  elif ((seconds >= 60)); then
-    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
-  else
-    printf '%d 秒\n' "$seconds"
-  fi
-}
-
 result_rule() {
   printf '%s\n' '━━━━━━━━━━ Docker 迁移结果 ━━━━━━━━━━'
 }

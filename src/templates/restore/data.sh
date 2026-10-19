@@ -5,9 +5,9 @@ volume_clear_and_extract() {
   printf '清空并解压命名卷：%s（归档：%s）\n' "$volume" "$archive_file" >&2
   if ! archive_normalized_stream "${archive_dir}/${archive_file}" |
     docker run --rm -i --read-only --network none \
-    --security-opt no-new-privileges --cap-drop MKNOD \
-    -v "${volume}:/to" \
-    alpine:3.20 sh -eu -c '
+      --security-opt no-new-privileges --cap-drop MKNOD \
+      -v "${volume}:/to" \
+      alpine:3.20 sh -eu -c '
       find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
       tar -xf - -C /to
     ' sh "$archive_file"; then
@@ -122,9 +122,9 @@ restore_bind_exact() {
   printf '解压绑定目录：%s（归档：%s）\n' "$host" "$archive" >&2
   if ! archive_normalized_stream "$archive" |
     docker run --rm -i --read-only --network none \
-    --security-opt no-new-privileges --cap-drop MKNOD \
-    -v "${stage}:/stage" \
-    alpine:3.20 tar -C /stage -xf -; then
+      --security-opt no-new-privileges --cap-drop MKNOD \
+      -v "${stage}:/stage" \
+      alpine:3.20 tar -C /stage -xf -; then
     root_exec rm -rf "$stage" || true
     return 1
   fi
@@ -169,33 +169,6 @@ restore_bind_exact() {
   fi
 }
 
-# 与主脚本 bind_path_is_system 保持一致：旧版迁移包可能仍记录了系统路径，
-# 恢复时一律跳过，绝不覆盖目标端宿主机文件。
-RESTORE_SYSTEM_BIND_PREFIXES=(
-  /proc /sys /dev /run /var/run /boot /lib/modules /usr/lib/modules
-  /var/lib/docker /var/lib/containerd /var/log /etc/docker /etc/systemd
-  /lib/systemd /usr/lib/systemd /etc/localtime /etc/timezone /usr/share/zoneinfo
-  /etc/hostname /etc/hosts /etc/resolv.conf /etc/machine-id /etc/os-release
-  /usr/lib/os-release /etc/passwd /etc/group /etc/shadow /etc/gshadow
-  /etc/ssl /etc/pki /etc/ca-certificates
-)
-RESTORE_SYSTEM_BIND_EXACT=(
-  / /etc /usr /usr/lib /usr/bin /usr/local /var /var/lib /lib /lib64 /bin /sbin
-  /opt /home /root /srv /mnt /media /tmp
-)
-
-restore_bind_is_system() {
-  local path="$1" prefix
-  [[ "$path" == "/" ]] || path="${path%/}"
-  for prefix in "${RESTORE_SYSTEM_BIND_EXACT[@]}"; do
-    [[ "$path" != "$prefix" ]] || return 0
-  done
-  for prefix in "${RESTORE_SYSTEM_BIND_PREFIXES[@]}"; do
-    [[ "$path" != "$prefix" && "$path" != "${prefix}/"* ]] || return 0
-  done
-  return 1
-}
-
 # 源端 bind 是软链接时，数据已恢复到真实路径；在原路径重建同一个链接，
 # 让容器按原挂载路径看到数据。新建的链接登记进 binds.tsv，回滚时删除。
 restore_bind_link() {
@@ -220,4 +193,3 @@ restore_bind_link() {
   root_exec mkdir -p "$(dirname "$link")" || return 1
   root_exec ln -s "$host" "$link"
 }
-

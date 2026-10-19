@@ -37,6 +37,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/m
 
 > **警告：**迁移链接包含本次迁移包的解密密钥，请完整复制，千万不要公开。
 
+## 参与开发
+
+源码按功能拆分在 `src/` 目录，发布用的 `docker_migrate_perfect.sh` 由 `./build.sh` 合并生成，请勿直接修改它：
+
+```bash
+./build.sh            # 修改 src/ 后重新生成发布脚本
+tests/run.sh          # 运行单元测试（需要 bash 4+、jq、python3、openssl）
+```
+
+- `src/lib/`：主脚本与生成的恢复脚本共用的函数（进度、路径判断、校验、容器网络等）
+- `src/backup/`：源端采集、打包与 HTTP 下载服务；`src/backup/flow/` 是备份主流程
+- `src/restore/`：新服务器下载、校验与解密
+- `src/templates/`：写入迁移包的 `restore.sh` 与单容器恢复脚本，用 `# @include` 引入 `src/lib/` 中的函数
+
 ## 测试与反馈
 
 遇到问题请前往 [问题反馈](https://github.com/lx969788249/docker_migrate/issues)，并附上系统版本、Docker 版本和脚本最终输出的错误摘要。

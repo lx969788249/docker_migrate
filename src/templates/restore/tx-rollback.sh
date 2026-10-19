@@ -124,7 +124,7 @@ transaction_restore_standalones() {
         "${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv")"
       if [[ -n "$backup" ]] && transaction_container_exists "$backup"; then
         docker rm -f "$name" >/dev/null 2>&1 || true
-        if ! transaction_rename_container "$backup" "$name"; then
+        if ! rename_container_with_retry "$backup" "$name"; then
           warn " · 无法恢复旧单容器名称：$name（回滚点：$backup）"
           rc=1
           continue
@@ -137,7 +137,7 @@ transaction_restore_standalones() {
       fi
       if ((restored_from_backup == 1)); then
         network_file="${RESTORE_TRANSACTION_DIR}/standalone_networks/${name}.json"
-        if ! transaction_restore_container_networks "$name" "$network_file"; then
+        if ! restore_container_networks "$name" "$network_file"; then
           warn " · 旧单容器网络恢复失败：$name"
           rc=1
           continue
@@ -181,7 +181,7 @@ transaction_restore_shared() {
       warn " · 无法恢复共享挂载容器状态：$name ($state)"
       rc=1
     fi
-    done <"${RESTORE_TRANSACTION_DIR}/shared.tsv"
+  done <"${RESTORE_TRANSACTION_DIR}/shared.tsv"
   return "$rc"
 }
 
@@ -258,16 +258,16 @@ transaction_rollback() {
     done <"${RESTORE_TRANSACTION_DIR}/shared.tsv"
   fi
 
-  dm_run_with_activity "自动回滚：停止并移除本次新服务" \
+  run_with_activity "自动回滚：停止并移除本次新服务" \
     transaction_remove_new_services || services_quiet=0
   if ((services_quiet == 1)); then
     # 目标文件最后写入、但可能位于已替换 bind 内；严格按修改逆序回滚，
     # 先撤销单文件覆盖，再整体换回 bind，最后恢复 volume。
-    dm_run_with_activity "自动回滚：恢复被替换的配置文件" \
+    run_with_activity "自动回滚：恢复被替换的配置文件" \
       transaction_restore_files || data_ok=0
-    dm_run_with_activity "自动回滚：恢复绑定目录数据" \
+    run_with_activity "自动回滚：恢复绑定目录数据" \
       transaction_restore_binds || data_ok=0
-    dm_run_with_activity "自动回滚：恢复命名卷数据" \
+    run_with_activity "自动回滚：恢复命名卷数据" \
       transaction_restore_volumes || data_ok=0
     ((data_ok == 1)) || rc=1
 
@@ -360,4 +360,3 @@ transaction_exit_handler() {
   restore_finish_result "$status" "$rollback_dir"
   exit "$exit_rc"
 }
-

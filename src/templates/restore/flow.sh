@@ -7,14 +7,14 @@ if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" == "1" ]]; then
   :
 elif [[ -f checksums.sha256 ]]; then
   say "[0] 验证迁移包完整性"
-  if ! dm_run_with_activity "校验迁移包内全部文件" restore_verify_checksums; then
+  if ! run_with_activity "校验迁移包内全部文件" verify_bundle_checksums "$BUNDLE_DIR"; then
     warn "迁移包完整性校验失败，拒绝恢复。"
     exit 1
   fi
 else
   warn "旧版迁移包未包含校验清单，按兼容模式继续。"
 fi
-if ! restore_manifest_is_safe; then
+if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
   warn "迁移包 manifest 结构或路径不安全，拒绝恢复。"
   exit 1
 fi
@@ -36,7 +36,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
     if [[ ! -f "volumes/$file" ]]; then
       warn " 命名卷缺少备份文件：$vname（volumes/$file）"
       FAILED_VOLUMES+=("$vname")
-    elif ! dm_run_with_activity "预检命名卷归档：$vname" \
+    elif ! run_with_activity "预检命名卷归档：$vname" \
       archive_members_safe "volumes/$file"; then
       warn " 命名卷归档结构异常：$vname"
       FAILED_VOLUMES+=("$vname")
@@ -48,12 +48,12 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     host="$(jq -r '.host' <<<"$row")"
     file="$(jq -r '.file' <<<"$row")"
     bind_prefix="${host#/}"
-    if restore_bind_is_system "$host"; then
+    if bind_path_is_system "$host"; then
       warn " 跳过宿主机系统路径，只重建挂载、不覆盖目标端：$host"
     elif [[ ! -f "binds/$file" ]]; then
       warn " 绑定目录缺少备份文件：$host（binds/$file）"
       FAILED_BINDS+=("$host")
-    elif ! dm_run_with_activity "预检绑定目录归档：$host" \
+    elif ! run_with_activity "预检绑定目录归档：$host" \
       archive_members_safe "binds/$file" "$bind_prefix"; then
       warn " 绑定目录归档结构异常：$host"
       FAILED_BINDS+=("$host")
@@ -68,7 +68,7 @@ fi
 RESTORE_STAGE="加载镜像"
 say "[A] 加载镜像（如 images.tar 存在）"
 if [[ -f images.tar ]]; then
-  dm_run_with_activity "加载镜像归档 images.tar" restore_load_images images.tar || \
+  run_with_activity "加载镜像归档 images.tar" restore_load_images images.tar ||
     warn "部分镜像加载失败，将尝试在线拉取"
 else
   warn "images.tar 不存在，将按需在线拉取镜像。"
@@ -78,7 +78,7 @@ RESTORE_STAGE="建立统一回滚事务"
 say "[A.1] 建立目标端服务与数据统一回滚事务"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
-  dm_run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 || {
+  run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 || {
     warn "无法准备 alpine:3.20；为避免在无回滚能力时修改数据，恢复终止。"
     exit 1
   }
@@ -108,7 +108,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       actual_volume_driver="$(docker volume inspect "$vname" | jq -r '.[0].Driver // "local"')"
       actual_volume_opts="$(docker volume inspect "$vname" | jq -cS '.[0].Options // {}')"
       if [[ "$actual_volume_driver" != "$v_driver" ||
-            "$actual_volume_opts" != "$desired_volume_opts" ]]; then
+        "$actual_volume_opts" != "$desired_volume_opts" ]]; then
         warn " 已存在同名但 driver/options 不同的卷，拒绝覆盖：$vname"
         FAILED_VOLUMES+=("$vname")
         break
@@ -126,7 +126,7 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
         break
       fi
     fi
-    if ! dm_run_with_activity "回灌命名卷：$vname" \
+    if ! run_with_activity "回灌命名卷：$vname" \
       restore_data_with_diagnostics "命名卷：$vname" \
       restore_volume_exact "$vname" "$PWD/volumes" "$file" \
       "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed" 1; then
@@ -151,14 +151,14 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     host=$(jq -r '.host' <<<"$row")
     file=$(jq -r '.file' <<<"$row")
     bind_link=$(jq -r '.link // empty' <<<"$row")
-    restore_bind_is_system "$host" && continue
+    bind_path_is_system "$host" && continue
     if [[ ! -f "binds/$file" ]]; then
       warn " 绑定目录缺少备份文件：$host（binds/$file）"
       FAILED_BINDS+=("$host")
       break
     fi
     echo " - ${host}"
-    if ! dm_run_with_activity "回灌绑定目录：$host" \
+    if ! run_with_activity "回灌绑定目录：$host" \
       restore_data_with_diagnostics "绑定目录：$host" \
       restore_bind_exact "$host" "$PWD/binds/${file}" 1; then
       warn " 恢复绑定目录失败，终止恢复：$host"
@@ -230,7 +230,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
         env_stored="$(jq -r '.stored' <<<"$env_map")"
         [[ -n "$env_source" && -f "compose/${name}/${env_stored}" ]] || continue
         transaction_install_file "compose/${name}/${env_stored}" "$env_source"
-      done < "compose/${name}/.env_file_map.jsonl"
+      done <"compose/${name}/.env_file_map.jsonl"
     fi
 
     # 构建多文件 -f 参数：从 manifest 的 config_files 提取 basename
@@ -312,7 +312,7 @@ done < <(compose_networks_from_meta_all)
 if jq -e '.networks|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r network_row; do
     n="$(jq -r '.name // empty' <<<"$network_row")"
-    case "$n" in bridge|host|none|"") continue ;; esac
+    case "$n" in bridge | host | none | "") continue ;; esac
     if [[ -n "${COMPOSE_NETS[$n]:-}" ]]; then
       continue
     fi

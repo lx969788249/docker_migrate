@@ -87,7 +87,7 @@ compose_capture_rollback_images() {
       return 1
     fi
     image="docker-migrate-rollback:${id:0:12}-$$"
-    if ! dm_run_with_activity "创建 Compose 回滚镜像：$service" \
+    if ! run_with_activity "创建 Compose 回滚镜像：$service" \
       docker commit "$id" "$image" >/dev/null; then
       warn " · 目标端容器回滚镜像创建失败：$service"
       compose_rollback_image_cleanup "$rollback_dir"
@@ -147,7 +147,7 @@ compose_restore_rollback() {
       esac
     done <states.tsv
     if [[ "$restore_running" == "1" ]]; then
-      ((${#start_services[@]} == 0)) || \
+      ((${#start_services[@]} == 0)) ||
         compose_run -p "$project" -f config.yml -f images.yml start "${start_services[@]}"
       for service in "${pause_services[@]}"; do
         while IFS= read -r id; do
@@ -291,4 +291,3 @@ compose_wait_project_health() {
   done
   return 1
 }
-

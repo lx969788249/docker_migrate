@@ -144,14 +144,6 @@ transaction_restore_files() {
   return "$rc"
 }
 
-transaction_mount_paths_overlap() {
-  local first="$1" second="$2"
-  while [[ "$first" != "/" && "$first" == */ ]]; do first="${first%/}"; done
-  while [[ "$second" != "/" && "$second" == */ ]]; do second="${second%/}"; done
-  [[ "$first" == "$second" || "$first" == "/" || "$second" == "/" ||
-    "$first" == "${second}/"* || "$second" == "${first}/"* ]]
-}
-
 transaction_normalize_path() {
   local path="$1" probe component suffix="" resolved parent base component_i last_index
   [[ -n "$path" ]] || return 1
@@ -231,13 +223,13 @@ transaction_internal_paths_are_safe() {
 
   while IFS= read -r host; do
     [[ -n "$host" ]] || continue
-    restore_bind_is_system "$host" && continue
+    bind_path_is_system "$host" && continue
     normalized_host="$(transaction_normalize_path "$host")" || return 1
     for ((protected_i = 0; protected_i < ${#protected_paths[@]}; protected_i += 2)); do
       label="${protected_paths[$protected_i]}"
       protected="${protected_paths[$((protected_i + 1))]}"
       normalized_protected="$(transaction_normalize_path "$protected")" || return 1
-      if transaction_mount_paths_overlap "$normalized_host" "$normalized_protected"; then
+      if mount_paths_overlap "$normalized_host" "$normalized_protected"; then
         warn "绑定目录与 ${label} 重叠，已在改动目标数据前拒绝恢复：$host"
         warn "冲突路径：$normalized_protected"
         warn "请把 RESTORE_BASE、RESTORE_ROLLBACK_BASE 与 RESTORE_LOCK_BASE 放到该 bind 之外后重试。"
@@ -246,4 +238,3 @@ transaction_internal_paths_are_safe() {
     done
   done < <(jq -r '.binds[] | .host, (.link // empty)' manifest.json)
 }
-

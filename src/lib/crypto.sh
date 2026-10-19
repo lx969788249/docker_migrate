@@ -1,18 +1,5 @@
 # 迁移包摘要、加密与解密。
 
-sha256_file() {
-  local file="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" | awk '{print $1}'
-  elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$file" | awk '{print $NF}'
-  else
-    return 127
-  fi
-}
-
 bundle_download_url() {
   printf '%s\n' "${1%%#*}"
 }

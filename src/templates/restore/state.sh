@@ -19,66 +19,6 @@ RESTORE_STARTED_AT=$SECONDS
 RESTORE_COMMIT_STARTED=0
 RESTORE_ACTIVE_DATA_LOG=""
 
-restore_format_elapsed() {
-  local seconds="${1:-0}"
-  ((seconds < 0)) && seconds=0
-  if ((seconds >= 3600)); then
-    printf '%d 小时 %d 分 %d 秒\n' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
-  elif ((seconds >= 60)); then
-    printf '%d 分 %d 秒\n' "$((seconds / 60))" "$((seconds % 60))"
-  else
-    printf '%d 秒\n' "$seconds"
-  fi
-}
-
-restore_target_container_names() {
-  local run project service found_service inspect_file
-  while IFS= read -r run; do
-    [[ -n "$run" ]] || continue
-    basename "${run%.sh}"
-  done < <(jq -r '.runs[]?' manifest.json 2>/dev/null || true)
-  while IFS= read -r project; do
-    [[ -n "$project" ]] || continue
-    found_service=0
-    for inspect_file in meta/*.inspect.json; do
-      [[ -f "$inspect_file" ]] || continue
-      service="$(jq -r --arg project "$project" '
-        if (.[0].Config.Labels["com.docker.compose.project"] // "") == $project
-        then .[0].Config.Labels["com.docker.compose.service"] // empty
-        else empty end
-      ' "$inspect_file" 2>/dev/null || true)"
-      [[ -n "$service" ]] || continue
-      found_service=1
-      docker ps -a --filter "label=com.docker.compose.project=${project}" \
-        --filter "label=com.docker.compose.service=${service}" \
-        --format '{{.Names}}' 2>/dev/null || true
-    done
-    if ((found_service == 0)); then
-      docker ps -a --filter "label=com.docker.compose.project=${project}" \
-        --format '{{.Names}}' 2>/dev/null || true
-    fi
-  done < <(jq -r '.projects[]?.name' manifest.json 2>/dev/null || true)
-}
-
-restore_result_metrics() {
-  local name state total=0 running=0 paused=0 stopped=0 missing=0 volumes=0 binds=0
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    total=$((total + 1))
-    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
-    case "$state" in
-      running | restarting) running=$((running + 1)) ;;
-      paused) paused=$((paused + 1)) ;;
-      created | exited | dead | removing) stopped=$((stopped + 1)) ;;
-      *) missing=$((missing + 1)) ;;
-    esac
-  done < <(restore_target_container_names | awk 'NF && !seen[$0]++')
-  volumes="$(jq -r '.volumes | length' manifest.json 2>/dev/null || echo 0)"
-  binds="$(jq -r '.binds | length' manifest.json 2>/dev/null || echo 0)"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$total" "$running" "$paused" "$stopped" "$missing" "$volumes" "$binds"
-}
-
 restore_record_result() {
   local status="$1" rollback_dir="${2:-}" result_file="${RESTORE_RESULT_FILE:-}" tmp
   [[ -n "$result_file" ]] || return 0
@@ -96,11 +36,11 @@ restore_record_result() {
 restore_print_final_result() {
   local status="$1" rollback_dir="${2:-}" metrics total running paused stopped missing volumes binds
   local elapsed container_line data_line
-  elapsed="$(restore_format_elapsed "$((SECONDS - RESTORE_STARTED_AT))")"
+  elapsed="$(format_elapsed "$((SECONDS - RESTORE_STARTED_AT))")"
   container_line=""
   data_line=""
   if [[ "$status" == "SUCCESS" ]]; then
-    metrics="$(restore_result_metrics)"
+    metrics="$(collect_restore_result_metrics "$BUNDLE_DIR")"
     IFS=$'\t' read -r total running paused stopped missing volumes binds <<<"$metrics"
     container_line="容器：${total} 个（运行 ${running} / 暂停 ${paused} / 停止 ${stopped}"
     ((missing == 0)) || container_line+=" / 缺失 ${missing}"
@@ -173,11 +113,11 @@ restore_nontransaction_exit_handler() {
 }
 
 restore_has_failures() {
-  (( ${#FAILED_VOLUMES[@]} > 0 ||
-     ${#FAILED_BINDS[@]} > 0 ||
-     ${#FAILED_NETWORKS[@]} > 0 ||
-     ${#FAILED_PROJECTS[@]} > 0 ||
-     ${#FAILED_CONTAINERS[@]} > 0 ))
+  ((${#FAILED_VOLUMES[@]} > 0 || \
+  ${#FAILED_BINDS[@]} > 0 || \
+  ${#FAILED_NETWORKS[@]} > 0 || \
+  ${#FAILED_PROJECTS[@]} > 0 || \
+  ${#FAILED_CONTAINERS[@]} > 0))
 }
 
 print_failure_summary() {
@@ -195,4 +135,3 @@ print_failure_summary() {
   fi
   warn "============================================"
 }
-

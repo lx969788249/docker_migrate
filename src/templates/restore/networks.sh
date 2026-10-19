@@ -53,7 +53,7 @@ compose_network_records() {
     tmp_cfg="$(mktemp)"
   else
     tmp_cfg="/tmp/docker_migrate_compose_config_$$.json"
-    : > "$tmp_cfg"
+    : >"$tmp_cfg"
   fi
 
   if compose_run "$@" config --format json >"$tmp_cfg" 2>/dev/null; then
@@ -121,7 +121,7 @@ compose_prepare_networks() {
     esac
   done < <(compose_network_records "$project" "$@")
 
-  if (( seen == 0 )); then
+  if ((seen == 0)); then
     while IFS= read -r net; do
       [[ -n "$net" ]] || continue
       if [[ "$net" == "${project}_"* ]]; then
@@ -210,4 +210,3 @@ create_network_from_record() {
 
   "${create_args[@]}" >/dev/null
 }
-

@@ -5,81 +5,9 @@ umask 077
 BUNDLE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 META="${BUNDLE_DIR}/meta/__NAME__.inspect.json"
 
-dm_format_elapsed() {
-  local seconds="${1:-0}"
-  if ((seconds >= 60)); then
-    printf '%d 分 %d 秒' "$((seconds / 60))" "$((seconds % 60))"
-  else
-    printf '%d 秒' "$seconds"
-  fi
-}
+# @include lib/progress.sh
 
-dm_tty_draw() {
-  printf '\r%s\033[K' "$1" >&2
-}
-
-dm_tty_clear() {
-  printf '\r\033[K' >&2
-}
-
-dm_progress_watch() {
-  local label="$1" started="$2" owner_pid="$3"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval elapsed line timer_pid=""
-  [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
-  if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
-    interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
-  elif [[ -t 2 ]]; then
-    interval=1
-  else
-    interval=10
-  fi
-  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
-  trap '
-    if [[ -n "${timer_pid:-}" ]]; then
-      kill "$timer_pid" 2>/dev/null || true
-      wait "$timer_pid" 2>/dev/null || true
-    fi
-    exit 0
-  ' TERM INT HUP
-  while kill -0 "$owner_pid" 2>/dev/null; do
-    # 关闭 timer 继承的 stdin 管道。
-    # shellcheck disable=SC2217
-    sleep "$interval" </dev/null >/dev/null 2>&1 &
-    timer_pid=$!
-    wait "$timer_pid" 2>/dev/null || true
-    timer_pid=""
-    kill -0 "$owner_pid" 2>/dev/null || break
-    elapsed=$((SECONDS - started))
-    if [[ -t 2 ]]; then
-      printf -v line '[进度] %s · %s' "$label" "$(dm_format_elapsed "$elapsed")"
-      dm_tty_draw "$line"
-    else
-      printf '[进度] %s · %s\n' \
-        "$label" "$(dm_format_elapsed "$elapsed")" >&2
-    fi
-  done
-  trap - TERM INT HUP
-}
-
-dm_run_with_activity() {
-  local label="$1"
-  shift
-  local started=$SECONDS watcher_pid rc restore_errexit=0
-  case $- in *e*) restore_errexit=1 ;; esac
-  dm_progress_watch "$label" "$started" "$$" &
-  watcher_pid=$!
-  set +e
-  "$@"
-  rc=$?
-  ((restore_errexit == 0)) || set -e
-  kill "$watcher_pid" 2>/dev/null || true
-  wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || dm_tty_clear
-  if ((rc != 0)); then
-    printf '[失败] %s · %s\n' "$label" "$(dm_format_elapsed "$((SECONDS - started))")" >&2
-  fi
-  return "$rc"
-}
+# @include lib/containers.sh
 
 dm_capture_command() {
   local output_file="$1"
@@ -145,45 +73,6 @@ if [[ -n "${RESTORE_TRANSACTION_DIR:-}" && -d "${RESTORE_TRANSACTION_DIR}" ]]; t
   transaction_mode=1
 fi
 
-rename_container_with_retry() {
-  local old_name="$1" new_name="$2"
-  for _ in {1..20}; do
-    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  return 1
-}
-
-restore_container_networks() {
-  local container="$1" metadata_file="$2" entry network ip ip6 alias
-  local -a connect_args=()
-  [[ -f "$metadata_file" ]] || return 1
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
-    network="$(jq -r '.key' <<<"$entry")"
-    case "$network" in "" | host | none) continue ;; esac
-    if docker inspect "$container" | jq -e --arg network "$network" \
-      '.[0].NetworkSettings.Networks[$network] != null' >/dev/null 2>&1; then
-      continue
-    fi
-    connect_args=()
-    if [[ "$network" == "bridge" ]]; then
-      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
-      continue
-    fi
-    ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
-    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // empty' <<<"$entry")"
-    [[ -z "$ip" ]] || connect_args+=(--ip "$ip")
-    [[ -z "$ip6" ]] || connect_args+=(--ip6 "$ip6")
-    while IFS= read -r alias; do
-      [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
-    done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
-    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
-  done < <(jq -c 'to_entries[]?' "$metadata_file")
-}
-
 disconnect_container_networks() {
   local container="$1" metadata_file="$2" network
   while IFS= read -r network; do
@@ -237,7 +126,7 @@ trap replacement_exit_handler EXIT
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then
   echo "[INFO] image is not loaded; pull before changing any existing container: $image"
-  dm_run_with_activity "拉取容器镜像：$image" docker pull "$image" || {
+  run_with_activity "拉取容器镜像：$image" docker pull "$image" || {
     echo "[WARN] image is unavailable; existing container was left unchanged: $image" >&2
     exit 1
   }
@@ -278,7 +167,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
       [[ "$existing_state" == "paused" ]] && docker unpause "$name" >/dev/null 2>&1 || true
       case "$existing_state" in
         running | restarting | paused)
-          dm_run_with_activity "停止目标端旧容器：$name" docker stop "$name" >/dev/null || {
+          run_with_activity "停止目标端旧容器：$name" docker stop "$name" >/dev/null || {
             echo "[WARN] failed to stop existing container; it was left unchanged: $name" >&2
             exit 1
           }
@@ -558,7 +447,7 @@ done
 
 mapfile -t mounts < <(jq -r '.[0].Mounts[]? | @base64' "$META")
 for m in "${mounts[@]}"; do
-  _jq(){ echo "$m" | decode_base64 | jq -r "$1"; }
+  _jq() { echo "$m" | decode_base64 | jq -r "$1"; }
   m_type="$(_jq '.Type')"
   dest="$(_jq '.Destination')"
   rw="$(_jq '.RW')"
@@ -583,7 +472,10 @@ for m in "${mounts[@]}"; do
   fi
   [[ "$rw" != "true" ]] && opts+=(ro)
   if ((${#opts[@]})); then
-    optstr="$(IFS=,; echo "${opts[*]}")"
+    optstr="$(
+      IFS=,
+      echo "${opts[*]}"
+    )"
     args+=(-v "${src}:${dest}:${optstr}")
   else
     args+=(-v "${src}:${dest}")
@@ -602,7 +494,7 @@ else
 fi
 
 if [[ "$primary_net" != "bridge" && "$primary_net" != "host" &&
-      "$primary_net" != "none" && "$primary_net" != container:* ]]; then
+  "$primary_net" != "none" && "$primary_net" != container:* ]]; then
   # 只还原用户显式指定的静态 IP（IPAMConfig）。Docker 动态分配的地址若被
   # 固定下来，会与目标端同网络的其他容器冲突，也改变了原有配置。
   primary_ip="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv4Address // empty' "$META")"
@@ -623,7 +515,7 @@ fi
 run_output=""
 run_log="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-run.XXXXXX")" || exit 1
 set +e
-dm_run_with_activity "创建并启动容器：$name" dm_capture_command "$run_log" "${args[@]}"
+run_with_activity "创建并启动容器：$name" dm_capture_command "$run_log" "${args[@]}"
 run_rc=$?
 set -e
 run_output="$(cat "$run_log")"
@@ -651,7 +543,7 @@ network_restore_failed=0
 if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" != container:* ]]; then
   mapfile -t net_entries < <(jq -r '.[0].NetworkSettings.Networks | to_entries[]? | @base64' "$META")
   for entry in "${net_entries[@]}"; do
-    _net(){ echo "$entry" | decode_base64 | jq -r "$1"; }
+    _net() { echo "$entry" | decode_base64 | jq -r "$1"; }
     net_name="$(_net '.key')"
     [[ -z "$net_name" || "$net_name" == "$primary_net" || "$net_name" == "bridge" ]] && continue
     ip="$(_net '.value.IPAMConfig.IPv4Address // empty')"
@@ -667,7 +559,7 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
       network_restore_failed=1
       echo "[WARN] 连接额外网络失败：$net_name，容器可能缺少网络" >&2
       case "$net_name" in
-        macvlan*|ipvlan*|overlay*)
+        macvlan* | ipvlan* | overlay*)
           echo "[WARN] → 网络 $net_name 需管理员在目标服务器预创建（macvlan/ipvlan/overlay 不自动创建）" >&2
           ;;
       esac
@@ -683,7 +575,7 @@ fi
 # 容器在一个短暂窗口内持续为 running。
 health_kind="$(jq -r '.[0].Config.Healthcheck.Test[0] // empty' "$META" 2>/dev/null || true)"
 if [[ "$original_running" == "true" &&
-      ("$health_kind" == "CMD" || "$health_kind" == "CMD-SHELL") ]]; then
+  ("$health_kind" == "CMD" || "$health_kind" == "CMD-SHELL") ]]; then
   health_timeout="${RESTORE_HEALTH_TIMEOUT:-60}"
   if ! [[ "$health_timeout" =~ ^[1-9][0-9]*$ ]] || ((health_timeout > 3600)); then
     echo "[WARN] invalid RESTORE_HEALTH_TIMEOUT: $health_timeout (expected 1-3600 seconds)" >&2

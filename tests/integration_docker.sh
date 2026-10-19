@@ -104,7 +104,7 @@ snapshot_image="$(snapshot_image_ref "$suffix" "$(docker inspect -f '{{.Id}}' "$
 snapshot_container_image "$container_name" "${bundle}/meta/${container_name}.inspect.json" "$snapshot_image"
 write_run_script "$container_name" "${bundle}/runs/${container_name}.sh"
 # 生成脚本必须自带数字心跳，但不能为每个操作打印冗长的通用开始提示。
-grep -Fq 'dm_progress_watch()' "${bundle}/runs/${container_name}.sh"
+grep -Fq 'progress_watch()' "${bundle}/runs/${container_name}.sh"
 ! grep -Fq '此步骤可能耗时较长' "${bundle}/runs/${container_name}.sh"
 
 network_json="$(docker network inspect "$network_name" | jq '.[0] | {
@@ -127,7 +127,7 @@ jq -n \
   '{images:[],networks:[$network],projects:[],volumes:[],binds:[],runs:[$run]}' \
   >"${bundle}/manifest.json"
 write_bundle_restore_script "${bundle}/restore.sh"
-grep -Fq 'dm_progress_watch()' "${bundle}/restore.sh"
+grep -Fq 'progress_watch()' "${bundle}/restore.sh"
 ! grep -Fq '此步骤可能耗时较长' "${bundle}/restore.sh"
 generate_bundle_checksums "$bundle"
 

@@ -8,18 +8,6 @@ asudo() {
   fi
 }
 
-run_with_timeout() {
-  local seconds="$1"
-  shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$seconds" "$@"
-  else
-    "$@"
-  fi
-}
-
 pm_detect() {
   if command -v apt-get >/dev/null 2>&1; then
     echo apt
