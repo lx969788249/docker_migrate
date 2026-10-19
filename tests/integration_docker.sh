@@ -124,8 +124,12 @@ network_json="$(docker network inspect "$network_name" | jq '.[0] | {
 jq -n \
   --arg run "runs/${container_name}.sh" \
   --argjson network "$network_json" \
-  '{images:[],networks:[$network],projects:[],volumes:[],binds:[],runs:[$run]}' \
+  '{images:[],networks:[$network],projects:[],volumes:[],runs:[$run],
+    binds:[{host:"/etc/localtime",dest:"/etc/localtime",file:"bind_localtime_1.tgz"}]}' \
   >"${bundle}/manifest.json"
+# 早期版本的迁移包可能记录了 /etc/localtime 这类宿主机系统路径：恢复时必须
+# 跳过它，不能因缺少归档而失败，更不能覆盖目标端的宿主机文件。
+localtime_before="$(ls -l /etc/localtime 2>/dev/null || true)"
 write_bundle_restore_script "${bundle}/restore.sh"
 grep -Fq 'progress_watch()' "${bundle}/restore.sh"
 ! grep -Fq '此步骤可能耗时较长' "${bundle}/restore.sh"
@@ -155,6 +159,8 @@ initial_restore_output="$(cd "$bundle" && bash restore.sh 2>&1)"
 [[ "$(grep -Fc '结果：' <<<"$initial_restore_output")" -eq 1 ]]
 grep -Fq '结果：✅ 恢复成功' <<<"$initial_restore_output"
 grep -Fq '容器：1 个（运行 1 / 暂停 0 / 停止 0）' <<<"$initial_restore_output"
+grep -Fq '跳过宿主机系统路径' <<<"$initial_restore_output"
+[[ "$(ls -l /etc/localtime 2>/dev/null || true)" == "$localtime_before" ]]
 ! grep -Fq '若端口被占用' <<<"$initial_restore_output"
 ! grep -Fq '此步骤可能耗时较长' <<<"$initial_restore_output"
 ! grep -Fq '无需按键' <<<"$initial_restore_output"

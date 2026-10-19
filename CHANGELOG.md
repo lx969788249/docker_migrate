@@ -13,6 +13,11 @@
 - Keep the image's own healthcheck instead of rewriting exec-form checks to shell form, so images without `/bin/sh` pass health verification.
 - Snapshot a container's writable layer only when it has real changes (or the image tag moved); other containers keep their original image name for normal upgrades. `DOCKER_MIGRATE_SNAPSHOT=always|never` overrides this.
 
+### Removed
+
+- Restores accept only encrypted links that carry the source digest, key, IV and HMAC; plaintext links from early versions, bundles without a checksum list, legacy network records and `RESTORE_ALLOW_UNVERIFIED` are no longer supported. Migration bundles exist only while the source script is serving them, so regenerate them with the current script.
+- Remove unused helpers (`CYA`, `bundle_encrypt_file`, `verify_bundle_hmac`, `verify_archive_sha256`).
+
 ### Development
 
 - Split the 6,800-line script into modules under `src/`; `./build.sh` assembles the single-file `docker_migrate_perfect.sh`, and CI rejects a release file that does not match `src/`.

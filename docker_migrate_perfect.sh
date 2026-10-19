@@ -11,11 +11,7 @@
 # 4. 生成 manifest.json 和 restore.sh
 # 5. 加密迁移包后启动带安全随机路径的 HTTP 服务；退出时关闭 HTTP、重启停机容器、清理临时文件
 #
-# 本版修复：
-# - 恢复时同名容器已存在但端口绑定不同，会删除并重建容器，避免“恢复成功但端口丢失”。
-# - 单容器 docker compose 项目按独立容器恢复，确保可以从 inspect 还原 -p 端口参数。
-# - 端口绑定还原支持空 HostPort 跳过、IPv6 HostIp 加方括号。
-# - 恢复已暂停容器时会先 unpause，再 start / remove。
+# 源码：本文件由 build.sh 从 src/ 目录合并生成，修改请改 src/ 下的源码后重新运行 ./build.sh。
 #
 # 环境变量：
 # PORT=8080             默认 HTTP 端口（会询问你要不要改；被占用则向后尝试）
@@ -53,7 +49,6 @@ BLUE() { echo -e "\033[1;34m$*\033[0m"; }
 YEL() { echo -e "\033[1;33m$*\033[0m"; }
 RED() { echo -e "\033[1;31m$*\033[0m"; }
 OK() { echo -e "\033[1;32m$*\033[0m"; }
-CYA() { echo -e "\033[1;36m$*\033[0m"; }
 
 # 通用工具：主脚本与生成的恢复脚本共用。
 
@@ -698,13 +693,6 @@ bundle_hmac_sha256_file() {
   printf '%s\n' "${digest,,}"
 }
 
-verify_bundle_hmac() {
-  local file="$1" mac_key="$2" iv="$3" expected="$4" actual
-  valid_sha256 "$expected" || return 2
-  actual="$(bundle_hmac_sha256_file "$file" "$mac_key" "$iv")" || return 1
-  [[ "${actual,,}" == "${expected,,}" ]]
-}
-
 bundle_file_digests() {
   local file="$1" mac_key="$2" iv="$3"
   local result sha mac extra
@@ -837,23 +825,6 @@ print(sha.hexdigest() + "\t" + mac.hexdigest())
   printf '%s\t%s\n' "${sha,,}" "${mac,,}"
 }
 
-bundle_encrypt_file() {
-  local input="$1" output="$2" encryption_key="$3" iv="$4"
-  local partial="${output}.partial.$$"
-  [[ -f "$input" && "$input" != "$output" ]] || return 1
-  valid_hex_length "$encryption_key" 64 || return 2
-  valid_hex_length "$iv" 32 || return 2
-  command -v openssl >/dev/null 2>&1 || return 127
-  rm -f "$partial"
-  if openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$iv" \
-    -in "$input" -out "$partial"; then
-    mv "$partial" "$output"
-  else
-    rm -f "$partial"
-    return 1
-  fi
-}
-
 bundle_decrypt_file() {
   local input="$1" output="$2" encryption_key="$3" iv="$4"
   local partial="${output}.partial.$$"
@@ -869,13 +840,6 @@ bundle_decrypt_file() {
     rm -f "$partial"
     return 1
   fi
-}
-
-verify_archive_sha256() {
-  local file="$1" expected="$2" actual
-  valid_sha256 "$expected" || return 2
-  actual="$(sha256_file "$file")" || return 1
-  [[ "${actual,,}" == "${expected,,}" ]]
 }
 
 # 迁移包结构：校验清单、manifest 与归档安全检查、恢复结果统计。
@@ -961,6 +925,7 @@ bundle_manifest_is_safe() {
     (.volumes | type == "array") and
     (.binds | type == "array") and
     (.runs | type == "array") and
+    all(.networks[]; type == "object" and (.name | type == "string")) and
     all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
     all(.projects[];
       (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
@@ -2411,7 +2376,6 @@ BLUE() { echo -e "\033[1;34m$*\033[0m"; }
 YEL() { echo -e "\033[1;33m$*\033[0m"; }
 RED() { echo -e "\033[1;31m$*\033[0m"; }
 OK() { echo -e "\033[1;32m$*\033[0m"; }
-CYA() { echo -e "\033[1;36m$*\033[0m"; }
 
 # 通用工具：主脚本与生成的恢复脚本共用。
 
@@ -2742,6 +2706,7 @@ bundle_manifest_is_safe() {
     (.volumes | type == "array") and
     (.binds | type == "array") and
     (.runs | type == "array") and
+    all(.networks[]; type == "object" and (.name | type == "string")) and
     all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
     all(.projects[];
       (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
@@ -3735,15 +3700,8 @@ compose_prepare_networks() {
     seen=1
     case "$external" in
       true)
-        network_row="$(jq -c --arg name "$net" '
-          .networks[]? |
-          (if type == "string" then
-            {name: ., legacy: true, driver: "bridge", internal: false,
-             attachable: false, enable_ipv6: false, options: {}, labels: {},
-             ipam: {driver: "default", options: {}, config: []}}
-           else . end) |
-          select(.name == $name)
-        ' "${BUNDLE_DIR}/manifest.json" | head -n1)"
+        network_row="$(jq -c --arg name "$net" '.networks[]? | select(.name == $name)' \
+          "${BUNDLE_DIR}/manifest.json" | head -n1)"
         if [[ -n "$network_row" ]]; then
           if ! docker network inspect "$net" >/dev/null 2>&1; then
             warn " · 检测到外部网络缺失，按迁移记录创建：$net"
@@ -3756,7 +3714,7 @@ compose_prepare_networks() {
           warn " · 外部网络缺失且迁移包没有其配置，拒绝创建默认错误网络：$net"
           return 1
         else
-          warn " · 旧迁移包没有外部网络配置，继续复用目标端已有网络：$net"
+          warn " · 迁移包没有该外部网络的配置，复用目标端已有网络：$net"
         fi
         ;;
       false)
@@ -3803,9 +3761,6 @@ create_network_from_record() {
   }' <<<"$row")"
 
   if docker network inspect "$name" >/dev/null 2>&1; then
-    if [[ "$(jq -r '.legacy // false' <<<"$row")" == "true" ]]; then
-      return 0
-    fi
     actual_core="$(docker network inspect "$name" | jq -cS '.[0] | {
       driver: (.Driver // "bridge"),
       internal: (.Internal // false),
@@ -4811,14 +4766,12 @@ trap 'exit 143' TERM
 RESTORE_STAGE="迁移包校验"
 if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" == "1" ]]; then
   :
-elif [[ -f checksums.sha256 ]]; then
+else
   say "[0] 验证迁移包完整性"
   if ! run_with_activity "校验迁移包内全部文件" verify_bundle_checksums "$BUNDLE_DIR"; then
     warn "迁移包完整性校验失败，拒绝恢复。"
     exit 1
   fi
-else
-  warn "旧版迁移包未包含校验清单，按兼容模式继续。"
 fi
 if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
   warn "迁移包 manifest 结构或路径不安全，拒绝恢复。"
@@ -5067,9 +5020,8 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
       echo " · 已读取 ${#source_state_records[@]} 条源端服务状态"
       if ((${#source_state_records[@]} == 0)); then
-        # 兼容旧迁移包：没有状态元数据时沿用全部启动行为。
-        compose_run "${COMPOSE_FILE_ARGS[@]}" up -d 2>&1 || exit 1
-        compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
+        warn " · 迁移包缺少 Compose 服务的源端状态记录：$name"
+        exit 1
       else
         compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start 2>&1 || exit 1
         for state_record in "${source_state_records[@]}"; do
@@ -5125,11 +5077,7 @@ if jq -e '.networks|length>0' manifest.json >/dev/null 2>&1; then
     if ! create_network_from_record "$network_row"; then
       FAILED_NETWORKS+=("$n")
     fi
-  done < <(jq -c '.networks[] | if type == "string" then
-    {name: ., legacy: true, driver: "bridge", internal: false, attachable: false,
-     enable_ipv6: false, options: {}, labels: {},
-     ipam: {driver: "default", options: {}, config: []}}
-    else . end' manifest.json)
+  done < <(jq -c '.networks[]' manifest.json)
 fi
 
 if ((${#FAILED_NETWORKS[@]} > 0)); then
@@ -5321,8 +5269,8 @@ restore_prompt_url() {
   if [[ -z "$restore_url" ]]; then
     read -rp "请输入旧服务器的一键包下载链接： " restore_url
   fi
-  if ! [[ "$restore_url" =~ ^https?://[^[:space:]]+\.tar\.gz(\.enc)?($|[?#]) ]]; then
-    RED "[ERR] 链接必须是 http/https 的 .tar.gz 或 .tar.gz.enc 文件。"
+  if ! [[ "$restore_url" =~ ^https?://[^[:space:]]+\.tar\.gz\.enc($|[?#]) ]]; then
+    RED "[ERR] 链接必须是源服务器输出的 http/https .tar.gz.enc 加密迁移包链接。"
     exit 1
   fi
   echo "$restore_url"
@@ -5340,13 +5288,11 @@ restore_find_bundle_dir() {
 }
 
 restore_ensure_deps() {
-  local require_openssl="${1:-0}" pm
+  local pm
   pm="$(pm_detect)"
   local pair bin pkg
-  local -a required_pairs=("curl curl" "tar tar" "find findutils" "jq jq" "docker docker" "python3 python3")
-  if [[ "$require_openssl" == "1" ]]; then
-    required_pairs+=("openssl openssl")
-  fi
+  local -a required_pairs=("curl curl" "tar tar" "find findutils" "jq jq" "docker docker"
+    "python3 python3" "openssl openssl")
   for pair in "${required_pairs[@]}"; do
     bin="${pair%% *}"
     pkg="${pair##* }"
@@ -5380,7 +5326,7 @@ restore_ensure_deps() {
 
 restore_main() {
   local URL DOWNLOAD_URL EXPECTED_SHA256 ENCRYPTION_SCHEME ENCRYPTION_SECRET
-  local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY encrypted=0 tgz_bytes free_bytes
+  local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY tgz_bytes free_bytes
   local restore_started=$SECONDS
   URL="$(restore_prompt_url "${1:-}")"
   DOWNLOAD_URL="$(bundle_download_url "$URL")"
@@ -5389,46 +5335,18 @@ restore_main() {
   ENCRYPTION_SECRET="$(bundle_encryption_secret "$URL")"
   ENCRYPTION_IV="$(bundle_encryption_iv "$URL")"
   ENCRYPTION_MAC="$(bundle_encryption_mac "$URL")"
-  if [[ -n "$EXPECTED_SHA256" ]] && ! valid_sha256 "$EXPECTED_SHA256"; then
-    RED "[ERR] 下载链接中的 SHA-256 摘要格式无效。"
+  # 只接受本工具生成的加密链接：来源摘要、加密参数和 HMAC 必须齐全。
+  # 迁移包只在源端脚本运行期间提供下载，不需要兼容早期的明文或无摘要链接。
+  if [[ "$ENCRYPTION_SCHEME" != "$BUNDLE_ENCRYPTION_SCHEME" ]] ||
+    ! valid_sha256 "$EXPECTED_SHA256" ||
+    ! valid_hex_length "$ENCRYPTION_SECRET" 128 ||
+    ! valid_hex_length "$ENCRYPTION_IV" 32 ||
+    ! valid_hex_length "$ENCRYPTION_MAC" 64; then
+    RED "[ERR] 链接缺少有效的 sha256/enc/secret/iv/mac 参数，请完整复制源服务器输出的链接。"
+    RED "[ERR] 如果源服务器运行的是旧版脚本，请用最新版重新生成迁移包。"
     exit 1
   fi
-  case "$ENCRYPTION_SCHEME" in
-    "")
-      if [[ -n "$ENCRYPTION_SECRET" || -n "$ENCRYPTION_IV" || -n "$ENCRYPTION_MAC" ||
-        "$DOWNLOAD_URL" == *.enc ]]; then
-        RED "[ERR] 加密链接缺少完整的 enc/secret/iv/mac 参数。"
-        exit 1
-      fi
-      ;;
-    "$BUNDLE_ENCRYPTION_SCHEME")
-      encrypted=1
-      if ! valid_hex_length "$ENCRYPTION_SECRET" 128 ||
-        ! valid_hex_length "$ENCRYPTION_IV" 32 ||
-        ! valid_hex_length "$ENCRYPTION_MAC" 64 ||
-        [[ -z "$EXPECTED_SHA256" ]]; then
-        RED "[ERR] 加密链接中的密钥、IV、HMAC 或 SHA-256 参数无效。"
-        exit 1
-      fi
-      ;;
-    *)
-      RED "[ERR] 不支持的迁移包加密格式：$ENCRYPTION_SCHEME"
-      exit 1
-      ;;
-  esac
-  if [[ -z "$EXPECTED_SHA256" && "${RESTORE_ALLOW_UNVERIFIED:-0}" != "1" ]]; then
-    if [[ -t 0 ]]; then
-      YEL "[WARN] 链接没有外部 SHA-256 摘要，无法确认迁移包来源。"
-      local allow_unverified
-      read -rp "仍要恢复这个旧版链接吗？[y/N] " allow_unverified
-      [[ "$allow_unverified" =~ ^[Yy]$ ]] || exit 1
-    else
-      RED "[ERR] 链接缺少外部 SHA-256 摘要；非交互模式拒绝恢复。"
-      YEL "[INFO] 仅兼容可信旧包时可显式设置 RESTORE_ALLOW_UNVERIFIED=1。"
-      exit 1
-    fi
-  fi
-  restore_ensure_deps "$encrypted"
+  restore_ensure_deps
   local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
   mkdir -p "$BASE"
   BASE="$(cd "$BASE" && pwd -P)" || {
@@ -5449,10 +5367,7 @@ restore_main() {
   [[ -n "$RID" ]] || RID="$(date +%s)"
   local TGZ="${SESSION_DIR}/bundle.tar.gz"
   local ENCRYPTED_BUNDLE="${SESSION_DIR}/bundle.tar.gz.enc"
-  local DOWNLOAD_FILE="$TGZ"
-  if ((encrypted == 1)); then
-    DOWNLOAD_FILE="$ENCRYPTED_BUNDLE"
-  fi
+  local DOWNLOAD_FILE="$ENCRYPTED_BUNDLE"
   local DOWNLOAD_PARTIAL="${DOWNLOAD_FILE}.partial"
   local OUTDIR="${SESSION_DIR}/unpacked"
 
@@ -5468,42 +5383,31 @@ restore_main() {
   fi
   OK "[OK] 保存路径：$DOWNLOAD_FILE"
   BLUE "[INFO] 文件大小：$(du -h "$DOWNLOAD_FILE" | awk '{print $1}')"
-  if ((encrypted == 1)); then
-    ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
-    MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
-    if ! run_with_activity "验证加密迁移包完整性" verify_bundle_digests \
-      "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" \
-      "$EXPECTED_SHA256" "$ENCRYPTION_MAC"; then
-      RED "[ERR] 加密迁移包摘要或认证失败，文件可能被篡改或链接密钥不正确。"
-      exit 1
-    fi
-    OK "[OK] 加密迁移包来源摘要与认证均通过"
-    if ! ensure_free_space "$SESSION_DIR" "$(progress_file_size "$ENCRYPTED_BUNDLE")" "解密迁移包"; then
-      exit 1
-    fi
-    if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
-      "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
-      "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
-      rm -f "$TGZ"
-      RED "[ERR] 迁移包解密失败。"
-      exit 1
-    fi
-    ENCRYPTION_SECRET=""
-    ENCRYPTION_KEY=""
-    MAC_KEY=""
-    OK "[OK] 迁移包解密完成"
-    # 密文已通过认证并解密，后续只用明文包；尽早释放一份完整包的空间。
-    [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$ENCRYPTED_BUNDLE"
-  elif [[ -n "$EXPECTED_SHA256" ]]; then
-    if ! run_with_activity "校验下载包 SHA-256" \
-      verify_archive_sha256 "$DOWNLOAD_FILE" "$EXPECTED_SHA256"; then
-      RED "[ERR] 下载包与源服务器提供的 SHA-256 摘要不一致，拒绝解压。"
-      exit 1
-    fi
-    OK "[OK] 下载包来源摘要校验通过"
-  else
-    YEL "[WARN] 已按兼容模式跳过外部来源校验。"
+  ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
+  MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
+  if ! run_with_activity "验证加密迁移包完整性" verify_bundle_digests \
+    "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" \
+    "$EXPECTED_SHA256" "$ENCRYPTION_MAC"; then
+    RED "[ERR] 加密迁移包摘要或认证失败，文件可能被篡改或链接密钥不正确。"
+    exit 1
   fi
+  OK "[OK] 加密迁移包来源摘要与认证均通过"
+  if ! ensure_free_space "$SESSION_DIR" "$(progress_file_size "$ENCRYPTED_BUNDLE")" "解密迁移包"; then
+    exit 1
+  fi
+  if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
+    "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
+    "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
+    rm -f "$TGZ"
+    RED "[ERR] 迁移包解密失败。"
+    exit 1
+  fi
+  ENCRYPTION_SECRET=""
+  ENCRYPTION_KEY=""
+  MAC_KEY=""
+  OK "[OK] 迁移包解密完成"
+  # 密文已通过认证并解密，后续只用明文包；尽早释放一份完整包的空间。
+  [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$ENCRYPTED_BUNDLE"
   if ! run_with_activity "扫描迁移包目录结构" archive_layout_is_safe "$TGZ"; then
     RED "[ERR] 迁移包结构不安全或已损坏，拒绝解压。"
     exit 1
@@ -5519,9 +5423,7 @@ restore_main() {
     RED "[ERR] 解压失败，请检查磁盘空间或确认文件是否完整。"
     exit 1
   fi
-  if ((encrypted == 1)) && [[ "${RESTORE_KEEP:-0}" != "1" ]]; then
-    rm -f "$TGZ"
-  fi
+  [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$TGZ"
 
   local BUNDLE_DIR
   BUNDLE_DIR="$(restore_find_bundle_dir "$OUTDIR" "$RID" || true)"
@@ -5529,16 +5431,12 @@ restore_main() {
     RED "[ERR] 未找到 restore.sh，解压内容异常：$OUTDIR"
     exit 1
   fi
-  if [[ -f "${BUNDLE_DIR}/checksums.sha256" ]]; then
-    if ! run_with_activity "校验迁移包内全部文件" \
-      verify_bundle_checksums "$BUNDLE_DIR"; then
-      RED "[ERR] 完整性校验未通过，拒绝恢复。"
-      exit 1
-    fi
-    OK "[OK] 迁移包完整性校验通过"
-  else
-    YEL "[WARN] 这是未带校验清单的旧版迁移包，将按兼容模式继续。"
+  if ! run_with_activity "校验迁移包内全部文件" \
+    verify_bundle_checksums "$BUNDLE_DIR"; then
+    RED "[ERR] 完整性校验未通过，拒绝恢复。"
+    exit 1
   fi
+  OK "[OK] 迁移包完整性校验通过"
   if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
     RED "[ERR] manifest.json 结构或路径不安全，拒绝恢复。"
     exit 1
@@ -6886,10 +6784,6 @@ Docker 迁移包
 恢复方法：
 1. 新服务器运行同一份 docker_migrate_perfect.sh，选择 2，然后粘贴下载链接；或
 2. 手动解压本包后，在包目录执行：bash restore.sh
-
-本版修复端口丢失问题：
-- 单容器 compose 项目会以独立容器方式迁移。
-- 已存在同名容器但端口绑定不一致时，恢复脚本会删除并重建容器。
 README
 }
 

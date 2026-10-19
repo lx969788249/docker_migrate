@@ -86,15 +86,8 @@ compose_prepare_networks() {
     seen=1
     case "$external" in
       true)
-        network_row="$(jq -c --arg name "$net" '
-          .networks[]? |
-          (if type == "string" then
-            {name: ., legacy: true, driver: "bridge", internal: false,
-             attachable: false, enable_ipv6: false, options: {}, labels: {},
-             ipam: {driver: "default", options: {}, config: []}}
-           else . end) |
-          select(.name == $name)
-        ' "${BUNDLE_DIR}/manifest.json" | head -n1)"
+        network_row="$(jq -c --arg name "$net" '.networks[]? | select(.name == $name)' \
+          "${BUNDLE_DIR}/manifest.json" | head -n1)"
         if [[ -n "$network_row" ]]; then
           if ! docker network inspect "$net" >/dev/null 2>&1; then
             warn " · 检测到外部网络缺失，按迁移记录创建：$net"
@@ -107,7 +100,7 @@ compose_prepare_networks() {
           warn " · 外部网络缺失且迁移包没有其配置，拒绝创建默认错误网络：$net"
           return 1
         else
-          warn " · 旧迁移包没有外部网络配置，继续复用目标端已有网络：$net"
+          warn " · 迁移包没有该外部网络的配置，复用目标端已有网络：$net"
         fi
         ;;
       false)
@@ -154,9 +147,6 @@ create_network_from_record() {
   }' <<<"$row")"
 
   if docker network inspect "$name" >/dev/null 2>&1; then
-    if [[ "$(jq -r '.legacy // false' <<<"$row")" == "true" ]]; then
-      return 0
-    fi
     actual_core="$(docker network inspect "$name" | jq -cS '.[0] | {
       driver: (.Driver // "bridge"),
       internal: (.Internal // false),

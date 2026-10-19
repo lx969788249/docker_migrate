@@ -5,14 +5,12 @@ trap 'exit 143' TERM
 RESTORE_STAGE="迁移包校验"
 if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" == "1" ]]; then
   :
-elif [[ -f checksums.sha256 ]]; then
+else
   say "[0] 验证迁移包完整性"
   if ! run_with_activity "校验迁移包内全部文件" verify_bundle_checksums "$BUNDLE_DIR"; then
     warn "迁移包完整性校验失败，拒绝恢复。"
     exit 1
   fi
-else
-  warn "旧版迁移包未包含校验清单，按兼容模式继续。"
 fi
 if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
   warn "迁移包 manifest 结构或路径不安全，拒绝恢复。"
@@ -261,9 +259,8 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
       echo " · 已读取 ${#source_state_records[@]} 条源端服务状态"
       if ((${#source_state_records[@]} == 0)); then
-        # 兼容旧迁移包：没有状态元数据时沿用全部启动行为。
-        compose_run "${COMPOSE_FILE_ARGS[@]}" up -d 2>&1 || exit 1
-        compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
+        warn " · 迁移包缺少 Compose 服务的源端状态记录：$name"
+        exit 1
       else
         compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start 2>&1 || exit 1
         for state_record in "${source_state_records[@]}"; do
@@ -319,11 +316,7 @@ if jq -e '.networks|length>0' manifest.json >/dev/null 2>&1; then
     if ! create_network_from_record "$network_row"; then
       FAILED_NETWORKS+=("$n")
     fi
-  done < <(jq -c '.networks[] | if type == "string" then
-    {name: ., legacy: true, driver: "bridge", internal: false, attachable: false,
-     enable_ipv6: false, options: {}, labels: {},
-     ipam: {driver: "default", options: {}, config: []}}
-    else . end' manifest.json)
+  done < <(jq -c '.networks[]' manifest.json)
 fi
 
 if ((${#FAILED_NETWORKS[@]} > 0)); then

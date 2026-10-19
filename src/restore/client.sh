@@ -101,8 +101,8 @@ restore_prompt_url() {
   if [[ -z "$restore_url" ]]; then
     read -rp "请输入旧服务器的一键包下载链接： " restore_url
   fi
-  if ! [[ "$restore_url" =~ ^https?://[^[:space:]]+\.tar\.gz(\.enc)?($|[?#]) ]]; then
-    RED "[ERR] 链接必须是 http/https 的 .tar.gz 或 .tar.gz.enc 文件。"
+  if ! [[ "$restore_url" =~ ^https?://[^[:space:]]+\.tar\.gz\.enc($|[?#]) ]]; then
+    RED "[ERR] 链接必须是源服务器输出的 http/https .tar.gz.enc 加密迁移包链接。"
     exit 1
   fi
   echo "$restore_url"
@@ -120,13 +120,11 @@ restore_find_bundle_dir() {
 }
 
 restore_ensure_deps() {
-  local require_openssl="${1:-0}" pm
+  local pm
   pm="$(pm_detect)"
   local pair bin pkg
-  local -a required_pairs=("curl curl" "tar tar" "find findutils" "jq jq" "docker docker" "python3 python3")
-  if [[ "$require_openssl" == "1" ]]; then
-    required_pairs+=("openssl openssl")
-  fi
+  local -a required_pairs=("curl curl" "tar tar" "find findutils" "jq jq" "docker docker"
+    "python3 python3" "openssl openssl")
   for pair in "${required_pairs[@]}"; do
     bin="${pair%% *}"
     pkg="${pair##* }"
@@ -160,7 +158,7 @@ restore_ensure_deps() {
 
 restore_main() {
   local URL DOWNLOAD_URL EXPECTED_SHA256 ENCRYPTION_SCHEME ENCRYPTION_SECRET
-  local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY encrypted=0 tgz_bytes free_bytes
+  local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY tgz_bytes free_bytes
   local restore_started=$SECONDS
   URL="$(restore_prompt_url "${1:-}")"
   DOWNLOAD_URL="$(bundle_download_url "$URL")"
@@ -169,46 +167,18 @@ restore_main() {
   ENCRYPTION_SECRET="$(bundle_encryption_secret "$URL")"
   ENCRYPTION_IV="$(bundle_encryption_iv "$URL")"
   ENCRYPTION_MAC="$(bundle_encryption_mac "$URL")"
-  if [[ -n "$EXPECTED_SHA256" ]] && ! valid_sha256 "$EXPECTED_SHA256"; then
-    RED "[ERR] 下载链接中的 SHA-256 摘要格式无效。"
+  # 只接受本工具生成的加密链接：来源摘要、加密参数和 HMAC 必须齐全。
+  # 迁移包只在源端脚本运行期间提供下载，不需要兼容早期的明文或无摘要链接。
+  if [[ "$ENCRYPTION_SCHEME" != "$BUNDLE_ENCRYPTION_SCHEME" ]] ||
+    ! valid_sha256 "$EXPECTED_SHA256" ||
+    ! valid_hex_length "$ENCRYPTION_SECRET" 128 ||
+    ! valid_hex_length "$ENCRYPTION_IV" 32 ||
+    ! valid_hex_length "$ENCRYPTION_MAC" 64; then
+    RED "[ERR] 链接缺少有效的 sha256/enc/secret/iv/mac 参数，请完整复制源服务器输出的链接。"
+    RED "[ERR] 如果源服务器运行的是旧版脚本，请用最新版重新生成迁移包。"
     exit 1
   fi
-  case "$ENCRYPTION_SCHEME" in
-    "")
-      if [[ -n "$ENCRYPTION_SECRET" || -n "$ENCRYPTION_IV" || -n "$ENCRYPTION_MAC" ||
-        "$DOWNLOAD_URL" == *.enc ]]; then
-        RED "[ERR] 加密链接缺少完整的 enc/secret/iv/mac 参数。"
-        exit 1
-      fi
-      ;;
-    "$BUNDLE_ENCRYPTION_SCHEME")
-      encrypted=1
-      if ! valid_hex_length "$ENCRYPTION_SECRET" 128 ||
-        ! valid_hex_length "$ENCRYPTION_IV" 32 ||
-        ! valid_hex_length "$ENCRYPTION_MAC" 64 ||
-        [[ -z "$EXPECTED_SHA256" ]]; then
-        RED "[ERR] 加密链接中的密钥、IV、HMAC 或 SHA-256 参数无效。"
-        exit 1
-      fi
-      ;;
-    *)
-      RED "[ERR] 不支持的迁移包加密格式：$ENCRYPTION_SCHEME"
-      exit 1
-      ;;
-  esac
-  if [[ -z "$EXPECTED_SHA256" && "${RESTORE_ALLOW_UNVERIFIED:-0}" != "1" ]]; then
-    if [[ -t 0 ]]; then
-      YEL "[WARN] 链接没有外部 SHA-256 摘要，无法确认迁移包来源。"
-      local allow_unverified
-      read -rp "仍要恢复这个旧版链接吗？[y/N] " allow_unverified
-      [[ "$allow_unverified" =~ ^[Yy]$ ]] || exit 1
-    else
-      RED "[ERR] 链接缺少外部 SHA-256 摘要；非交互模式拒绝恢复。"
-      YEL "[INFO] 仅兼容可信旧包时可显式设置 RESTORE_ALLOW_UNVERIFIED=1。"
-      exit 1
-    fi
-  fi
-  restore_ensure_deps "$encrypted"
+  restore_ensure_deps
   local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
   mkdir -p "$BASE"
   BASE="$(cd "$BASE" && pwd -P)" || {
@@ -229,10 +199,7 @@ restore_main() {
   [[ -n "$RID" ]] || RID="$(date +%s)"
   local TGZ="${SESSION_DIR}/bundle.tar.gz"
   local ENCRYPTED_BUNDLE="${SESSION_DIR}/bundle.tar.gz.enc"
-  local DOWNLOAD_FILE="$TGZ"
-  if ((encrypted == 1)); then
-    DOWNLOAD_FILE="$ENCRYPTED_BUNDLE"
-  fi
+  local DOWNLOAD_FILE="$ENCRYPTED_BUNDLE"
   local DOWNLOAD_PARTIAL="${DOWNLOAD_FILE}.partial"
   local OUTDIR="${SESSION_DIR}/unpacked"
 
@@ -248,42 +215,31 @@ restore_main() {
   fi
   OK "[OK] 保存路径：$DOWNLOAD_FILE"
   BLUE "[INFO] 文件大小：$(du -h "$DOWNLOAD_FILE" | awk '{print $1}')"
-  if ((encrypted == 1)); then
-    ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
-    MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
-    if ! run_with_activity "验证加密迁移包完整性" verify_bundle_digests \
-      "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" \
-      "$EXPECTED_SHA256" "$ENCRYPTION_MAC"; then
-      RED "[ERR] 加密迁移包摘要或认证失败，文件可能被篡改或链接密钥不正确。"
-      exit 1
-    fi
-    OK "[OK] 加密迁移包来源摘要与认证均通过"
-    if ! ensure_free_space "$SESSION_DIR" "$(progress_file_size "$ENCRYPTED_BUNDLE")" "解密迁移包"; then
-      exit 1
-    fi
-    if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
-      "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
-      "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
-      rm -f "$TGZ"
-      RED "[ERR] 迁移包解密失败。"
-      exit 1
-    fi
-    ENCRYPTION_SECRET=""
-    ENCRYPTION_KEY=""
-    MAC_KEY=""
-    OK "[OK] 迁移包解密完成"
-    # 密文已通过认证并解密，后续只用明文包；尽早释放一份完整包的空间。
-    [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$ENCRYPTED_BUNDLE"
-  elif [[ -n "$EXPECTED_SHA256" ]]; then
-    if ! run_with_activity "校验下载包 SHA-256" \
-      verify_archive_sha256 "$DOWNLOAD_FILE" "$EXPECTED_SHA256"; then
-      RED "[ERR] 下载包与源服务器提供的 SHA-256 摘要不一致，拒绝解压。"
-      exit 1
-    fi
-    OK "[OK] 下载包来源摘要校验通过"
-  else
-    YEL "[WARN] 已按兼容模式跳过外部来源校验。"
+  ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
+  MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
+  if ! run_with_activity "验证加密迁移包完整性" verify_bundle_digests \
+    "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" \
+    "$EXPECTED_SHA256" "$ENCRYPTION_MAC"; then
+    RED "[ERR] 加密迁移包摘要或认证失败，文件可能被篡改或链接密钥不正确。"
+    exit 1
   fi
+  OK "[OK] 加密迁移包来源摘要与认证均通过"
+  if ! ensure_free_space "$SESSION_DIR" "$(progress_file_size "$ENCRYPTED_BUNDLE")" "解密迁移包"; then
+    exit 1
+  fi
+  if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
+    "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
+    "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
+    rm -f "$TGZ"
+    RED "[ERR] 迁移包解密失败。"
+    exit 1
+  fi
+  ENCRYPTION_SECRET=""
+  ENCRYPTION_KEY=""
+  MAC_KEY=""
+  OK "[OK] 迁移包解密完成"
+  # 密文已通过认证并解密，后续只用明文包；尽早释放一份完整包的空间。
+  [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$ENCRYPTED_BUNDLE"
   if ! run_with_activity "扫描迁移包目录结构" archive_layout_is_safe "$TGZ"; then
     RED "[ERR] 迁移包结构不安全或已损坏，拒绝解压。"
     exit 1
@@ -299,9 +255,7 @@ restore_main() {
     RED "[ERR] 解压失败，请检查磁盘空间或确认文件是否完整。"
     exit 1
   fi
-  if ((encrypted == 1)) && [[ "${RESTORE_KEEP:-0}" != "1" ]]; then
-    rm -f "$TGZ"
-  fi
+  [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$TGZ"
 
   local BUNDLE_DIR
   BUNDLE_DIR="$(restore_find_bundle_dir "$OUTDIR" "$RID" || true)"
@@ -309,16 +263,12 @@ restore_main() {
     RED "[ERR] 未找到 restore.sh，解压内容异常：$OUTDIR"
     exit 1
   fi
-  if [[ -f "${BUNDLE_DIR}/checksums.sha256" ]]; then
-    if ! run_with_activity "校验迁移包内全部文件" \
-      verify_bundle_checksums "$BUNDLE_DIR"; then
-      RED "[ERR] 完整性校验未通过，拒绝恢复。"
-      exit 1
-    fi
-    OK "[OK] 迁移包完整性校验通过"
-  else
-    YEL "[WARN] 这是未带校验清单的旧版迁移包，将按兼容模式继续。"
+  if ! run_with_activity "校验迁移包内全部文件" \
+    verify_bundle_checksums "$BUNDLE_DIR"; then
+    RED "[ERR] 完整性校验未通过，拒绝恢复。"
+    exit 1
   fi
+  OK "[OK] 迁移包完整性校验通过"
   if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
     RED "[ERR] manifest.json 结构或路径不安全，拒绝恢复。"
     exit 1

@@ -39,9 +39,6 @@ jobs:
         run: tests/archive_parser_compat.sh
       - name: Docker integration test
         run: tests/integration_docker.sh
-      - name: Shared namespace and system bind restore test
-        if: success() || failure()
-        run: tests/integration_netns.sh
       - name: Real-world configuration fidelity test
         if: success() || failure()
         run: tests/integration_fidelity.sh

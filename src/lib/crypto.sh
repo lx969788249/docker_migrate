@@ -79,13 +79,6 @@ bundle_hmac_sha256_file() {
   printf '%s\n' "${digest,,}"
 }
 
-verify_bundle_hmac() {
-  local file="$1" mac_key="$2" iv="$3" expected="$4" actual
-  valid_sha256 "$expected" || return 2
-  actual="$(bundle_hmac_sha256_file "$file" "$mac_key" "$iv")" || return 1
-  [[ "${actual,,}" == "${expected,,}" ]]
-}
-
 bundle_file_digests() {
   local file="$1" mac_key="$2" iv="$3"
   local result sha mac extra
@@ -218,23 +211,6 @@ print(sha.hexdigest() + "\t" + mac.hexdigest())
   printf '%s\t%s\n' "${sha,,}" "${mac,,}"
 }
 
-bundle_encrypt_file() {
-  local input="$1" output="$2" encryption_key="$3" iv="$4"
-  local partial="${output}.partial.$$"
-  [[ -f "$input" && "$input" != "$output" ]] || return 1
-  valid_hex_length "$encryption_key" 64 || return 2
-  valid_hex_length "$iv" 32 || return 2
-  command -v openssl >/dev/null 2>&1 || return 127
-  rm -f "$partial"
-  if openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$iv" \
-    -in "$input" -out "$partial"; then
-    mv "$partial" "$output"
-  else
-    rm -f "$partial"
-    return 1
-  fi
-}
-
 bundle_decrypt_file() {
   local input="$1" output="$2" encryption_key="$3" iv="$4"
   local partial="${output}.partial.$$"
@@ -250,11 +226,4 @@ bundle_decrypt_file() {
     rm -f "$partial"
     return 1
   fi
-}
-
-verify_archive_sha256() {
-  local file="$1" expected="$2" actual
-  valid_sha256 "$expected" || return 2
-  actual="$(sha256_file "$file")" || return 1
-  [[ "${actual,,}" == "${expected,,}" ]]
 }

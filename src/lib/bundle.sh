@@ -81,6 +81,7 @@ bundle_manifest_is_safe() {
     (.volumes | type == "array") and
     (.binds | type == "array") and
     (.runs | type == "array") and
+    all(.networks[]; type == "object" and (.name | type == "string")) and
     all(.runs[]; type == "string" and test("^runs/[A-Za-z0-9][A-Za-z0-9_.-]*\\.sh$")) and
     all(.projects[];
       (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and

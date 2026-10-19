@@ -304,6 +304,8 @@ test_generated_scripts_are_valid_bash() {
   ! grep -Fq '此步骤可能耗时较长' "${tmp}/bundle/restore.sh"
   ! grep -Fq '无需按键' "${tmp}/bundle/runs/demo.sh"
   ! grep -Fq '无需按键' "${tmp}/bundle/restore.sh"
+  # 不再兼容缺少校验清单或明文链接的早期迁移包。
+  ! grep -Fq '兼容模式' "${tmp}/bundle/restore.sh"
   # TTY 更新必须一次覆盖并清除行尾，不能先输出 120 个空格制造空白帧。
   grep -Fq "printf '\\r%s\\033[K'" "${tmp}/bundle/runs/demo.sh"
   grep -Fq "printf '\\r%s\\033[K'" "${tmp}/bundle/restore.sh"
@@ -769,52 +771,26 @@ test_external_bundle_digest() {
   valid_hex_length "$iv" 32
   valid_hex_length "$mac" 64
 
-  # Legacy plaintext links remain parseable and do not pretend to be encrypted.
+  # 早期的明文链接仍能被解析，但不会被当作加密链接，也不再被接受。
   [[ "$(bundle_download_url "$legacy_url")" == "http://192.0.2.1/token/bundle.tar.gz" ]]
   [[ "$(bundle_expected_sha256 "$legacy_url")" == "$digest" ]]
   [[ -z "$(bundle_encryption_scheme "$legacy_url")" ]]
   [[ -z "$(bundle_encryption_secret "$legacy_url")" ]]
-  [[ "$(restore_prompt_url "$legacy_url")" == "$legacy_url" ]]
-  ! (restore_prompt_url 'file:///tmp/bundle.tar.gz#sha256=abc' >/dev/null 2>&1)
-  ! (restore_prompt_url '--config.tar.gz#sha256=abc' >/dev/null 2>&1)
+  ! (restore_prompt_url "$legacy_url" >/dev/null 2>&1)
+  ! (restore_prompt_url 'file:///tmp/bundle.tar.gz.enc#sha256=abc' >/dev/null 2>&1)
+  ! (restore_prompt_url '--config.tar.gz.enc#sha256=abc' >/dev/null 2>&1)
   valid_sha256 "$digest"
-  verify_archive_sha256 "${tmp}/bundle.tar.gz" "$digest"
-
-  printf 'tampered\n' >>"${tmp}/bundle.tar.gz"
-  ! verify_archive_sha256 "${tmp}/bundle.tar.gz" "$digest"
   ! valid_sha256 not-a-digest
 }
 
-test_encrypted_bundle_round_trip() {
-  local tmp marker secret encryption_key mac_key iv mac
-  command -v openssl >/dev/null 2>&1 || return 0
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
-  marker="docker-migrate-confidential-marker-$RANDOM-$$"
-  secret="$(printf '0123456789abcdef%.0s' {1..8})"
-  iv="00112233445566778899aabbccddeeff"
-  encryption_key="$(bundle_secret_encryption_key "$secret")"
-  mac_key="$(bundle_secret_mac_key "$secret")"
-  printf '%s\n%s\n' "$marker" 'private migration payload' >"${tmp}/plain.tar.gz"
-
-  bundle_encrypt_file "${tmp}/plain.tar.gz" "${tmp}/bundle.tar.gz.enc" "$encryption_key" "$iv"
-  [[ -s "${tmp}/bundle.tar.gz.enc" ]]
-  ! LC_ALL=C grep -aFq -- "$marker" "${tmp}/bundle.tar.gz.enc"
-
-  mac="$(bundle_hmac_sha256_file "${tmp}/bundle.tar.gz.enc" "$mac_key" "$iv")"
-  valid_sha256 "$mac"
-  verify_bundle_hmac "${tmp}/bundle.tar.gz.enc" "$mac_key" "$iv" "$mac"
-  bundle_decrypt_file "${tmp}/bundle.tar.gz.enc" "${tmp}/round-trip.tar.gz" "$encryption_key" "$iv"
-  cmp -s "${tmp}/plain.tar.gz" "${tmp}/round-trip.tar.gz"
-}
-
 test_streaming_pack_encrypt_round_trip() {
-  local tmp secret encryption_key mac_key iv digests sha mac extra
+  local tmp secret encryption_key mac_key iv digests sha mac extra marker
   command -v openssl >/dev/null 2>&1 || return 0
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   mkdir -p "${tmp}/bundle/rid/meta"
-  printf 'streamed migration payload\n' >"${tmp}/bundle/rid/meta/data.txt"
+  marker="docker-migrate-confidential-marker-$RANDOM-$$"
+  printf '%s\nstreamed migration payload\n' "$marker" >"${tmp}/bundle/rid/meta/data.txt"
   secret="$(printf '0123456789abcdef%.0s' {1..8})"
   encryption_key="$(bundle_secret_encryption_key "$secret")"
   mac_key="$(bundle_secret_mac_key "$secret")"
@@ -824,6 +800,7 @@ test_streaming_pack_encrypt_round_trip() {
     "${tmp}/bundle.tar.gz.enc" "$encryption_key" "$mac_key" "$iv")"
   IFS=$'\t' read -r sha mac extra <<<"$digests"
   [[ -z "$extra" ]]
+  ! LC_ALL=C grep -aFq -- "$marker" "${tmp}/bundle.tar.gz.enc"
   valid_sha256 "$sha"
   valid_sha256 "$mac"
   [[ "$sha" == "$(sha256_file "${tmp}/bundle.tar.gz.enc")" ]]
@@ -892,7 +869,7 @@ SH
 }
 
 test_encrypted_bundle_rejects_tampering() {
-  local tmp secret wrong_secret encryption_key wrong_key mac_key wrong_mac_key iv mac bad_mac
+  local tmp secret wrong_secret encryption_key wrong_key mac_key wrong_mac_key iv digests sha mac bad_mac
   command -v openssl >/dev/null 2>&1 || return 0
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
@@ -903,26 +880,29 @@ test_encrypted_bundle_rejects_tampering() {
   wrong_key="$(bundle_secret_encryption_key "$wrong_secret")"
   wrong_mac_key="$(bundle_secret_mac_key "$wrong_secret")"
   iv="00112233445566778899aabbccddeeff"
-  printf 'authenticated migration payload\n' >"${tmp}/plain.tar.gz"
+  mkdir -p "${tmp}/bundle/rid"
+  printf 'authenticated migration payload\n' >"${tmp}/bundle/rid/data.txt"
+  digests="$(bundle_pack_encrypt_directory "${tmp}/bundle" rid \
+    "${tmp}/bundle.tar.gz.enc" "$encryption_key" "$mac_key" "$iv")"
+  IFS=$'\t' read -r sha mac _ <<<"$digests"
 
-  bundle_encrypt_file "${tmp}/plain.tar.gz" "${tmp}/bundle.tar.gz.enc" "$encryption_key" "$iv"
-  mac="$(bundle_hmac_sha256_file "${tmp}/bundle.tar.gz.enc" "$mac_key" "$iv")"
-
-  # CTR has no built-in key check; a wrong key must at least produce different bytes.
+  # CTR 没有内建的密钥校验；错误密钥至少必须解出不同的字节，且 HMAC 验证失败。
+  bundle_decrypt_file "${tmp}/bundle.tar.gz.enc" "${tmp}/right.tar.gz" "$encryption_key" "$iv"
   bundle_decrypt_file "${tmp}/bundle.tar.gz.enc" "${tmp}/wrong-key.tar.gz" "$wrong_key" "$iv"
-  ! cmp -s "${tmp}/plain.tar.gz" "${tmp}/wrong-key.tar.gz"
-  ! verify_bundle_hmac "${tmp}/bundle.tar.gz.enc" "$wrong_mac_key" "$iv" "$mac"
+  ! cmp -s "${tmp}/right.tar.gz" "${tmp}/wrong-key.tar.gz"
+  verify_bundle_digests "${tmp}/bundle.tar.gz.enc" "$mac_key" "$iv" "$sha" "$mac"
+  ! verify_bundle_digests "${tmp}/bundle.tar.gz.enc" "$wrong_mac_key" "$iv" "$sha" "$mac"
 
   cp "${tmp}/bundle.tar.gz.enc" "${tmp}/tampered.enc"
   printf 'tamper' >>"${tmp}/tampered.enc"
-  ! verify_bundle_hmac "${tmp}/tampered.enc" "$mac_key" "$iv" "$mac"
+  ! verify_bundle_digests "${tmp}/tampered.enc" "$mac_key" "$iv" "$sha" "$mac"
 
   if [[ "${mac:0:1}" == "0" ]]; then
     bad_mac="1${mac:1}"
   else
     bad_mac="0${mac:1}"
   fi
-  ! verify_bundle_hmac "${tmp}/bundle.tar.gz.enc" "$mac_key" "$iv" "$bad_mac"
+  ! verify_bundle_digests "${tmp}/bundle.tar.gz.enc" "$mac_key" "$iv" "$sha" "$bad_mac"
   ! valid_hex_length short 128
 }
 
@@ -1181,7 +1161,6 @@ run_test "Compose env_file parser handles scalar/list/long syntax" test_compose_
 run_test "restore client cleans interrupted and failed preparation sessions" test_restore_client_cleanup_on_interrupts_and_errors
 run_test "restore client preserves diagnostics after transaction handoff" test_restore_client_cleanup_preserves_transaction_diagnostics
 run_test "encrypted and legacy URL fragments are parsed safely" test_external_bundle_digest
-run_test "encrypted bundle round-trips without exposing plaintext" test_encrypted_bundle_round_trip
 run_test "streaming compression and encryption preserves bundle and digests" test_streaming_pack_encrypt_round_trip
 run_test "batch stop uses one Docker call and verifies every container" test_batch_stop_uses_one_docker_call_and_verifies_all
 run_test "encrypted bundle rejects wrong keys and tampering" test_encrypted_bundle_rejects_tampering

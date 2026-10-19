@@ -11,11 +11,7 @@
 # 4. 生成 manifest.json 和 restore.sh
 # 5. 加密迁移包后启动带安全随机路径的 HTTP 服务；退出时关闭 HTTP、重启停机容器、清理临时文件
 #
-# 本版修复：
-# - 恢复时同名容器已存在但端口绑定不同，会删除并重建容器，避免“恢复成功但端口丢失”。
-# - 单容器 docker compose 项目按独立容器恢复，确保可以从 inspect 还原 -p 端口参数。
-# - 端口绑定还原支持空 HostPort 跳过、IPv6 HostIp 加方括号。
-# - 恢复已暂停容器时会先 unpause，再 start / remove。
+# 源码：本文件由 build.sh 从 src/ 目录合并生成，修改请改 src/ 下的源码后重新运行 ./build.sh。
 #
 # 环境变量：
 # PORT=8080             默认 HTTP 端口（会询问你要不要改；被占用则向后尝试）
