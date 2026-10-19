@@ -38,6 +38,39 @@ jobs:
       - name: Docker integration test
         run: tests/integration_docker.sh
       - name: Shared namespace and system bind restore test
+        if: success() || failure()
         run: tests/integration_netns.sh
+      - name: Real-world configuration fidelity test
+        if: success() || failure()
+        run: tests/integration_fidelity.sh
       - name: End-to-end migration test
+        if: success() || failure()
         run: tests/end_to_end.sh
+
+  # 脚本声明支持 bash >= 4.0 与多种发行版：在这些环境里跑单元测试，
+  # 及早发现旧版 bash（如 4.0-4.3 下 set -u 与空数组）和 BusyBox 工具差异。
+  compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: bash:4.0
+            install: apk add --no-cache jq python3 openssl
+          - image: bash:4.2
+            install: apk add --no-cache jq python3 openssl
+          - image: bash:4.4
+            install: apk add --no-cache jq python3 openssl
+          - image: alpine:3.20
+            install: apk add --no-cache bash jq python3 openssl
+          - image: debian:11
+            install: apt-get update -qq && apt-get install -y -qq jq python3 openssl procps >/dev/null
+          - image: rockylinux:8
+            install: dnf install -y -q jq python3 openssl procps-ng tar gzip
+    name: compat (${{ matrix.image }})
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests in ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "${{ matrix.image }}" \
+            sh -c '${{ matrix.install }} && bash --version | head -n1 && bash tests/run.sh'
