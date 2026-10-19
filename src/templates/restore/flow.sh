@@ -251,8 +251,39 @@ compose_start_project() {
   )
 }
 
-RESTORE_STAGE="恢复 Compose 项目"
 restore_stage 5 "启动服务"
+
+# 先按迁移记录创建独立网络，再启动 Compose 项目：Compose 自动分配网段时
+# 会占用第一个空闲网段，可能正是独立网络在源端使用的网段。
+RESTORE_STAGE="创建网络"
+say "创建自定义网络"
+declare -A COMPOSE_NETS=()
+while IFS= read -r n; do
+  [[ -n "$n" ]] || continue
+  COMPOSE_NETS["$n"]=1
+done < <(compose_networks_from_meta_all)
+
+if jq -e '.networks|length>0' manifest.json >/dev/null 2>&1; then
+  while IFS= read -r network_row; do
+    n="$(jq -r '.name // empty' <<<"$network_row")"
+    case "$n" in bridge | host | none | "") continue ;; esac
+    if [[ -n "${COMPOSE_NETS[$n]:-}" ]]; then
+      continue
+    fi
+    if ! create_network_from_record "$network_row"; then
+      [[ -n "$(fail_reason_read || true)" ]] ||
+        fail_with_output "网络 ${n} 创建失败" "$(log_tail_text 10)" "检查是否与新服务器已有网络的网段冲突"
+      FAILED_NETWORKS+=("$n")
+    fi
+  done < <(jq -c '.networks[]' manifest.json)
+fi
+
+if ((${#FAILED_NETWORKS[@]} > 0)); then
+  print_failure_summary
+  exit 1
+fi
+
+RESTORE_STAGE="恢复 Compose 项目"
 if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
   COMPOSE_RESTORE_ROOT="${RESTORE_TRANSACTION_DIR}/incoming_compose"
   mkdir -p "$COMPOSE_RESTORE_ROOT"
@@ -343,34 +374,6 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       exit 1
     fi
   done < <(jq -c '.projects[]' manifest.json)
-fi
-
-RESTORE_STAGE="创建网络"
-say "创建自定义网络"
-declare -A COMPOSE_NETS=()
-while IFS= read -r n; do
-  [[ -n "$n" ]] || continue
-  COMPOSE_NETS["$n"]=1
-done < <(compose_networks_from_meta_all)
-
-if jq -e '.networks|length>0' manifest.json >/dev/null 2>&1; then
-  while IFS= read -r network_row; do
-    n="$(jq -r '.name // empty' <<<"$network_row")"
-    case "$n" in bridge | host | none | "") continue ;; esac
-    if [[ -n "${COMPOSE_NETS[$n]:-}" ]]; then
-      continue
-    fi
-    if ! create_network_from_record "$network_row"; then
-      [[ -n "$(fail_reason_read || true)" ]] ||
-        fail_with_output "网络 ${n} 创建失败" "$(log_tail_text 10)" "检查是否与新服务器已有网络的网段冲突"
-      FAILED_NETWORKS+=("$n")
-    fi
-  done < <(jq -c '.networks[]' manifest.json)
-fi
-
-if ((${#FAILED_NETWORKS[@]} > 0)); then
-  print_failure_summary
-  exit 1
 fi
 
 # --network/--pid/--ipc container:X 要求 X 先存在。按依赖排序独立容器的恢复

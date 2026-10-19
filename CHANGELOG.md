@@ -5,6 +5,7 @@
 ### Fixes found in a real two-server migration
 
 - Restore Compose projects under their original project name. Projects started with `-p`, `COMPOSE_PROJECT_NAME` or a panel-chosen name used to be recreated under the directory name, so the restore waited for containers that never appeared, rolled back, and left the wrongly named containers behind.
+- Create standalone networks before starting Compose projects. A Compose network picks the first free address range on its own, which could be the range a standalone network used on the source, and that network then failed to create.
 - Generate the resolved Compose configuration with the original project name on the source as well.
 - Keep Compose warnings (such as the obsolete `version` attribute) in the log instead of breaking the progress line.
 - Show container names instead of IDs while analysing the selected containers.
