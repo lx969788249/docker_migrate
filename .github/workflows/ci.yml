@@ -64,9 +64,9 @@ jobs:
           - image: alpine:3.20
             install: apk add --no-cache bash jq python3 openssl
           - image: debian:11
-            install: apt-get update -qq && apt-get install -y -qq jq python3 openssl procps >/dev/null
+            install: apt-get -o Acquire::Retries=5 update -qq && apt-get -o Acquire::Retries=5 install -y -qq jq python3 openssl procps >/dev/null
           - image: rockylinux:8
-            install: dnf install -y -q jq python3 openssl procps-ng tar gzip
+            install: dnf install -y -q jq python3 openssl procps-ng tar gzip findutils diffutils
     name: compat (${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4

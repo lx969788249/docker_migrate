@@ -7,9 +7,17 @@
 - Recreate host system bind mounts (`/etc/localtime`, `/proc`, `/sys`, `/dev`, `/var/log`, and similar) without migrating or overwriting them; restores no longer fail on the `/etc/localtime` symlink.
 - Back up the real data behind symlinked bind sources and recreate the link on the target.
 - Fix restoring read-only bind mounts (`-v src:dst:ro`), which produced the invalid mount mode `ro,ro`.
+- Restore only explicitly assigned static IPs; dynamically assigned addresses are no longer pinned on the target, where they could collide with other containers.
+- Install `find` when missing (minimal images) and keep interrupted-restore summaries visible on bash 4.0/4.1.
 - Restore standalone containers that share another container's network namespace: skip conflicting hostname, DNS, hosts and port options, restore dependencies first, and include the dependency automatically during backup.
 - Keep the image's own healthcheck instead of rewriting exec-form checks to shell form, so images without `/bin/sh` pass health verification.
 - Snapshot a container's writable layer only when it has real changes (or the image tag moved); other containers keep their original image name for normal upgrades. `DOCKER_MIGRATE_SNAPSHOT=always|never` overrides this.
+
+### Testing
+
+- Add a real-world configuration fidelity test that migrates eight differently configured containers end to end and compares their `docker inspect` output.
+- Run unit tests on bash 4.0, 4.2 and 4.4, Alpine, Debian 11 and Rocky Linux 8.
+- Add a manual two-server test checklist in `docs/manual-vps-test.md`.
 
 ### Usability
 

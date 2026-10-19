@@ -1624,8 +1624,8 @@ restore_container_networks() {
       docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
       continue
     fi
-    ip="$(jq -r '.value.IPAMConfig.IPv4Address // .value.IPAddress // empty' <<<"$entry")"
-    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // .value.GlobalIPv6Address // .value.IPv6Address // empty' <<<"$entry")"
+    ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
+    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // empty' <<<"$entry")"
     [[ -z "$ip" ]] || connect_args+=(--ip "$ip")
     [[ -z "$ip6" ]] || connect_args+=(--ip6 "$ip6")
     while IFS= read -r alias; do
@@ -2054,8 +2054,10 @@ fi
 
 if [[ "$primary_net" != "bridge" && "$primary_net" != "host" &&
       "$primary_net" != "none" && "$primary_net" != container:* ]]; then
-  primary_ip="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv4Address // .[0].NetworkSettings.Networks[$n].IPAddress // empty' "$META")"
-  primary_ip6="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv6Address // .[0].NetworkSettings.Networks[$n].GlobalIPv6Address // .[0].NetworkSettings.Networks[$n].IPv6Address // empty' "$META")"
+  # 只还原用户显式指定的静态 IP（IPAMConfig）。Docker 动态分配的地址若被
+  # 固定下来，会与目标端同网络的其他容器冲突，也改变了原有配置。
+  primary_ip="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv4Address // empty' "$META")"
+  primary_ip6="$(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].IPAMConfig.IPv6Address // empty' "$META")"
   [[ -z "$primary_ip" ]] || args+=(--ip "$primary_ip")
   [[ -z "$primary_ip6" ]] || args+=(--ip6 "$primary_ip6")
   mapfile -t primary_aliases < <(jq -r --arg n "$primary_net" '.[0].NetworkSettings.Networks[$n].Aliases[]? // empty' "$META")
@@ -2103,8 +2105,8 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
     _net(){ echo "$entry" | decode_base64 | jq -r "$1"; }
     net_name="$(_net '.key')"
     [[ -z "$net_name" || "$net_name" == "$primary_net" || "$net_name" == "bridge" ]] && continue
-    ip="$(_net '.value.IPAMConfig.IPv4Address // .value.IPAddress // empty')"
-    ip6="$(_net '.value.IPAMConfig.IPv6Address // .value.GlobalIPv6Address // .value.IPv6Address // empty')"
+    ip="$(_net '.value.IPAMConfig.IPv4Address // empty')"
+    ip6="$(_net '.value.IPAMConfig.IPv6Address // empty')"
     aliases_raw="$(_net '.value.Aliases // empty | join(" ")')"
     conn_args=()
     [[ -n "$ip" && "$ip" != "null" ]] && conn_args+=(--ip "$ip")
@@ -3146,7 +3148,9 @@ restore_volume_exact() {
 }
 
 restore_data_with_diagnostics() {
-  local label="$1" logfile rc RESTORE_ACTIVE_DATA_LOG=""
+  # RESTORE_ACTIVE_DATA_LOG 必须是全局变量：bash 4.0/4.1 在函数内 exit 时会先
+  # 撤销 local 再执行 EXIT trap，trap 将读不到日志路径。
+  local label="$1" logfile rc
   shift
   # 日志置于迁移包旁，不混入包内校验清单，也不随事务回滚点一起删除。
   # mktemp + umask 077 防止覆盖已有路径或泄露数据库文件信息。
@@ -3156,11 +3160,13 @@ restore_data_with_diagnostics() {
   }
   RESTORE_ACTIVE_DATA_LOG="$logfile"
   if "$@" >"$logfile" 2>&1; then
+    RESTORE_ACTIVE_DATA_LOG=""
     rm -f "$logfile" || true
     return 0
   else
     rc=$?
   fi
+  RESTORE_ACTIVE_DATA_LOG=""
   printf '\n[错误详情] %s（退出码：%s）\n' "$label" "$rc" >&2
   tail -n 20 "$logfile" >&2
   printf '详细日志：%s\n' "$logfile" >&2
@@ -3796,8 +3802,8 @@ transaction_restore_container_networks() {
       continue
     fi
     connect_args=()
-    ip="$(jq -r '.value.IPAMConfig.IPv4Address // .value.IPAddress // empty' <<<"$entry")"
-    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // .value.GlobalIPv6Address // .value.IPv6Address // empty' <<<"$entry")"
+    ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
+    ip6="$(jq -r '.value.IPAMConfig.IPv6Address // empty' <<<"$entry")"
     [[ -z "$ip" ]] || connect_args+=(--ip "$ip")
     [[ -z "$ip6" ]] || connect_args+=(--ip6 "$ip6")
     while IFS= read -r alias; do
@@ -5050,7 +5056,7 @@ restore_ensure_deps() {
   local require_openssl="${1:-0}" pm
   pm="$(pm_detect)"
   local pair bin pkg
-  local -a required_pairs=("curl curl" "tar tar" "jq jq" "docker docker" "python3 python3")
+  local -a required_pairs=("curl curl" "tar tar" "find findutils" "jq jq" "docker docker" "python3 python3")
   if [[ "$require_openssl" == "1" ]]; then
     required_pairs+=("openssl openssl")
   fi
@@ -5404,6 +5410,7 @@ case "$PKGMGR" in
     need_bin jq jq
     try_optional_bin python3 python3
     need_bin tar tar
+    need_bin find findutils
     need_bin gzip gzip
     try_optional_bin pigz pigz
     need_bin openssl openssl
@@ -5414,6 +5421,7 @@ case "$PKGMGR" in
     need_bin jq jq
     try_optional_bin python3 python3
     need_bin tar tar
+    need_bin find findutils
     need_bin gzip gzip
     try_optional_bin pigz pigz
     need_bin openssl openssl
@@ -5426,6 +5434,7 @@ case "$PKGMGR" in
     need_bin jq jq
     try_optional_bin python3 python3
     need_bin tar tar
+    need_bin find findutils
     need_bin gzip gzip
     try_optional_bin pigz pigz
     need_bin openssl openssl
@@ -5436,13 +5445,14 @@ case "$PKGMGR" in
     need_bin jq jq
     try_optional_bin python3 python3
     need_bin tar tar
+    need_bin find findutils
     need_bin gzip gzip
     try_optional_bin pigz pigz
     need_bin openssl openssl
     need_bin docker docker
     ;;
   none)
-    for required_bin in curl jq tar gzip openssl docker; do
+    for required_bin in curl jq tar find gzip openssl docker; do
       if ! command -v "$required_bin" >/dev/null 2>&1; then
         RED "[ERR] 缺少命令：$required_bin，且未检测到受支持的包管理器，请手动安装。"
         exit 1
