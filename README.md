@@ -58,7 +58,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/m
 ```text
 ━━━━━━━━━━ 迁移包已就绪 ━━━━━━━━━━
 下载链接（请完整复制）：
-http://203.0.113.10:8080/Xk3fQ9.../docker_migrate_20261019-101500_a1B2c3D4e5.tar.gz.enc#sha256=…&enc=aes-256-ctr-hmac-sha256-v1&secret=…&iv=…&mac=…
+http://127.0.0.1:8080/Xk3fQ9.../docker_migrate_20261019-101500_a1B2c3D4e5.tar.gz.enc#sha256=…&enc=aes-256-ctr-hmac-sha256-v1&secret=…&iv=…&mac=…
 
 使用方法：在新服务器运行同一脚本 → 选择「2) 下载备份并恢复」→ 粘贴上面的完整链接。
 新服务器下载失败时，请确认旧服务器防火墙和云厂商安全组已放行 TCP 8080 端口。
