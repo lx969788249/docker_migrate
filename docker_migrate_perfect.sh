@@ -2026,7 +2026,11 @@ for m in "${mounts[@]}"; do
   opts=()
   if [[ -n "$mode" && "$mode" != "null" ]]; then
     IFS=',' read -r -a mode_parts <<<"$mode"
-    for part in "${mode_parts[@]}"; do [[ -n "$part" ]] && opts+=("$part"); done
+    # Mode 里的 ro/rw 与 RW 字段重复；读写属性统一由 RW 决定，否则会生成
+    # Docker 拒绝的 ro,ro。
+    for part in "${mode_parts[@]}"; do
+      case "$part" in "" | ro | rw) ;; *) opts+=("$part") ;; esac
+    done
   fi
   [[ "$rw" != "true" ]] && opts+=(ro)
   if ((${#opts[@]})); then
