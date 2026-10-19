@@ -165,8 +165,16 @@ initial_restore_log="$(cat "${tmp}"/log-initial/*.log)"
 grep -Fq '结果：✅ 恢复成功' <<<"$initial_restore_output"
 grep -Fq '容器：1 个（运行 1 / 暂停 0 / 停止 0）' <<<"$initial_restore_output"
 grep -Fq '跳过宿主机系统路径' <<<"$initial_restore_log"
-grep -Eq '\[[1-5]/5\] 启动服务 ✓' <<<"$initial_restore_output"
-[[ "$(ls -l /etc/localtime 2>/dev/null || true)" == "$localtime_before" ]]
+if ! grep -Eq '\[[1-5]/5\] 启动服务 ✓' <<<"$initial_restore_output"; then
+  echo "restore output is missing the final stage line:" >&2
+  printf '%s\n' "$initial_restore_output" >&2
+  exit 1
+fi
+localtime_after="$(ls -l /etc/localtime 2>/dev/null || true)"
+if [[ "$localtime_after" != "$localtime_before" ]]; then
+  printf 'host /etc/localtime changed:\n  before: %s\n  after:  %s\n' "$localtime_before" "$localtime_after" >&2
+  exit 1
+fi
 ! grep -Fq '若端口被占用' <<<"$initial_restore_output"
 ! grep -Fq '此步骤可能耗时较长' <<<"$initial_restore_output"
 ! grep -Fq '无需按键' <<<"$initial_restore_output"
