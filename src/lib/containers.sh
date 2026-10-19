@@ -3,7 +3,7 @@
 rename_container_with_retry() {
   local old_name="$1" new_name="$2"
   for _ in {1..20}; do
-    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
+    if dm_quiet docker rename "$old_name" "$new_name"; then
       return 0
     fi
     sleep 0.1
@@ -25,7 +25,7 @@ restore_container_networks() {
     fi
     connect_args=()
     if [[ "$network" == "bridge" ]]; then
-      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
+      dm_quiet docker network connect "$network" "$container" || return 1
       continue
     fi
     ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
@@ -35,6 +35,6 @@ restore_container_networks() {
     while IFS= read -r alias; do
       [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
     done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
-    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
+    dm_quiet docker network connect "${connect_args[@]}" "$network" "$container" || return 1
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }

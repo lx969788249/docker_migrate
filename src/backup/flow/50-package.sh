@@ -1,8 +1,9 @@
 #####################################
 # 生成独立容器 run 脚本
 #####################################
+stage_begin 5 7 "保存镜像"
 if ((${#IDS[@]})); then
-  BLUE "[INFO] 生成独立容器 run 脚本 ..."
+  detail "生成单容器恢复脚本"
   for id in "${IDS[@]}"; do
     if [[ "${CONTAINER_IS_COMPOSE[$id]}" == "1" ]]; then
       continue
@@ -20,24 +21,21 @@ fi
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | awk 'NF' | sort -u)
 if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
-  if progress_docker_save "${OUT_IMG}" docker image save "${IMAGES[@]}"; then
-    OK "[OK] images.tar 已生成，大小：$(du -h "${OUT_IMG}" | awk '{print $1}')"
+  if progress_docker_save "${OUT_IMG}" "$(images_total_bytes "${IMAGES[@]}")" \
+    docker image save "${IMAGES[@]}"; then
+    detail "images.tar 已生成：$(human "$(progress_file_size "$OUT_IMG")")"
     if ! cleanup_snapshot_images; then
-      YEL "[WARN] 部分临时 snapshot image 暂未删除，退出清理时会自动重试。"
+      detail "部分临时快照镜像暂未删除，退出清理时会自动重试"
     fi
   else
-    RED "[ERR] docker image save 失败，请检查磁盘空间或 Docker 状态。"
     rm -f "${OUT_IMG}" 2>/dev/null || true
-    BACKUP_FAILURES+=("镜像归档失败")
+    fail_with_output "保存镜像失败" "$(log_tail_text)" "执行 df -h 检查磁盘空间，并确认 Docker 运行正常"
+    exit 1
   fi
 else
-  YEL "[WARN] 未收集到镜像名（可能是只用了本地 none 镜像）。"
+  warn_user "没有找到需要保存的镜像，新服务器将尝试在线拉取"
 fi
-
-if ((${#BACKUP_FAILURES[@]} > 0)); then
-  RED "[ERR] 备份未完成，不会生成可误用的迁移包。"
-  exit 1
-fi
+stage_end "${#IMAGES[@]} 个镜像 · $(human "$(progress_file_size "${OUT_IMG:-/dev/null}")")"
 
 #####################################
 # 生成 manifest.json 与 restore.sh
@@ -134,8 +132,9 @@ Docker 迁移包
 README
 }
 
+stage_begin 6 7 "加密打包"
 generate_manifest_and_restore
-run_with_activity "计算迁移包内文件校验值" generate_bundle_checksums "$BUNDLE"
+run_with_activity "计算文件校验值" generate_bundle_checksums "$BUNDLE"
 
 #####################################
 # 流式压缩并加密成单文件
@@ -143,15 +142,15 @@ run_with_activity "计算迁移包内文件校验值" generate_bundle_checksums 
 BUNDLE_BASENAME="docker_migrate_${STAMP}_${RID}"
 SINGLE_TAR_PATH="${BUNDLE_ROOT}/${BUNDLE_BASENAME}.tar.gz"
 BUNDLE_SECRET="$(openssl rand -hex 64)" || {
-  RED "[ERR] 无法生成迁移包加密密钥。"
+  error_user "无法生成迁移包加密密钥" "确认 openssl 可以正常运行"
   exit 1
 }
 BUNDLE_IV="$(openssl rand -hex 16)" || {
-  RED "[ERR] 无法生成迁移包加密 IV。"
+  error_user "无法生成迁移包加密 IV" "确认 openssl 可以正常运行"
   exit 1
 }
 valid_hex_length "$BUNDLE_SECRET" 128 && valid_hex_length "$BUNDLE_IV" 32 || {
-  RED "[ERR] OpenSSL 返回了无效的随机密钥材料。"
+  error_user "OpenSSL 返回了无效的随机密钥" "确认 openssl 可以正常运行"
   exit 1
 }
 BUNDLE_ENCRYPTION_KEY="$(bundle_secret_encryption_key "$BUNDLE_SECRET")"
@@ -163,30 +162,34 @@ bundle_plain_bytes="$(du -sk "$BUNDLE" 2>/dev/null | awk '{ printf "%.0f\n", $1 
 if ! ensure_free_space "$BUNDLE_ROOT" "${bundle_plain_bytes:-0}" "生成加密迁移包"; then
   exit 1
 fi
-if ! BUNDLE_DIGESTS="$(run_with_file_progress "压缩并加密迁移包" \
-  "$ENCRYPTED_PARTIAL_PATH" 0 bundle_pack_encrypt_directory \
+PACK_COUNT_FILE="${ENCRYPTED_PARTIAL_PATH}.count"
+if ! BUNDLE_DIGESTS="$(DM_PROGRESS_HINT="正在压缩，数据量大时需要几分钟" \
+  run_with_progress "压缩并加密" "count:${PACK_COUNT_FILE}" "${bundle_plain_bytes:-0}" \
+  bundle_pack_encrypt_directory \
   "$BUNDLE_ROOT" "$RID" "$ENCRYPTED_PARTIAL_PATH" \
-  "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_MAC_KEY" "$BUNDLE_IV")"; then
-  RED "[ERR] 迁移包压缩或加密失败，拒绝启动下载服务。"
+  "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_MAC_KEY" "$BUNDLE_IV" "$PACK_COUNT_FILE")"; then
+  rm -f "$PACK_COUNT_FILE"
+  fail_with_output "压缩或加密迁移包失败" "$(log_tail_text)" "执行 df -h 检查磁盘空间后重试"
   exit 1
 fi
+rm -f "$PACK_COUNT_FILE"
 IFS=$'\t' read -r BUNDLE_SHA256 BUNDLE_HMAC BUNDLE_DIGEST_EXTRA <<<"$BUNDLE_DIGESTS"
 if [[ -n "$BUNDLE_DIGEST_EXTRA" ]] || ! valid_sha256 "$BUNDLE_SHA256" ||
   ! valid_sha256 "$BUNDLE_HMAC"; then
-  RED "[ERR] 无法生成加密迁移包摘要。"
+  error_user "无法生成加密迁移包的摘要"
   exit 1
 fi
 if ! mv "$ENCRYPTED_PARTIAL_PATH" "$ENCRYPTED_TAR_PATH"; then
-  RED "[ERR] 无法提交已完成的加密迁移包。"
+  error_user "无法保存加密迁移包" "执行 df -h 检查磁盘空间后重试"
   exit 1
 fi
 # 明文目录已全部进入加密包：立即删除，释放磁盘并减少明文数据停留时间。
-rm -rf "$BUNDLE" 2>/dev/null || YEL "[WARN] 明文迁移目录暂未删除，退出时会再次清理：$BUNDLE"
+rm -rf "$BUNDLE" 2>/dev/null || detail "明文迁移目录暂未删除，退出时会再次清理：$BUNDLE"
 TRANSFER_NAME="${BUNDLE_BASENAME}.tar.gz.enc"
 TRANSFER_PATH="$ENCRYPTED_TAR_PATH"
 TRANSFER_FRAGMENT="#sha256=${BUNDLE_SHA256}&enc=${BUNDLE_ENCRYPTION_SCHEME}&secret=${BUNDLE_SECRET}&iv=${BUNDLE_IV}&mac=${BUNDLE_HMAC}"
 BUNDLE_ENCRYPTION_KEY=""
 BUNDLE_MAC_KEY=""
 BUNDLE_SECRET=""
-OK "[OK] 加密迁移包已生成，大小：$(du -h "$TRANSFER_PATH" | awk '{print $1}')"
 SOURCE_PACKAGE_READY=1
+stage_end "$(human "$(progress_file_size "$TRANSFER_PATH")")"

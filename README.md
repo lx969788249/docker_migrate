@@ -53,7 +53,19 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/m
 
 ## 📺 运行效果
 
-旧服务器备份完成后：
+整个过程分成几个步骤，每步只占一行；耗时较长的步骤会实时显示进度、速度和剩余时间。
+
+旧服务器：
+
+```text
+[1/7] 检查环境 ✓ Docker 27.3.1 · 2 秒
+[2/7] 选择容器 ✓ 5 个容器 · 6 秒
+[3/7] 读取配置 ✓ 5 个容器 · 1 秒
+[4/7] 停机并打包数据 ✓ 3 个卷 · 2 个目录 · 1.8GB · 停机 42 秒 · 44 秒
+[5/7] 保存镜像 ██████████████░░░░░░ 72% · 1.5GB/2.1GB · 45MB/s · 剩余约 13 秒
+```
+
+迁移包就绪后，会给出迁移链接：
 
 ```text
 ━━━━━━━━━━ 迁移包已就绪 ━━━━━━━━━━
@@ -69,13 +81,38 @@ http://127.0.0.1:8080/Xk3fQ9.../docker_migrate_20261019-101500_a1B2c3D4e5.tar.gz
 新服务器恢复完成后：
 
 ```text
+[1/8] 检查环境 ✓ Docker 27.3.1 · 1 秒
+[2/8] 下载迁移包 ✓ 2.3GB · 52 秒
+[3/8] 校验并解密 ✓ 2.3GB · 38 秒
+[4/8] 预检数据 ✓ 3 个卷 · 2 个目录 · 4 秒
+[5/8] 加载镜像 ✓ 2.1GB · 41 秒
+[6/8] 建立回滚点 ✓ 2 秒
+[7/8] 恢复数据 ✓ 9 秒
+[8/8] 启动服务 ✓ 3 个容器 · 1 个 Compose 项目 · 17 秒
+
 ━━━━━━━━━━ Docker 迁移结果 ━━━━━━━━━━
 结果：✅ 恢复成功
 容器：5 个（运行 4 / 暂停 0 / 停止 1）
 数据：3 个 volume、2 个 bind 目录
 验证：完整性校验、服务启动与健康检查均已通过
+阶段耗时：检查环境 1 秒 · 下载迁移包 52 秒 · 校验并解密 38 秒 · …
 清理：下载文件与临时目录已删除
-耗时：2 分 37 秒
+耗时：2 分 44 秒
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+出错时，结果中会给出失败的步骤、原因、建议和日志位置：
+
+```text
+[8/8] 启动服务 ✗
+━━━━━━━━━━ Docker 迁移结果 ━━━━━━━━━━
+结果：❌ 恢复失败，已安全回滚
+失败阶段：恢复独立容器
+目标端状态：旧服务与原数据已恢复
+原因：容器 nginx 创建失败：宿主机端口 80 已被其他程序占用
+建议：执行 ss -lntp | grep ":80 " 查看占用的进程，停止它或修改端口后重试
+日志：/root/docker_migrate_logs/restore-20261019-102233-4182.log
+      反馈问题时请附上这个文件（密钥与密码已自动隐藏），或运行 --diagnose 生成诊断包。
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
@@ -194,6 +231,12 @@ bash docker_migrate_perfect.sh --backup --no-stop
 
 # 在新服务器直接恢复
 bash docker_migrate_perfect.sh --restore='http://…完整链接…'
+
+# 在屏幕上显示每一步的细节（默认只写进日志）
+bash docker_migrate_perfect.sh --verbose
+
+# 出问题时收集诊断信息，生成一个可以附到 issue 里的文件
+bash docker_migrate_perfect.sh --diagnose
 ```
 
 在非交互环境（定时任务、`nohup`）中运行备份时，下载服务会保持运行，并提示一条 `kill -TERM <pid>` 命令，恢复完成后用它结束源端任务。
@@ -211,6 +254,8 @@ bash docker_migrate_perfect.sh --restore='http://…完整链接…'
 | `RESTORE_KEEP` | — | 设为 `1` 时，恢复成功后保留下载与解压文件 |
 | `RESTORE_CLEAN_ALL` | — | 设为 `1` 时，恢复失败也删除下载文件（默认保留以便排查） |
 | `RESTORE_HEALTH_TIMEOUT` | `60` | 恢复后等待健康检查通过的秒数 |
+| `DOCKER_MIGRATE_LOG_DIR` | `~/docker_migrate_logs` | 运行日志目录。成功后日志自动删除，失败时保留并在结果中给出路径 |
+| `DOCKER_MIGRATE_KEEP_LOG` | — | 设为 `1` 时，成功后也保留日志 |
 
 完整说明见 `bash docker_migrate_perfect.sh --help`。
 
@@ -264,6 +309,12 @@ bash docker_migrate_perfect.sh --restore='http://…完整链接…'
 </details>
 
 <details>
+<summary><b>出错了怎么反馈？</b></summary>
+
+每次运行都会把完整过程写进日志（`~/docker_migrate_logs/`）。成功后日志自动删除；失败时结果里会给出日志路径，提交 [Issue](https://github.com/lx969788249/docker_migrate/issues) 时附上它即可。也可以运行 `bash docker_migrate_perfect.sh --diagnose` 生成一份包含系统、Docker 状态和最近日志的诊断文件。日志和诊断文件中的迁移密钥、容器密码等敏感信息会自动替换为 `***`。
+</details>
+
+<details>
 <summary><b>链接泄露了会怎样？</b></summary>
 
 拿到完整链接的人可以在下载服务开启期间下载并解密迁移包。迁移完成后在旧服务器按回车关闭下载服务，链接就会失效。只拿到下载地址、没有 `#` 后面密钥部分的人，下载到的只是无法解密的密文。
@@ -291,7 +342,7 @@ tests/run.sh       # 运行单元测试（需要 bash 4+、jq、python3、openss
 
 ## 💬 反馈
 
-- 遇到问题请提交 [Issue](https://github.com/lx969788249/docker_migrate/issues)，附上两端的系统版本、`docker version` 和脚本最后输出的“Docker 迁移结果”摘要。
+- 遇到问题请提交 [Issue](https://github.com/lx969788249/docker_migrate/issues)，附上脚本失败时给出的日志文件，或运行 `--diagnose` 生成的诊断文件（密钥与密码已自动隐藏）。
 - 版本变化见 [CHANGELOG](CHANGELOG.md)。
 
 如果这个项目帮你省下了一次搬家的时间，欢迎点一个 ⭐ Star。

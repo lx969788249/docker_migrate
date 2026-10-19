@@ -15,6 +15,8 @@ for ((arg_i = 0; arg_i < ${#ORIGINAL_ARGS[@]}; arg_i++)); do
       exit 0
       ;;
     --backup) REQUESTED_MODE=1 ;;
+    --diagnose) REQUESTED_MODE=diagnose ;;
+    --verbose | -v) DOCKER_MIGRATE_VERBOSE=1 ;;
     --restore=*)
       REQUESTED_MODE=2
       RESTORE_URL="${ORIGINAL_ARGS[$arg_i]#*=}"
@@ -28,6 +30,8 @@ for ((arg_i = 0; arg_i < ${#ORIGINAL_ARGS[@]}; arg_i++)); do
       ;;
   esac
 done
+
+export DOCKER_MIGRATE_VERBOSE="${DOCKER_MIGRATE_VERBOSE:-0}"
 
 if [[ -n "$REQUESTED_MODE" ]]; then
   MODE_PICK="$REQUESTED_MODE"
@@ -44,6 +48,10 @@ fi
 
 case "$MODE_PICK" in
   1) : ;;
+  diagnose)
+    run_diagnose
+    exit 0
+    ;;
   2)
     restore_main "$RESTORE_URL"
     exit 0

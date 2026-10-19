@@ -1,6 +1,7 @@
 #####################################
 # 容器选择（支持 compose 分组）
 #####################################
+stage_begin 2 7 "选择容器"
 if [[ -n "$INCLUDE_LIST" ]]; then
   declare -A INCLUDE_ID_BY_NAME=()
   include_container_count=0
@@ -10,7 +11,7 @@ if [[ -n "$INCLUDE_LIST" ]]; then
     include_container_count=$((include_container_count + 1))
   done < <(docker ps -a --format '{{.ID}}\t{{.Names}}')
   ((include_container_count > 0)) || {
-    RED "[ERR] 没有任何容器（运行中或已停止）"
+    error_user "本机没有任何容器（运行中或已停止）"
     exit 1
   }
   IFS=',' read -r -a NAMES <<<"$INCLUDE_LIST"
@@ -22,17 +23,17 @@ if [[ -n "$INCLUDE_LIST" ]]; then
     if [[ -n "$id" ]]; then
       IDS+=("$id")
     else
-      YEL "[WARN] 未找到容器：$n"
+      warn_user "未找到容器：$n"
     fi
   done
   ((${#IDS[@]})) || {
-    RED "[ERR] --include 未匹配到任何容器"
+    error_user "--include 没有匹配到任何容器" "执行 docker ps -a 确认容器名称"
     exit 1
   }
 else
   mapfile -t PS_LINES < <(docker ps -a --format '{{.ID}} {{.Names}}')
   ((${#PS_LINES[@]})) || {
-    RED "[ERR] 没有任何容器（运行中或已停止）"
+    error_user "本机没有任何容器（运行中或已停止）"
     exit 1
   }
 
@@ -48,13 +49,13 @@ else
 
   scan_total=${#PS_LINES[@]}
   scan_index=0
-  BLUE "[INFO] 正在识别容器与 Compose 分组（共 ${scan_total} 个）..."
+  detail "识别容器与 Compose 分组（共 ${scan_total} 个）"
   for line in "${PS_LINES[@]}"; do
     scan_index=$((scan_index + 1))
     id="${line%% *}"
     cname="${line#* }"
     [[ -z "$cname" || "$cname" == "$id" ]] && cname="$id"
-    progress_count "识别容器分组" "$scan_index" "$scan_total" "$cname"
+    progress_count "识别容器" "$scan_index" "$scan_total" "$cname"
     NAME_OF_ID["$id"]="$cname"
 
     j="$(docker inspect "$id")"
@@ -136,6 +137,7 @@ else
   declare -a MENU_KIND=()
   declare -a MENU_VAL=()
   idx=0
+  stage_hold
   if ((${#STANDALONE_IDS[@]})); then
     BLUE "独立 docker 容器："
     for i in "${!STANDALONE_IDS[@]}"; do
@@ -170,12 +172,12 @@ else
   fi
 
   if ((idx == 0)); then
-    RED "[ERR] 没有可迁移的容器"
+    error_user "没有可迁移的容器"
     exit 1
   fi
 
   if [[ ! -t 0 ]]; then
-    RED "[ERR] 非交互模式无法选择容器，请用 --include=容器名1,容器名2 指定要迁移的容器。"
+    error_user "非交互模式无法选择容器" "用 --include=容器名1,容器名2 指定要迁移的容器"
     exit 1
   fi
   read -rp "请输入要迁移的序号 [回车=全部 / 逗号分隔，如 1,3]： " PICK
@@ -191,12 +193,12 @@ else
       t="$(echo "$t" | xargs)"
       [[ -z "$t" ]] && continue
       if ! [[ "$t" =~ ^[0-9]+$ ]]; then
-        YEL "[WARN] 非法序号：$t"
+        warn_user "忽略无效的序号：$t"
         continue
       fi
       num="$t"
       if ((num < 1 || num > idx)); then
-        YEL "[WARN] 序号越界：$t"
+        warn_user "忽略超出范围的序号：$t"
         continue
       fi
       kind="${MENU_KIND[$num]}"
@@ -217,7 +219,7 @@ else
       fi
     done
     ((${#IDS[@]})) || {
-      RED "[ERR] 未选择任何容器"
+      error_user "没有选择任何容器"
       exit 1
     }
   fi
@@ -245,7 +247,7 @@ while ((dependency_added == 1)); do
       done
       ((dep_selected == 0)) || continue
       dep_name="$(docker inspect -f '{{.Name}}' "$dep_id" 2>/dev/null | sed 's#^/##')"
-      YEL "[INFO] 自动加入被依附的容器：${dep_name:-${dep_id:0:12}}（其他所选容器共享它的命名空间）"
+      warn_user "自动加入被依附的容器 ${dep_name:-${dep_id:0:12}}（其他所选容器共享它的网络或进程命名空间）"
       IDS+=("${dep_id:0:12}")
       dependency_added=1
     done < <(docker inspect -f '{{.HostConfig.NetworkMode}}
@@ -254,3 +256,6 @@ while ((dependency_added == 1)); do
     ((dependency_added == 0)) || break
   done
 done
+
+# shellcheck disable=SC2154
+stage_end "${#IDS[@]} 个容器"

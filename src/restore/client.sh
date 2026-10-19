@@ -22,7 +22,7 @@ restore_client_remove_session() {
   local base="${RESTORE_CLIENT_SESSION_BASE:-}"
   local session="${RESTORE_CLIENT_SESSION_DIR:-}"
   if ! restore_client_session_path_is_safe "$base" "$session"; then
-    RED "[ERR] 拒绝清理不安全的恢复临时目录：${session:-<空>}"
+    log_line "拒绝清理不安全的恢复临时目录：${session:-<空>}"
     return 1
   fi
   [[ -e "$session" || -L "$session" ]] || return 0
@@ -41,15 +41,21 @@ restore_client_exit_handler() {
       if restore_client_remove_session; then
         if ((rc != 0)); then
           case "$rc" in
-            129 | 130 | 143) YEL "[INFO] 已清理中断产生的下载与临时文件。" ;;
-            *) YEL "[INFO] 已清理未完成的下载与临时文件。" ;;
+            129 | 130 | 143) printf '已清理中断产生的下载与临时文件。\n' >&2 ;;
+            *) printf '已清理未完成的下载与临时文件。\n' >&2 ;;
           esac
         fi
       else
-        RED "[ERR] 自动清理失败，请检查：${RESTORE_CLIENT_SESSION_DIR:-未知目录}"
+        printf '自动清理失败，请检查：%s\n' "${RESTORE_CLIENT_SESSION_DIR:-未知目录}" >&2
       fi
       ;;
   esac
+  if ((rc != 0)); then
+    stage_fail
+    [[ -z "${DM_LOG_FILE:-}" ]] || printf '日志：%s（反馈问题时请附上这个文件）\n' "$DM_LOG_FILE" >&2
+  else
+    log_finish 1
+  fi
   RESTORE_CLIENT_PHASE="finished"
   # 清理失败不能覆盖原始信号或错误退出码；诊断信息已在上面明确给出。
   exit "$rc"
@@ -58,7 +64,7 @@ restore_client_exit_handler() {
 restore_client_arm_session_cleanup() {
   local base="$1" session="$2"
   if ! restore_client_session_path_is_safe "$base" "$session"; then
-    RED "[ERR] 无法保护不安全的恢复临时目录：$session"
+    error_user "恢复工作目录不安全：$session" "设置 RESTORE_BASE 指向一个普通目录后重试"
     return 1
   fi
   RESTORE_CLIENT_SESSION_BASE="$base"
@@ -102,7 +108,7 @@ restore_prompt_url() {
     read -rp "请输入旧服务器的一键包下载链接： " restore_url
   fi
   if ! [[ "$restore_url" =~ ^https?://[^[:space:]]+\.tar\.gz\.enc($|[?#]) ]]; then
-    RED "[ERR] 链接必须是源服务器输出的 http/https .tar.gz.enc 加密迁移包链接。"
+    error_user "链接格式不正确" "请完整复制旧服务器输出的 http(s)://….tar.gz.enc#… 链接"
     exit 1
   fi
   echo "$restore_url"
@@ -120,40 +126,54 @@ restore_find_bundle_dir() {
 }
 
 restore_ensure_deps() {
-  local pm
-  pm="$(pm_detect)"
   local pair bin pkg
   local -a required_pairs=("curl curl" "tar tar" "find findutils" "jq jq" "docker docker"
     "python3 python3" "openssl openssl")
+  PKGMGR="$(pm_detect)"
   for pair in "${required_pairs[@]}"; do
     bin="${pair%% *}"
     pkg="${pair##* }"
-    if ! command -v "$bin" >/dev/null 2>&1; then
-      if [[ "$pm" == "none" ]]; then
-        RED "[ERR] 缺少命令：$bin，请在新服务器安装该命令后重试。"
-        exit 1
-      fi
-      if [[ "$bin" == "docker" ]]; then
-        YEL "[INFO] 安装依赖：$bin（以及 docker compose）"
-        case "$pm" in
-          apt) pm_install "$pm" docker.io ;;
-          dnf | yum | zypper | apk) pm_install "$pm" docker ;;
-          *) pm_install "$pm" docker || true ;;
+    command -v "$bin" >/dev/null 2>&1 && continue
+    if [[ "$PKGMGR" == "none" ]]; then
+      error_user "缺少命令 ${bin}，且没有可用的包管理器" "请手动安装 ${bin} 后重试"
+      exit 1
+    fi
+    if [[ "$bin" == "docker" ]]; then
+      case "$PKGMGR" in
+        apt) install_package docker docker.io || true ;;
+        *) install_package docker docker || true ;;
+      esac
+      if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+        case "$PKGMGR" in
+          apt) install_package "docker compose" docker-compose-plugin ||
+            install_package docker-compose docker-compose || true ;;
+          *) install_package docker-compose docker-compose || true ;;
         esac
-        if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
-          case "$pm" in
-            apt) pm_install "$pm" docker-compose-plugin || pm_install "$pm" docker-compose || true ;;
-            dnf | yum | zypper | apk) pm_install "$pm" docker-compose || true ;;
-            *) pm_install "$pm" docker-compose || true ;;
-          esac
-        fi
-      else
-        YEL "[INFO] 安装依赖：$bin"
-        pm_install "$pm" "$pkg"
       fi
+      command -v docker >/dev/null 2>&1 || {
+        error_user "Docker 自动安装失败" "请按 https://docs.docker.com/engine/install/ 手动安装后重试"
+        exit 1
+      }
+    else
+      need_bin "$bin" "$pkg"
     fi
   done
   ensure_docker_running
+}
+
+# 下载迁移包：响应头写入 header_file，供进度显示读取总大小；curl 的报错
+# 写入日志，失败时据此给出原因。
+restore_download() {
+  local url="$1" output="$2" header_file="$3"
+  curl -fL --globoff -sS --retry 5 --retry-delay 10 --retry-max-time 300 \
+    --connect-timeout 30 -D "$header_file" --output "$output" --url "$url" \
+    2>>"${DM_LOG_FILE:-/dev/null}"
+}
+
+# 解压迁移包，同时统计已读取的压缩数据量用于显示进度。
+restore_extract() {
+  local archive="$1" outdir="$2" count_file="$3"
+  progress_meter "$count_file" <"$archive" | tar -xzf - -C "$outdir"
 }
 
 restore_main() {
@@ -161,6 +181,8 @@ restore_main() {
   local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY tgz_bytes free_bytes
   local restore_started=$SECONDS
   URL="$(restore_prompt_url "${1:-}")"
+  log_init restore
+  stage_begin 1 8 "检查环境"
   DOWNLOAD_URL="$(bundle_download_url "$URL")"
   EXPECTED_SHA256="$(bundle_expected_sha256 "$URL")"
   ENCRYPTION_SCHEME="$(bundle_encryption_scheme "$URL")"
@@ -174,26 +196,27 @@ restore_main() {
     ! valid_hex_length "$ENCRYPTION_SECRET" 128 ||
     ! valid_hex_length "$ENCRYPTION_IV" 32 ||
     ! valid_hex_length "$ENCRYPTION_MAC" 64; then
-    RED "[ERR] 链接缺少有效的 sha256/enc/secret/iv/mac 参数，请完整复制源服务器输出的链接。"
-    RED "[ERR] 如果源服务器运行的是旧版脚本，请用最新版重新生成迁移包。"
+    error_user "链接缺少有效的 sha256/enc/secret/iv/mac 参数" \
+      "请完整复制旧服务器输出的链接；如果旧服务器运行的是旧版脚本，请用最新版重新生成"
     exit 1
   fi
   restore_ensure_deps
   local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
   mkdir -p "$BASE"
   BASE="$(cd "$BASE" && pwd -P)" || {
-    RED "[ERR] 无法访问恢复目录：$BASE"
+    error_user "无法访问恢复目录：$BASE" "设置 RESTORE_BASE 指向一个可写的目录后重试"
     exit 1
   }
   local SESSION_DIR
   SESSION_DIR="$(mktemp -d "${BASE}/restore.XXXXXX")" || {
-    RED "[ERR] 无法创建独立恢复工作目录：$BASE"
+    error_user "无法创建恢复工作目录：$BASE" "执行 df -h 检查磁盘空间，或设置 RESTORE_BASE 指向其他目录"
     exit 1
   }
   if ! restore_client_arm_session_cleanup "$BASE" "$SESSION_DIR"; then
     rmdir "$SESSION_DIR" 2>/dev/null || true
     exit 1
   fi
+  stage_end "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
   local RID
   RID="$(basename "$DOWNLOAD_URL" | sed 's/\.tar\.gz.*$//' | tr -dc 'A-Za-z0-9_-')"
   [[ -n "$RID" ]] || RID="$(date +%s)"
@@ -201,47 +224,51 @@ restore_main() {
   local ENCRYPTED_BUNDLE="${SESSION_DIR}/bundle.tar.gz.enc"
   local DOWNLOAD_FILE="$ENCRYPTED_BUNDLE"
   local DOWNLOAD_PARTIAL="${DOWNLOAD_FILE}.partial"
+  local HEADER_FILE="${SESSION_DIR}/download.headers"
   local OUTDIR="${SESSION_DIR}/unpacked"
 
-  BLUE "[INFO] 下载：$DOWNLOAD_URL"
-  if ! curl -fL --globoff --progress-bar --retry 5 --retry-delay 10 --retry-max-time 300 \
-    --connect-timeout 30 --output "$DOWNLOAD_PARTIAL" --url "$DOWNLOAD_URL"; then
-    RED "[ERR] 下载失败：$DOWNLOAD_URL"
+  stage_begin 2 8 "下载迁移包"
+  log_line "下载地址：${DOWNLOAD_URL}"
+  if ! DM_PROGRESS_HINT="长时间没有进展时，请检查旧服务器的防火墙和云厂商安全组" \
+    run_with_progress "下载" "$DOWNLOAD_PARTIAL" "header:${HEADER_FILE}" \
+    restore_download "$DOWNLOAD_URL" "$DOWNLOAD_PARTIAL" "$HEADER_FILE"; then
+    fail_with_output "下载迁移包失败" "$(log_tail_text 10)" \
+      "确认旧服务器上的脚本仍在运行，并检查防火墙和安全组是否放行了下载端口"
     exit 1
   fi
   if ! mv "$DOWNLOAD_PARTIAL" "$DOWNLOAD_FILE"; then
-    RED "[ERR] 无法保存已下载的迁移包，请检查磁盘空间：$DOWNLOAD_FILE"
+    error_user "无法保存下载的迁移包" "执行 df -h 检查磁盘空间后重试"
     exit 1
   fi
-  OK "[OK] 保存路径：$DOWNLOAD_FILE"
-  BLUE "[INFO] 文件大小：$(du -h "$DOWNLOAD_FILE" | awk '{print $1}')"
+  stage_end "$(human "$(progress_file_size "$DOWNLOAD_FILE")")"
+
+  stage_begin 3 8 "校验并解密"
   ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
   MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
-  if ! run_with_activity "验证加密迁移包完整性" verify_bundle_digests \
+  if ! run_with_activity "校验摘要与签名" verify_bundle_digests \
     "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" \
     "$EXPECTED_SHA256" "$ENCRYPTION_MAC"; then
-    RED "[ERR] 加密迁移包摘要或认证失败，文件可能被篡改或链接密钥不正确。"
+    error_user "迁移包摘要或签名校验失败，文件可能被篡改或链接不完整" \
+      "确认链接完整复制后重新恢复；仍失败时请在旧服务器重新运行备份"
     exit 1
   fi
-  OK "[OK] 加密迁移包来源摘要与认证均通过"
   if ! ensure_free_space "$SESSION_DIR" "$(progress_file_size "$ENCRYPTED_BUNDLE")" "解密迁移包"; then
     exit 1
   fi
-  if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
+  if ! run_with_progress "解密" "${TGZ}.partial.$$" \
     "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
     "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
     rm -f "$TGZ"
-    RED "[ERR] 迁移包解密失败。"
+    fail_with_output "解密迁移包失败" "$(log_tail_text 10)" "执行 df -h 检查磁盘空间后重试"
     exit 1
   fi
   ENCRYPTION_SECRET=""
   ENCRYPTION_KEY=""
   MAC_KEY=""
-  OK "[OK] 迁移包解密完成"
   # 密文已通过认证并解密，后续只用明文包；尽早释放一份完整包的空间。
   [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$ENCRYPTED_BUNDLE"
-  if ! run_with_activity "扫描迁移包目录结构" archive_layout_is_safe "$TGZ"; then
-    RED "[ERR] 迁移包结构不安全或已损坏，拒绝解压。"
+  if ! run_with_activity "检查归档结构" archive_layout_is_safe "$TGZ"; then
+    error_user "迁移包结构不安全或已损坏，拒绝解压" "请在旧服务器重新运行备份"
     exit 1
   fi
   mkdir -p "$OUTDIR"
@@ -249,30 +276,33 @@ restore_main() {
   tgz_bytes="$(progress_file_size "$TGZ")"
   free_bytes="$(free_disk_bytes "$SESSION_DIR")"
   if [[ "$free_bytes" =~ ^[0-9]+$ ]] && ((free_bytes < tgz_bytes * 3 / 2)); then
-    YEL "[WARN] 磁盘剩余空间可能不足以解压迁移包（约需 $(human "$((tgz_bytes * 3 / 2))")），解压失败时请先清理磁盘。"
+    warn_user "磁盘剩余空间可能不足以解压迁移包（约需 $(human "$((tgz_bytes * 3 / 2))")）"
   fi
-  if ! run_with_activity "解压迁移包" tar -xzf "$TGZ" -C "$OUTDIR"; then
-    RED "[ERR] 解压失败，请检查磁盘空间或确认文件是否完整。"
+  if ! run_with_progress "解压" "count:${TGZ}.count" "$tgz_bytes" \
+    restore_extract "$TGZ" "$OUTDIR" "${TGZ}.count"; then
+    rm -f "${TGZ}.count"
+    fail_with_output "解压迁移包失败" "$(log_tail_text 10)" "执行 df -h 检查磁盘空间后重试"
     exit 1
   fi
+  rm -f "${TGZ}.count"
   [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$TGZ"
 
   local BUNDLE_DIR
   BUNDLE_DIR="$(restore_find_bundle_dir "$OUTDIR" "$RID" || true)"
   if [[ -z "$BUNDLE_DIR" || ! -f "${BUNDLE_DIR}/restore.sh" ]]; then
-    RED "[ERR] 未找到 restore.sh，解压内容异常：$OUTDIR"
+    error_user "迁移包内容不完整：找不到 restore.sh" "请在旧服务器重新运行备份"
     exit 1
   fi
-  if ! run_with_activity "校验迁移包内全部文件" \
+  if ! run_with_activity "校验每个文件" \
     verify_bundle_checksums "$BUNDLE_DIR"; then
-    RED "[ERR] 完整性校验未通过，拒绝恢复。"
+    error_user "迁移包文件校验失败，拒绝恢复" "请在旧服务器重新运行备份"
     exit 1
   fi
-  OK "[OK] 迁移包完整性校验通过"
   if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
-    RED "[ERR] manifest.json 结构或路径不安全，拒绝恢复。"
+    error_user "迁移包的 manifest 结构或路径不安全，拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
     exit 1
   fi
+  stage_end "$(human "$tgz_bytes")"
 
   # 使用当前脚本内置的修复版 restore.sh 覆盖包内旧 restore.sh。
   write_bundle_restore_script "${BUNDLE_DIR}/restore.sh"
@@ -282,8 +312,10 @@ restore_main() {
   local container_line="" data_line="" cleanup_line="" diagnostic_dir="" elapsed
   restore_client_begin_restore
   set +e
+  DM_SUMMARY_ARMED=1
   RESTORE_CHECKSUM_VERIFIED=1 RESTORE_SESSION_DIR="$SESSION_DIR" \
     RESTORE_RESULT_FILE="$result_file" RESTORE_DEFER_FINAL_SUMMARY=1 \
+    DM_STAGE_OFFSET=3 DM_STAGE_TOTAL=8 DM_SUMMARY_ARMED=1 \
     bash "${BUNDLE_DIR}/restore.sh"
   rc=$?
   set -e
@@ -357,5 +389,10 @@ restore_main() {
   print_restore_result_summary "$result_status" "$result_stage" "$container_line" "$data_line" \
     "$cleanup_line" "$diagnostic_dir" "$rollback_dir" "$elapsed"
   restore_client_finish_session
+  if [[ "$result_status" == "SUCCESS" ]]; then
+    log_finish 1
+  else
+    log_finish 0
+  fi
   exit "$rc"
 }

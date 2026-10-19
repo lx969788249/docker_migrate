@@ -5,12 +5,15 @@ umask 077
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$BUNDLE_DIR"
 
-say() { echo -e "\033[1;34m$*\033[0m"; }
-warn() { echo -e "\033[1;33m$*\033[0m"; }
-
 # @include lib/colors.sh
 
 # @include lib/common.sh
+
+# @include lib/log.sh
+
+# @include lib/screen.sh
+
+# @include lib/errors.sh
 
 # @include lib/progress.sh
 
@@ -20,12 +23,24 @@ warn() { echo -e "\033[1;33m$*\033[0m"; }
 
 # @include lib/containers.sh
 
+# 细节写入日志（--verbose 时也显示）；回滚等需要用户看到的过程用 warn。
+say() { detail "$*"; }
+warn() {
+  log_line "$*"
+  screen_clear_line
+  printf '    %s\n' "$*" >&2
+}
+
+# 恢复脚本的阶段编号：由主脚本调用时接在下载、校验之后（共 8 步），
+# 在迁移包目录手动执行时从 1 开始（共 5 步）。
+restore_stage() {
+  stage_begin "$((${DM_STAGE_OFFSET:-0} + $1))" "${DM_STAGE_TOTAL:-5}" "$2"
+}
+
+log_init restore-manual
+export DM_SUMMARY_ARMED=1
+
 restore_load_images() {
-  local archive="$1" total
-  if command -v pv >/dev/null 2>&1; then
-    total="$(progress_file_size "$archive")"
-    pv -f -s "$total" "$archive" | docker load
-  else
-    docker load -i "$archive"
-  fi
+  local archive="$1" count_file="${2:-}"
+  progress_meter "$count_file" <"$archive" | dm_quiet docker load
 }

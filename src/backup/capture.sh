@@ -102,11 +102,28 @@ collect_shared_running_containers() {
   done < <(docker ps --format '{{.ID}}\t{{.Names}}')
 }
 
+# 估算数据卷大小（字节），用于显示进度百分比；无法读取挂载点时输出 0。
+volume_size_bytes() {
+  local mountpoint
+  mountpoint="$(docker volume inspect -f '{{.Mountpoint}}' "$1" 2>/dev/null || true)"
+  [[ -n "$mountpoint" && -d "$mountpoint" ]] || {
+    echo 0
+    return 0
+  }
+  path_size_bytes "$mountpoint"
+}
+
+path_size_bytes() {
+  du -sk "$1" 2>/dev/null | awk '{ printf "%.0f\n", $1 * 1024 } END { if (NR == 0) print 0 }'
+}
+
+# count_file 非空时统计打包的原始字节数，供进度显示使用。
 archive_volume_to_gzip() {
-  local volume="$1" output="$2" rc=0
+  local volume="$1" output="$2" count_file="${3:-/dev/null}" rc=0
   rm -f -- "$output"
   if docker run --rm -v "${volume}:/from:ro" alpine:3.20 \
-    tar -C /from -cf - . | gzip_compress_stream >"$output"; then
+    tar -C /from -cf - . 2>>"${DM_LOG_FILE:-/dev/null}" |
+    progress_meter "$count_file" | gzip_compress_stream >"$output"; then
     return 0
   else
     rc=$?
@@ -116,9 +133,10 @@ archive_volume_to_gzip() {
 }
 
 archive_bind_to_gzip() {
-  local source="$1" output="$2" rc=0
+  local source="$1" output="$2" count_file="${3:-/dev/null}" rc=0
   rm -f -- "$output"
-  if tar -C / -cf - "${source#/}" | gzip_compress_stream >"$output"; then
+  if tar -C / -cf - "${source#/}" 2>>"${DM_LOG_FILE:-/dev/null}" |
+    progress_meter "$count_file" | gzip_compress_stream >"$output"; then
     return 0
   else
     rc=$?
@@ -133,47 +151,42 @@ docker_stop_batch_verified() {
   local name running stop_rc=0 verify_rc=0
   (($# > 0)) || return 0
 
-  run_with_activity "$label" docker stop "$@" >/dev/null || stop_rc=$?
+  DM_PROGRESS_HINT="容器正在处理退出信号，最长等待约 10 秒后会被强制停止" \
+    run_with_activity "$label" dm_quiet docker stop "$@" || stop_rc=$?
   # Docker CLI 的聚合退出码无法指出具体失败项；以 daemon 的最终状态为准，
   # 同时逐个确认，避免部分停止后误以为已经取得一致性快照。
   for name in "$@"; do
     if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)"; then
-      RED "[ERR] 停机后无法确认容器状态：$name"
+      log_line "停机后无法确认容器状态：$name"
       verify_rc=1
     elif [[ "$running" != "false" ]]; then
-      RED "[ERR] 容器仍在运行：$name"
+      log_line "容器仍在运行：$name"
       verify_rc=1
     fi
   done
   ((verify_rc == 0)) || return 1
   if ((stop_rc != 0)); then
-    YEL "[WARN] docker stop 返回异常，但已逐个确认所有目标容器停止。"
+    log_line "docker stop 返回异常，但已逐个确认所有目标容器停止"
   fi
   return 0
 }
 
+# 保存镜像到 images.tar，按镜像层总大小显示进度。
 progress_docker_save() {
-  local outfile="$1"
-  shift
-  local rc=0 started=$SECONDS current=0 restore_errexit=0
-  if command -v pv >/dev/null 2>&1; then
-    case $- in *e*) restore_errexit=1 ;; esac
-    set +e
-    # -f 保证日志被重定向时也持续输出；pipefail 保留 docker save 的失败状态。
-    "$@" | pv -f -b >"$outfile"
-    rc=$?
-    ((restore_errexit == 0)) || set -e
-    current="$(progress_file_size "$outfile")"
-    progress_finish "保存镜像 images.tar" "$rc" "$((SECONDS - started))" "$current"
-  else
-    if run_with_file_progress "保存镜像 images.tar" "$outfile" 0 \
-      progress_capture_stdout "$outfile" "$@"; then
-      rc=0
-    else
-      rc=$?
-    fi
-  fi
-  return "$rc"
+  local outfile="$1" total="$2"
+  shift 2
+  DM_PROGRESS_HINT="镜像较大时需要几分钟，请耐心等待" \
+    run_with_progress "保存镜像" "$outfile" "$total" \
+    progress_capture_stdout "$outfile" dm_logged "$@"
+}
+
+# 镜像大小之和，作为 docker save 输出大小的估算值。
+images_total_bytes() {
+  (($# > 0)) || {
+    echo 0
+    return 0
+  }
+  docker image inspect -f '{{.Size}}' "$@" 2>/dev/null | awk '{ s += $1 } END { printf "%.0f\n", s }'
 }
 
 snapshot_image_ref() {
@@ -191,7 +204,7 @@ snapshot_container_image() {
   running="$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || echo false)"
   # 用户选择不停机时不偷偷暂停业务；这种模式本身已明确提示快照可能不一致。
   [[ "$running" != "true" ]] || commit_args+=(--pause=false)
-  if ! "${commit_args[@]}" "$container_id" "$snapshot_image" >/dev/null; then
+  if ! dm_quiet "${commit_args[@]}" "$container_id" "$snapshot_image"; then
     return 1
   fi
   TEMP_IMAGES+=("$snapshot_image")
@@ -278,7 +291,7 @@ cleanup_snapshot_images() {
   local image rc=0
   local -a remaining=()
   for image in "${TEMP_IMAGES[@]}"; do
-    if docker image rm "$image" >/dev/null 2>&1; then
+    if dm_quiet docker image rm "$image"; then
       continue
     fi
     # rm 失败后，只有在 Docker daemon 可用且明确查不到镜像时才视为已清理；

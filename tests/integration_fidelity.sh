@@ -180,7 +180,7 @@ include_list="$(
 )"
 (
   cd "$tmp"
-  exec env PORT=$((port_base + 2)) ADVERTISE_HOST=127.0.0.1 \
+  exec env PORT=$((port_base + 2)) ADVERTISE_HOST=127.0.0.1 DOCKER_MIGRATE_VERBOSE=1 \
     STOP_SHARED_MOUNTS=1 \
     DOCKER_MIGRATE_LOCK_BASE="${tmp}/source-locks" \
     DOCKER_MIGRATE_IGNORE_CONTAINERS="$ignore_container" \
@@ -210,7 +210,7 @@ fi
 [[ "$(docker inspect -f '{{.State.Status}}' "$paused_name")" == "paused" ]]
 [[ "$(docker inspect -f '{{.State.Status}}' "$stopped_name")" == "created" ]]
 grep -Fq '宿主机系统路径只在新服务器重建挂载' "$backup_log"
-grep -Fq 'bind 源是软链接，备份真实目录' "$backup_log"
+grep -Fq '挂载路径是软链接，备份它指向的真实目录' "$backup_log"
 grep -Fq "沿用原镜像" "$backup_log"
 
 # 模拟全新的目标服务器：删除容器、网络、卷、镜像与宿主机目录。

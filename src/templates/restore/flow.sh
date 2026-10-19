@@ -3,17 +3,15 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 RESTORE_STAGE="迁移包校验"
-if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" == "1" ]]; then
-  :
-else
-  say "[0] 验证迁移包完整性"
-  if ! run_with_activity "校验迁移包内全部文件" verify_bundle_checksums "$BUNDLE_DIR"; then
-    warn "迁移包完整性校验失败，拒绝恢复。"
+restore_stage 1 "预检数据"
+if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" != "1" ]]; then
+  if ! run_with_activity "校验每个文件" verify_bundle_checksums "$BUNDLE_DIR"; then
+    error_user "迁移包文件校验失败，拒绝恢复" "请在旧服务器重新运行备份"
     exit 1
   fi
 fi
 if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
-  warn "迁移包 manifest 结构或路径不安全，拒绝恢复。"
+  error_user "迁移包的 manifest 结构或路径不安全，拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
   exit 1
 fi
 if ! transaction_internal_paths_are_safe; then
@@ -23,20 +21,19 @@ fi
 RESTORE_STAGE="预检数据归档"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! command -v python3 >/dev/null 2>&1; then
-  warn "缺少 python3，尚未停止服务或修改数据；请使用主脚本「下载备份并恢复」自动补齐依赖。"
+  error_user "缺少 python3（尚未停止服务或修改数据）" "安装 python3，或使用主脚本「下载备份并恢复」自动安装依赖"
   exit 1
 fi
-say "[0.1] 在停止目标服务前预检 volume 与 bind 归档"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r row; do
     vname="$(jq -r '.name' <<<"$row")"
     file="vol_${vname}.tgz"
     if [[ ! -f "volumes/$file" ]]; then
-      warn " 命名卷缺少备份文件：$vname（volumes/$file）"
+      error_user "迁移包缺少数据卷 ${vname} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_VOLUMES+=("$vname")
-    elif ! run_with_activity "预检命名卷归档：$vname" \
+    elif ! run_with_activity "检查卷 ${vname}" \
       archive_members_safe "volumes/$file"; then
-      warn " 命名卷归档结构异常：$vname"
+      error_user "数据卷 ${vname} 的备份文件结构异常" "请在旧服务器重新运行备份"
       FAILED_VOLUMES+=("$vname")
     fi
   done < <(jq -c '.volumes[]' manifest.json)
@@ -47,13 +44,13 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     file="$(jq -r '.file' <<<"$row")"
     bind_prefix="${host#/}"
     if bind_path_is_system "$host"; then
-      warn " 跳过宿主机系统路径，只重建挂载、不覆盖目标端：$host"
+      say "跳过宿主机系统路径，只重建挂载、不覆盖目标端：$host"
     elif [[ ! -f "binds/$file" ]]; then
-      warn " 绑定目录缺少备份文件：$host（binds/$file）"
+      error_user "迁移包缺少挂载目录 ${host} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_BINDS+=("$host")
-    elif ! run_with_activity "预检绑定目录归档：$host" \
+    elif ! run_with_activity "检查目录 ${host}" \
       archive_members_safe "binds/$file" "$bind_prefix"; then
-      warn " 绑定目录归档结构异常：$host"
+      error_user "挂载目录 ${host} 的备份文件结构异常" "请在旧服务器重新运行备份"
       FAILED_BINDS+=("$host")
     fi
   done < <(jq -c '.binds[]' manifest.json)
@@ -62,40 +59,50 @@ if ((${#FAILED_VOLUMES[@]} > 0 || ${#FAILED_BINDS[@]} > 0)); then
   print_failure_summary
   exit 1
 fi
+stage_end "$(jq -r '"\(.volumes | length) 个卷 · \(.binds | length) 个目录"' manifest.json)"
 
 RESTORE_STAGE="加载镜像"
-say "[A] 加载镜像（如 images.tar 存在）"
+restore_stage 2 "加载镜像"
 if [[ -f images.tar ]]; then
-  run_with_activity "加载镜像归档 images.tar" restore_load_images images.tar ||
-    warn "部分镜像加载失败，将尝试在线拉取"
+  images_count_file="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-load.XXXXXX")"
+  DM_PROGRESS_HINT="镜像较大时需要几分钟，请耐心等待" \
+    run_with_progress "加载镜像" "count:${images_count_file}" "$(progress_file_size images.tar)" \
+    restore_load_images images.tar "$images_count_file" ||
+    warn_user "部分镜像加载失败，创建容器时会尝试在线拉取"
+  rm -f "$images_count_file" "${images_count_file}.tmp"
+  stage_end "$(human "$(progress_file_size images.tar)")"
 else
-  warn "images.tar 不存在，将按需在线拉取镜像。"
+  warn_user "迁移包里没有镜像，创建容器时会在线拉取"
+  stage_end
 fi
 
 RESTORE_STAGE="建立统一回滚事务"
-say "[A.1] 建立目标端服务与数据统一回滚事务"
+restore_stage 3 "建立回滚点"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
-  run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 || {
-    warn "无法准备 alpine:3.20；为避免在无回滚能力时修改数据，恢复终止。"
+  DM_PROGRESS_HINT="正在从 Docker Hub 下载，网络较慢时可能需要几分钟" \
+    run_with_activity "拉取卷操作镜像 alpine:3.20" dm_quiet docker pull alpine:3.20 || {
+    fail_with_output "无法拉取卷操作镜像 alpine:3.20（尚未修改任何数据）" "$(log_tail_text 10)" \
+      "检查服务器能否访问 Docker Hub，或先手动执行 docker pull alpine:3.20"
     exit 1
   }
 fi
 transaction_prepare
+stage_end
 
 RESTORE_STAGE="回灌命名卷"
-say "[B] 回灌命名卷"
+restore_stage 4 "恢复数据"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p volumes
   while IFS= read -r row; do
     vname=$(jq -r '.name' <<<"$row")
     file="vol_${vname}.tgz"
     if [[ ! -f "volumes/$file" ]]; then
-      warn " 命名卷缺少备份文件：$vname（volumes/$file）"
+      error_user "迁移包缺少数据卷 ${vname} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_VOLUMES+=("$vname")
       break
     fi
-    echo " - ${vname}"
+    say "恢复数据卷：${vname}"
     # 使用备份时记录的 driver 和 options 创建卷；同名卷已存在时必须先
     # 核对后端，绝不能把 NFS/plugin 数据误写进碰巧同名的 local 卷。
     v_driver=$(jq -r '.driver // "local"' <<<"$row")
@@ -107,7 +114,8 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       actual_volume_opts="$(docker volume inspect "$vname" | jq -cS '.[0].Options // {}')"
       if [[ "$actual_volume_driver" != "$v_driver" ||
         "$actual_volume_opts" != "$desired_volume_opts" ]]; then
-        warn " 已存在同名但 driver/options 不同的卷，拒绝覆盖：$vname"
+        error_user "已存在同名但驱动或参数不同的数据卷 ${vname}，拒绝覆盖" \
+          "确认新服务器上的这个卷可以删除后，执行 docker volume rm ${vname} 再重试"
         FAILED_VOLUMES+=("$vname")
         break
       fi
@@ -118,17 +126,18 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
         volume_create_args+=(--opt "$volume_opt")
       done
       volume_create_args+=("$vname")
-      if ! "${volume_create_args[@]}" >/dev/null; then
-        warn " 卷创建失败（driver=$v_driver）：$vname"
+      if ! dm_quiet "${volume_create_args[@]}"; then
+        fail_with_output "数据卷 ${vname} 创建失败（驱动 ${v_driver}）" "$(log_tail_text 10)" \
+          "非 local 驱动的卷需要先在新服务器安装对应的卷插件"
         FAILED_VOLUMES+=("$vname")
         break
       fi
     fi
-    if ! run_with_activity "回灌命名卷：$vname" \
+    if ! run_with_activity "卷 ${vname}" \
       restore_data_with_diagnostics "命名卷：$vname" \
       restore_volume_exact "$vname" "$PWD/volumes" "$file" \
       "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed" 1; then
-      warn " 恢复卷 ${vname} 失败，终止恢复"
+      fail_with_output "恢复数据卷 ${vname} 失败" "$(log_tail_text 20)"
       FAILED_VOLUMES+=("$vname")
       break
     fi
@@ -142,7 +151,6 @@ if ((${#FAILED_VOLUMES[@]} > 0)); then
 fi
 
 RESTORE_STAGE="回灌绑定目录"
-say "[C] 回灌绑定目录"
 if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p binds
   while IFS= read -r row; do
@@ -151,20 +159,21 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     bind_link=$(jq -r '.link // empty' <<<"$row")
     bind_path_is_system "$host" && continue
     if [[ ! -f "binds/$file" ]]; then
-      warn " 绑定目录缺少备份文件：$host（binds/$file）"
+      error_user "迁移包缺少挂载目录 ${host} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_BINDS+=("$host")
       break
     fi
-    echo " - ${host}"
-    if ! run_with_activity "回灌绑定目录：$host" \
+    say "恢复挂载目录：${host}"
+    if ! run_with_activity "目录 ${host}" \
       restore_data_with_diagnostics "绑定目录：$host" \
       restore_bind_exact "$host" "$PWD/binds/${file}" 1; then
-      warn " 恢复绑定目录失败，终止恢复：$host"
+      fail_with_output "恢复挂载目录 ${host} 失败" "$(log_tail_text 20)"
       FAILED_BINDS+=("$host")
       break
     fi
     if ! restore_bind_link "$bind_link" "$host"; then
-      warn " 无法在原路径重建软链接，终止恢复：$bind_link -> $host"
+      error_user "无法在原路径重建软链接：${bind_link} -> ${host}" \
+        "确认 ${bind_link} 在新服务器上没有被其他文件或目录占用"
       FAILED_BINDS+=("$bind_link")
       break
     fi
@@ -176,9 +185,55 @@ if ((${#FAILED_VOLUMES[@]} > 0 || ${#FAILED_BINDS[@]} > 0)); then
   print_failure_summary
   exit 1
 fi
+stage_end
+
+# 在 run_with_activity 中启动一个 Compose 项目：命令输出写入日志，屏幕只显示进度。
+compose_start_project() {
+  local compose_dir="$1" name="$2" compose_impl="$3"
+  local compose_log="${DM_LOG_FILE:-/dev/null}"
+  (
+    cd "$compose_dir"
+    COMPOSE_IMPL="$compose_impl"
+    compose_run "${COMPOSE_FILE_ARGS[@]}" config >/dev/null 2>>"$compose_log" || exit 1
+    compose_prepare_networks "$name" "${COMPOSE_FILE_ARGS[@]}" >>"$compose_log" 2>&1 || exit 1
+    declare -a source_state_records=() start_services=() pause_services=()
+    mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
+    say "Compose 项目 ${name}：读取到 ${#source_state_records[@]} 条源端服务状态"
+    if ((${#source_state_records[@]} == 0)); then
+      error_user "迁移包缺少 Compose 项目 ${name} 的服务状态记录" "请用最新版脚本在旧服务器重新运行备份"
+      exit 1
+    fi
+    log_line "\$ compose up --no-start（${name}）"
+    compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start >>"$compose_log" 2>&1 || exit 1
+    for state_record in "${source_state_records[@]}"; do
+      service="${state_record%%$'\t'*}"
+      state="${state_record#*$'\t'}"
+      case "$state" in
+        running) start_services+=("$service") ;;
+        paused)
+          start_services+=("$service")
+          pause_services+=("$service")
+          ;;
+      esac
+    done
+    if ((${#start_services[@]} > 0)); then
+      log_line "\$ compose start ${start_services[*]}（${name}）"
+      compose_run "${COMPOSE_FILE_ARGS[@]}" start "${start_services[@]}" >>"$compose_log" 2>&1 || exit 1
+      compose_wait_services "${RESTORE_HEALTH_TIMEOUT:-60}" \
+        "${COMPOSE_FILE_ARGS[@]}" -- "${start_services[@]}" || exit 1
+    fi
+    compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
+    for service in "${pause_services[@]}"; do
+      while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        dm_quiet docker pause "$id" || exit 1
+      done < <(compose_run "${COMPOSE_FILE_ARGS[@]}" ps -q "$service" 2>>"$compose_log")
+    done
+  )
+}
 
 RESTORE_STAGE="恢复 Compose 项目"
-say "[D] 恢复 Compose 项目"
+restore_stage 5 "启动服务"
 if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
   COMPOSE_RESTORE_ROOT="${RESTORE_TRANSACTION_DIR}/incoming_compose"
   mkdir -p "$COMPOSE_RESTORE_ROOT"
@@ -186,11 +241,11 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     USE_WDIR=0
     name=$(jq -r '.name' <<<"$row")
     wdir=$(jq -r '.working_dir // ""' <<<"$row")
-    echo " - project: $name"
+    say "恢复 Compose 项目：${name}"
     mkdir -p "${COMPOSE_RESTORE_ROOT}/${name}"
 
     if [[ -n "${SKIP_PROJECTS[$name]:-}" ]]; then
-      warn " · Compose 项目已存在，按 RESTORE_EXISTING=skip 保持不变：$name"
+      warn_user "Compose 项目 ${name} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       continue
     fi
 
@@ -199,7 +254,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     elif command -v docker-compose >/dev/null 2>&1; then
       compose_impl="legacy"
     else
-      warn " 新机未安装 docker compose/docker-compose，跳过该项目。"
+      error_user "新服务器没有安装 docker compose" "安装 docker-compose-plugin 后重试"
       FAILED_PROJECTS+=("$name")
       continue
     fi
@@ -214,7 +269,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     printf '%s\n' "$name" >>"${RESTORE_TRANSACTION_DIR}/compose_replaced.list"
 
     if [[ -n "$wdir" ]]; then
-      echo " · 还原 compose 配置到原路径：$wdir"
+      say "还原 Compose 配置到原路径：$wdir"
       transaction_install_tree "compose/${name}" "$wdir"
       # 如果 wdir 存在且 compose 文件已还原到 wdir，则从 wdir 执行 compose up
       # 这确保 1Panel / 宝塔等使用相对路径 bind mount 的 compose 项目能正确解析路径
@@ -250,47 +305,13 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       compose_dir="${COMPOSE_RESTORE_ROOT}/${name}"
     fi
     compose_rc=0
-    (
-      cd "$compose_dir"
-      COMPOSE_IMPL="$compose_impl"
-      compose_run "${COMPOSE_FILE_ARGS[@]}" config >/dev/null || exit 1
-      compose_prepare_networks "$name" "${COMPOSE_FILE_ARGS[@]}" || exit 1
-      declare -a source_state_records=() start_services=() pause_services=()
-      mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
-      echo " · 已读取 ${#source_state_records[@]} 条源端服务状态"
-      if ((${#source_state_records[@]} == 0)); then
-        warn " · 迁移包缺少 Compose 服务的源端状态记录：$name"
-        exit 1
-      else
-        compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start 2>&1 || exit 1
-        for state_record in "${source_state_records[@]}"; do
-          service="${state_record%%$'\t'*}"
-          state="${state_record#*$'\t'}"
-          case "$state" in
-            running) start_services+=("$service") ;;
-            paused)
-              start_services+=("$service")
-              pause_services+=("$service")
-              ;;
-          esac
-        done
-        if ((${#start_services[@]} > 0)); then
-          compose_run "${COMPOSE_FILE_ARGS[@]}" start "${start_services[@]}" 2>&1 || exit 1
-          compose_wait_services "${RESTORE_HEALTH_TIMEOUT:-60}" \
-            "${COMPOSE_FILE_ARGS[@]}" -- "${start_services[@]}" || exit 1
-        fi
-        compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
-        for service in "${pause_services[@]}"; do
-          while IFS= read -r id; do
-            [[ -n "$id" ]] || continue
-            docker pause "$id" >/dev/null || exit 1
-          done < <(compose_run "${COMPOSE_FILE_ARGS[@]}" ps -q "$service")
-        done
-      fi
-    ) || compose_rc=$?
+    DM_PROGRESS_HINT="正在等待服务启动与健康检查（最长 ${RESTORE_HEALTH_TIMEOUT:-60} 秒）" \
+      run_with_activity "Compose 项目 ${name}" \
+      compose_start_project "$compose_dir" "$name" "$compose_impl" || compose_rc=$?
 
     if ((compose_rc != 0)); then
-      warn " · 新 Compose 项目启动失败：$name"
+      fail_with_output "Compose 项目 ${name} 启动失败" "$(log_tail_text 30)" \
+        "执行 docker compose -p ${name} logs 查看服务日志"
       FAILED_PROJECTS+=("$name")
       print_failure_summary
       exit 1
@@ -299,7 +320,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
 fi
 
 RESTORE_STAGE="创建独立容器网络"
-say "[E] 创建独立容器自定义网络（非 Compose）"
+say "创建自定义网络"
 declare -A COMPOSE_NETS=()
 while IFS= read -r n; do
   [[ -n "$n" ]] || continue
@@ -314,6 +335,8 @@ if jq -e '.networks|length>0' manifest.json >/dev/null 2>&1; then
       continue
     fi
     if ! create_network_from_record "$network_row"; then
+      [[ -n "$(fail_reason_read || true)" ]] ||
+        fail_with_output "网络 ${n} 创建失败" "$(log_tail_text 10)" "检查是否与新服务器已有网络的网段冲突"
       FAILED_NETWORKS+=("$n")
     fi
   done < <(jq -c '.networks[]' manifest.json)
@@ -375,19 +398,19 @@ restore_runs_in_dependency_order() {
 }
 
 RESTORE_STAGE="恢复独立容器"
-say "[F] 恢复单容器（非 Compose）"
 if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
     cname_from_script="${r#runs/}"
     cname_from_script="${cname_from_script%.sh}"
     if [[ -n "${SKIP_CONTAINERS[$cname_from_script]:-}" ]]; then
-      warn " 同名单容器按 RESTORE_EXISTING=skip 保持不变：$cname_from_script"
+      warn_user "容器 ${cname_from_script} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       continue
     fi
-    echo " - $r"
-    if ! RESTORE_TRANSACTION_DIR="$RESTORE_TRANSACTION_DIR" bash "$r" 2>&1; then
-      warn " 容器恢复脚本失败：$r"
+    say "恢复容器：${cname_from_script}"
+    if ! RESTORE_TRANSACTION_DIR="$RESTORE_TRANSACTION_DIR" bash "$r"; then
+      [[ -n "$(fail_reason_read || true)" ]] ||
+        error_user "容器 ${cname_from_script} 恢复失败" "查看下方日志中的最后几行了解详情"
       FAILED_CONTAINERS+=("$cname_from_script")
       print_failure_summary
       exit 1
@@ -401,3 +424,4 @@ if restore_has_failures; then
 fi
 
 transaction_commit
+stage_end "$(jq -r '"\(.runs | length) 个容器 · \(.projects | length) 个 Compose 项目"' manifest.json)"

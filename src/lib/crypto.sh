@@ -143,7 +143,7 @@ gzip_compress_stream() {
 
 bundle_pack_encrypt_directory() {
   local bundle_root="$1" member="$2" output="$3"
-  local encryption_key="$4" mac_key="$5" iv="$6"
+  local encryption_key="$4" mac_key="$5" iv="$6" count_file="${7:-}"
   local result sha mac extra rc=0
   [[ -d "${bundle_root}/${member}" ]] || return 1
   valid_hex_length "$encryption_key" 64 || return 2
@@ -157,6 +157,7 @@ bundle_pack_encrypt_directory() {
     # 密文也无需为了 HMAC/SHA 再从磁盘完整读取一次。
     if result="$(
       tar -C "$bundle_root" -cf - "$member" |
+        progress_meter "$count_file" |
         gzip_compress_stream |
         openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$iv" |
         python3 -c '
@@ -188,6 +189,7 @@ print(sha.hexdigest() + "\t" + mac.hexdigest())
   else
     # 无 Python 时仍保留流式压缩加密和格式兼容，只在生成后回退为摘要扫描。
     if tar -C "$bundle_root" -cf - "$member" |
+      progress_meter "$count_file" |
       gzip_compress_stream |
       openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$iv" \
         -out "$output"; then

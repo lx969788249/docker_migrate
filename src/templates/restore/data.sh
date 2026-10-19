@@ -55,7 +55,7 @@ restore_volume_exact() {
     volume_clear_and_extract "$volume" "$rollback_dir" "$rollback_file" 0 || return 1
     rm -f "${rollback_dir}/${rollback_file}"
   else
-    docker volume rm "$volume" >/dev/null 2>&1 || true
+    dm_quiet docker volume rm "$volume" || true
   fi
   return 1
 }
@@ -65,6 +65,20 @@ restore_data_with_diagnostics() {
   # 撤销 local 再执行 EXIT trap，trap 将读不到日志路径。
   local label="$1" logfile rc
   shift
+  # 有运行日志时，数据操作的输出直接追加进去；失败原因由调用方统一说明。
+  if [[ -n "${DM_LOG_FILE:-}" ]]; then
+    log_line "开始：${label}"
+    RESTORE_ACTIVE_DATA_LOG="$DM_LOG_FILE"
+    if "$@" >>"$DM_LOG_FILE" 2>&1; then
+      RESTORE_ACTIVE_DATA_LOG=""
+      return 0
+    else
+      rc=$?
+    fi
+    RESTORE_ACTIVE_DATA_LOG=""
+    log_line "失败：${label}（退出码 ${rc}）"
+    return "$rc"
+  fi
   # 日志置于迁移包旁，不混入包内校验清单，也不随事务回滚点一起删除。
   # mktemp + umask 077 防止覆盖已有路径或泄露数据库文件信息。
   logfile="$(mktemp "${BUNDLE_DIR}/../docker-migrate-data.XXXXXX")" || {
@@ -91,7 +105,8 @@ restore_diagnostic_output() {
   # 输出，确保手动恢复模式下也能看见回滚进度和最终结果。
   if [[ -n "${RESTORE_ACTIVE_DATA_LOG:-}" ]]; then
     exec 1>&202 2>&203
-    printf '详细日志：%s\n' "$RESTORE_ACTIVE_DATA_LOG" >&2
+    [[ "$RESTORE_ACTIVE_DATA_LOG" == "${DM_LOG_FILE:-}" ]] ||
+      printf '详细日志：%s\n' "$RESTORE_ACTIVE_DATA_LOG" >&2
   fi
 }
 

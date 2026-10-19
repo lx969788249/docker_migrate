@@ -1,7 +1,7 @@
 #####################################
 # 元数据采集
 #####################################
-BLUE "[INFO] 采集容器元数据 ..."
+stage_begin 3 7 "读取配置"
 declare -A IMGSET=()
 declare -A NETWORKS=()
 declare -A CONTAINER_NAME=()
@@ -17,7 +17,7 @@ metadata_total=${#IDS[@]}
 metadata_index=0
 for id in "${IDS[@]}"; do
   metadata_index=$((metadata_index + 1))
-  progress_count "分析所选容器" "$metadata_index" "$metadata_total" "$id"
+  progress_count "分析容器" "$metadata_index" "$metadata_total" "$id"
   jtmp="$(docker inspect "$id")"
   SELECTED_INSPECT_JSON["$id"]="$jtmp"
   projtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$jtmp")
@@ -47,7 +47,7 @@ for id in "${IDS[@]}"; do
   metadata_index=$((metadata_index + 1))
   j="${SELECTED_INSPECT_JSON[$id]}"
   name=$(jq -r '.[0].Name | ltrimstr("/")' <<<"$j")
-  progress_count "采集容器元数据" "$metadata_index" "$metadata_total" "$name"
+  progress_count "读取容器配置" "$metadata_index" "$metadata_total" "$name"
   img=$(jq -r '.[0].Config.Image' <<<"$j")
   CONTAINER_NAME["$id"]="$name"
   IMGSET["$img"]=1
@@ -123,7 +123,7 @@ done
 # 打包 Compose 配置（绝对/相对路径）
 #####################################
 if ((${#COMPOSE_GROUP[@]})); then
-  BLUE "[INFO] 打包 docker compose 项目配置 ..."
+  detail "打包 Docker Compose 项目配置"
   compose_total=${#COMPOSE_GROUP[@]}
   compose_index=0
   for key in "${!COMPOSE_GROUP[@]}"; do
@@ -167,17 +167,18 @@ if ((${#COMPOSE_GROUP[@]})); then
     # 使用全部 -f 文件生成规范配置，合并覆盖文件并解析 env_file。
     if ((${#CFG_SOURCE_ARGS[@]} > 0)); then
       resolved_tmp="${dest}/.resolved_config.yml.tmp"
-      BLUE "[INFO] 解析 Compose 配置：$proj"
+      detail "解析 Compose 配置：$proj"
+      compose_log="${DM_LOG_FILE:-/dev/null}"
       if docker compose version >/dev/null 2>&1 &&
-        { docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>/dev/null ||
-          docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>/dev/null; }; then
+        { docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>>"$compose_log" ||
+          docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>>"$compose_log"; }; then
         mv "$resolved_tmp" "${dest}/_resolved_config.yml"
       elif command -v docker-compose >/dev/null 2>&1 &&
-        (cd "$wdir" && docker-compose "${CFG_SOURCE_ARGS[@]}" config) >"$resolved_tmp" 2>/dev/null; then
+        (cd "$wdir" && docker-compose "${CFG_SOURCE_ARGS[@]}" config) >"$resolved_tmp" 2>>"$compose_log"; then
         mv "$resolved_tmp" "${dest}/_resolved_config.yml"
       else
         rm -f "$resolved_tmp"
-        YEL "[WARN] 无法生成解析后的 Compose 配置，将使用原始配置文件。"
+        warn_user "Compose 项目 ${proj} 无法生成解析后的配置，将使用原始配置文件"
       fi
     fi
 

@@ -8,7 +8,7 @@ transaction_remove_new_services() {
       if [[ -n "$backup" ]]; then
         if transaction_container_exists "$backup"; then
           if transaction_container_exists "$name"; then
-            docker rm -f "$name" >/dev/null 2>&1 || true
+            dm_quiet docker rm -f "$name" || true
             if transaction_container_exists "$name"; then
               warn " · 无法静默并删除本次新建的单容器：$name"
               rc=1
@@ -22,7 +22,7 @@ transaction_remove_new_services() {
           rc=1
         fi
       elif [[ "$had_old" == "0" ]]; then
-        docker rm -f "$name" >/dev/null 2>&1 || true
+        dm_quiet docker rm -f "$name" || true
         if transaction_container_exists "$name"; then
           warn " · 无法静默并删除本次新建的单容器：$name"
           rc=1
@@ -37,7 +37,7 @@ transaction_remove_new_services() {
       grep -Fxq "$project" "${RESTORE_TRANSACTION_DIR}/compose_replaced.list" || continue
       while IFS= read -r id; do
         [[ -n "$id" ]] || continue
-        docker rm -f "$id" >/dev/null 2>&1 || rc=1
+        dm_quiet docker rm -f "$id" || rc=1
       done < <(docker ps -a --filter "label=com.docker.compose.project=${project}" --format '{{.ID}}')
       if [[ -n "$(docker ps -a --filter "label=com.docker.compose.project=${project}" \
         --format '{{.ID}}')" ]]; then
@@ -63,7 +63,7 @@ transaction_restore_volumes() {
         warn " · 命名卷数据回滚失败：$volume"
         rc=1
       fi
-    elif ! docker volume rm "$volume" >/dev/null 2>&1; then
+    elif ! dm_quiet docker volume rm "$volume"; then
       warn " · 无法删除本次新建的命名卷：$volume"
       rc=1
     fi
@@ -123,7 +123,7 @@ transaction_restore_standalones() {
       backup="$(awk -F '\t' -v name="$name" '$1 == name { print $2; exit }' \
         "${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv")"
       if [[ -n "$backup" ]] && transaction_container_exists "$backup"; then
-        docker rm -f "$name" >/dev/null 2>&1 || true
+        dm_quiet docker rm -f "$name" || true
         if ! rename_container_with_retry "$backup" "$name"; then
           warn " · 无法恢复旧单容器名称：$name（回滚点：$backup）"
           rc=1
@@ -192,7 +192,7 @@ transaction_cleanup_artifacts() {
   if [[ -f "${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv" ]]; then
     while IFS=$'\t' read -r name backup state; do
       [[ -n "$backup" ]] || continue
-      if ! docker rm -f "$backup" >/dev/null 2>&1; then
+      if ! dm_quiet docker rm -f "$backup"; then
         if ! docker info >/dev/null 2>&1 || transaction_container_exists "$backup"; then
           warn " · 无法清理旧单容器回滚点：$backup"
           rc=1
@@ -207,7 +207,7 @@ transaction_cleanup_artifacts() {
       [[ -f "${rollback_dir}/images.list" ]] || continue
       while IFS= read -r image; do
         [[ -n "$image" ]] || continue
-        if ! docker image rm "$image" >/dev/null 2>&1; then
+        if ! dm_quiet docker image rm "$image"; then
           if ! docker info >/dev/null 2>&1 ||
             docker image inspect "$image" >/dev/null 2>&1; then
             warn " · 无法清理 Compose 回滚镜像：$image"

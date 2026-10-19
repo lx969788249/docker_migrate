@@ -36,7 +36,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.4.0"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -47,6 +47,12 @@ declare -a TEMP_IMAGES=()
 # @include lib/colors.sh
 
 # @include lib/common.sh
+
+# @include lib/log.sh
+
+# @include lib/screen.sh
+
+# @include lib/errors.sh
 
 # @include lib/ui.sh
 
@@ -69,6 +75,8 @@ declare -a TEMP_IMAGES=()
 # @include templates.sh
 
 # @include restore/client.sh
+
+# @include diagnose.sh
 
 # @include entry.sh
 

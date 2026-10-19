@@ -20,6 +20,8 @@ print_restore_result_summary() {
       [[ -z "$container_line" ]] || printf '%s\n' "$container_line"
       [[ -z "$data_line" ]] || printf '%s\n' "$data_line"
       printf '验证：完整性校验、服务启动与健康检查均已通过\n'
+      print_stage_timings
+      print_warning_summary
       ;;
     FAILED_ROLLED_BACK)
       printf '结果：❌ 恢复失败，已安全回滚\n'
@@ -59,6 +61,10 @@ print_restore_result_summary() {
   [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
   [[ -z "$diagnostic_dir" ]] || printf '诊断目录：%s\n' "$diagnostic_dir"
   [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+  if [[ "$status" != "SUCCESS" ]]; then
+    print_warning_summary
+    print_failure_details
+  fi
   result_end_rule
 }
 
@@ -73,6 +79,8 @@ print_source_result_summary() {
       printf '结果：✅ 源端任务已安全结束\n'
       [[ -z "$source_line" ]] || printf '源容器：%s\n' "$source_line"
       [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+      print_stage_timings
+      print_warning_summary
       result_end_rule
       return 0
       ;;
@@ -84,6 +92,8 @@ print_source_result_summary() {
   [[ -z "$source_line" ]] || printf '源容器：%s\n' "$source_line"
   [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
   [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+  print_warning_summary
+  print_failure_details
   result_end_rule
 }
 
@@ -137,8 +147,12 @@ BANNER
 show_help() {
   cat <<'HLP'
 用法:
-  bash docker_migrate_perfect.sh [--backup] [--no-stop] [--include=name1,name2]
-  bash docker_migrate_perfect.sh --restore[=URL]
+  bash docker_migrate_perfect.sh [--backup] [--no-stop] [--include=name1,name2] [--verbose]
+  bash docker_migrate_perfect.sh --restore[=URL] [--verbose]
+  bash docker_migrate_perfect.sh --diagnose
+
+  --verbose                 在屏幕上显示每一步的细节（默认只写进日志）
+  --diagnose                收集系统、Docker 与最近日志，生成可附到 issue 的诊断文件
 
 环境变量:
   PORT=8080                 HTTP 端口（被占用会自动递增）
@@ -151,6 +165,9 @@ show_help() {
                             可写层快照：auto 仅在容器内有改动时快照（默认），
                             always 总是快照，never 不迁移容器内未挂载的改动
   STOP_SHARED_MOUNTS=1      非交互模式下允许临时停止共享挂载的其他容器
+  DOCKER_MIGRATE_LOG_DIR    日志目录（默认 ~/docker_migrate_logs）；成功后日志自动删除，
+                            失败时保留并在结果中给出路径
+  DOCKER_MIGRATE_KEEP_LOG=1 成功后也保留日志
 
 宿主机系统路径（如 /etc/localtime、/proc、/sys、/dev）只在新服务器重建挂载，不迁移内容。
 不带参数运行时仍使用原有交互菜单。

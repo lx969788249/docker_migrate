@@ -141,14 +141,14 @@ volume_released=0
 bind_released=0
 for _ in $(seq 1 240); do
   if ((volume_released == 0)) && [[ -e "$archive_started" ]] &&
-    grep -Fq "[进度] 打包命名卷：${volume_name} ·" "$backup_log"; then
+    grep -Fq "· 卷 ${volume_name}" "$backup_log"; then
     [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
     [[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
     touch "$archive_release"
     volume_released=1
   fi
   if ((bind_released == 0)) && [[ -e "$bind_archive_started" ]] &&
-    grep -Fq "[进度] 打包绑定目录：${bind_path} ·" "$backup_log"; then
+    grep -Fq "· 目录 ${bind_path}" "$backup_log"; then
     [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "false" ]]
     [[ "$(docker inspect -f '{{.State.Running}}' "$paused_shared_name")" == "false" ]]
     touch "$bind_archive_release"

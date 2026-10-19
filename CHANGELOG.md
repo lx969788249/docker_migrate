@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.4.0
+
+### Output and progress
+
+- Show the run as numbered steps (7 for backup, 8 for restore); each step takes one line that updates in place and ends with its result and duration.
+- Progress bars show percentage, speed and remaining time for downloads, image save/load, data archives, encryption, decryption and extraction, using a built-in byte counter instead of the optional `pv`.
+- When nothing moves for 30 seconds, the progress line says what the script is waiting for, so long steps are not mistaken for a hang.
+- Warnings take one line and are listed again in the final summary together with per-step timings.
+- All messages, including the per-container restore script, are in Chinese.
+
+### Logging and diagnosis
+
+- Every run writes a full log (environment, each step, every Docker command and its output) to `~/docker_migrate_logs`; it is deleted after a successful run and kept on failure.
+- Keys from migration links and password-like environment values are hidden in logs.
+- Docker command errors that were previously discarded are now recorded.
+- Failures end with the failing step, a plain-language cause, a suggested fix, the log path and the last log lines; common Docker, network and disk errors are recognized.
+- Add `--verbose` to show step details on screen and `--diagnose` to collect a redacted report for issues.
+
 ## 2.3.0
 
 ### Restore fidelity

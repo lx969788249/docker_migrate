@@ -1,6 +1,23 @@
 #####################################
 # 依赖检测 / 安装
 #####################################
+log_init backup "${ORIGINAL_ARGS[@]}"
+
+# 锁与清理流程就绪前的退出：失败时保留日志并告诉用户位置。
+backup_early_exit() {
+  local rc="$1"
+  trap - EXIT
+  if ((rc == 0)); then
+    log_finish 1
+  else
+    stage_fail
+    [[ -z "${DM_LOG_FILE:-}" ]] || printf '日志：%s\n' "$DM_LOG_FILE" >&2
+  fi
+  exit "$rc"
+}
+trap 'backup_early_exit $?' EXIT
+
+stage_begin 1 7 "检查环境"
 PKGMGR="$(pm_detect)"
 
 case "$PKGMGR" in
@@ -53,7 +70,7 @@ case "$PKGMGR" in
   none)
     for required_bin in curl jq tar find gzip openssl docker; do
       if ! command -v "$required_bin" >/dev/null 2>&1; then
-        RED "[ERR] 缺少命令：$required_bin，且未检测到受支持的包管理器，请手动安装。"
+        error_user "缺少命令 ${required_bin}，且没有可用的包管理器" "请手动安装 ${required_bin} 后重试"
         exit 1
       fi
     done
@@ -69,6 +86,7 @@ INCLUDE_LIST=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backup) shift ;;
+    --verbose | -v) shift ;;
     --no-stop)
       NO_STOP=1
       shift
@@ -87,7 +105,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      RED "[ERR] 未知参数：$1"
+      error_user "未知参数：$1" "运行 --help 查看可用参数"
       exit 1
       ;;
   esac
@@ -104,7 +122,7 @@ RID="$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 10)"
 BUNDLE_ROOT="${WORKDIR}/bundle"
 BUNDLE="${BUNDLE_ROOT}/${RID}"
 mkdir -p "${BUNDLE}"/{runs,volumes,binds,compose,meta,networks}
-BLUE "[INFO] Bundle 目录：${BUNDLE}"
+detail "迁移包工作目录：${BUNDLE}"
 
 #####################################
 # 并发锁：防止同机同时运行两个实例互相干扰
@@ -119,12 +137,11 @@ if command -v flock >/dev/null 2>&1; then
   LOCK_METHOD="flock"
   exec 200>"$LOCKFILE"
   if ! flock -n 200 2>/dev/null; then
-    RED "[ERR] 检测到另一个 docker_migrate 实例正在运行。"
+    error_user "本机已有另一个迁移任务正在运行" "等待它结束后重试"
     exit 1
   fi
 elif ! mkdir "$LOCKDIR" 2>/dev/null; then
-  RED "[ERR] 检测到另一个 docker_migrate 实例正在运行。"
-  RED "[ERR] 若确认没有实例运行，可删除：$LOCKDIR"
+  error_user "本机已有另一个迁移任务正在运行" "确认没有其他任务后，删除 ${LOCKDIR} 再重试"
   exit 1
 fi
 
@@ -196,12 +213,12 @@ restart_source_containers() {
   if ((observed_total > SOURCE_RESTORE_EXPECTED)); then
     SOURCE_RESTORE_EXPECTED=$observed_total
   fi
-  BLUE "[INFO] 恢复源服务器容器原始运行状态（共 ${#STOPPED_ON_BACKUP[@]} 个）..."
+  detail "恢复源服务器容器原始运行状态（共 ${#STOPPED_ON_BACKUP[@]} 个）"
   local ok=0 fail=0 record n original_state current_state restore_ok
   local -a remaining=()
   for record in "${STOPPED_ON_BACKUP[@]}"; do
     IFS=$'\t' read -r n original_state <<<"$record"
-    printf " [恢复源状态] %s (%s)\n" "$n" "$original_state"
+    detail "恢复源容器状态：${n}（${original_state}）"
     current_state="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo missing)"
     restore_ok=1
     case "$original_state" in
@@ -211,28 +228,28 @@ restart_source_containers() {
             running | restarting) ;;
             *)
               run_with_activity "启动源容器：$n" \
-                run_with_timeout 60 docker start "$n" >/dev/null || restore_ok=0
+                dm_quiet run_with_timeout 60 docker start "$n" || restore_ok=0
               ;;
           esac
-          ((restore_ok == 0)) || docker pause "$n" >/dev/null 2>&1 || restore_ok=0
+          ((restore_ok == 0)) || dm_quiet docker pause "$n" || restore_ok=0
         fi
         ;;
       *)
         case "$current_state" in
           running | restarting) ;;
-          paused) docker unpause "$n" >/dev/null 2>&1 || restore_ok=0 ;;
+          paused) dm_quiet docker unpause "$n" || restore_ok=0 ;;
           *)
             run_with_activity "启动源容器：$n" \
-              run_with_timeout 60 docker start "$n" >/dev/null || restore_ok=0
+              dm_quiet run_with_timeout 60 docker start "$n" || restore_ok=0
             ;;
         esac
         ;;
     esac
     if ((restore_ok == 1)); then
-      printf " [恢复源状态] %s：ok\n" "$n"
+      detail "源容器已恢复：${n}"
       ok=$((ok + 1))
     else
-      printf " [恢复源状态] %s：fail\n" "$n"
+      detail "源容器恢复失败：${n}"
       fail=$((fail + 1))
       remaining+=("$record")
     fi
@@ -240,10 +257,11 @@ restart_source_containers() {
   STOPPED_ON_BACKUP=("${remaining[@]}")
   SOURCE_RESTORED_COUNT=$((SOURCE_RESTORE_EXPECTED - ${#STOPPED_ON_BACKUP[@]}))
   if ((fail > 0)); then
-    RED "[ERR] 有 ${fail} 个源容器未能重启，请立即人工检查。"
+    error_user "有 ${fail} 个源容器未能恢复原来的运行状态" \
+      "立即执行 docker ps -a 检查，并用 docker start <容器名> 手动启动"
     return 1
   fi
-  OK "[OK] 源容器已恢复：${ok}/${attempted}"
+  detail "源容器已恢复：${ok}/${attempted}"
 }
 
 graceful_exit() {
@@ -301,8 +319,14 @@ graceful_exit() {
     status="FAILED"
   fi
   elapsed="$(format_elapsed "$((SECONDS - SOURCE_TASK_STARTED_AT))")"
+  ((rc == 0)) || stage_fail
   print_source_result_summary "$status" "$package_line" "$HTTP_CLEANUP_STATUS" \
     "$source_line" "$CLEANUP_STATUS" "$elapsed"
+  if [[ "$status" == "SUCCESS" ]]; then
+    log_finish 1
+  else
+    log_finish 0
+  fi
   exit "$final_rc"
 }
 
@@ -311,3 +335,5 @@ trap 'graceful_exit $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+DM_SUMMARY_ARMED=1
+stage_end "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"

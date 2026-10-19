@@ -154,18 +154,22 @@ fi
 [[ "$(docker inspect -f "{{with index .NetworkSettings.Networks \"${network_name}\"}}{{.IPAddress}}{{end}}" "$container_name")" == "$container_ip" ]]
 docker rm -f "$blocker_name" >/dev/null
 
-initial_restore_output="$(cd "$bundle" && bash restore.sh 2>&1)"
+# 细节与进度只写进运行日志：保留日志以便检查（成功时默认会自动删除）。
+initial_restore_output="$(cd "$bundle" && DOCKER_MIGRATE_LOG_DIR="${tmp}/log-initial" \
+  DOCKER_MIGRATE_KEEP_LOG=1 bash restore.sh 2>&1)"
+initial_restore_log="$(cat "${tmp}"/log-initial/*.log)"
 [[ "$(grep -Fc 'Docker 迁移结果' <<<"$initial_restore_output")" -eq 1 ]]
 [[ "$(grep -Fc '结果：' <<<"$initial_restore_output")" -eq 1 ]]
 grep -Fq '结果：✅ 恢复成功' <<<"$initial_restore_output"
 grep -Fq '容器：1 个（运行 1 / 暂停 0 / 停止 0）' <<<"$initial_restore_output"
-grep -Fq '跳过宿主机系统路径' <<<"$initial_restore_output"
+grep -Fq '跳过宿主机系统路径' <<<"$initial_restore_log"
+grep -Eq '\[[1-5]/5\] 启动服务 ✓' <<<"$initial_restore_output"
 [[ "$(ls -l /etc/localtime 2>/dev/null || true)" == "$localtime_before" ]]
 ! grep -Fq '若端口被占用' <<<"$initial_restore_output"
 ! grep -Fq '此步骤可能耗时较长' <<<"$initial_restore_output"
 ! grep -Fq '无需按键' <<<"$initial_restore_output"
 grep -Eq "\[(进度|完成)\] 容器健康检查：${container_name} .* [0-9]+(/60)?秒" \
-  <<<"$initial_restore_output"
+  <<<"$initial_restore_log"
 
 [[ "$(docker inspect -f '{{.State.Running}}' "$container_name")" == "true" ]]
 [[ "$(docker exec "$container_name" cat /writable-state.txt)" == "writable-layer-state" ]]
@@ -335,7 +339,9 @@ docker run --rm -v "${standalone_tx_volume_name}:/to:ro" alpine:3.20 sh -ec \
 [[ "$(grep -Fc 'Docker 迁移结果' <<<"$standalone_restore_output")" -eq 1 ]]
 [[ "$(grep -Fc '结果：' <<<"$standalone_restore_output")" -eq 1 ]]
 grep -Fq '结果：❌ 恢复失败，已安全回滚' <<<"$standalone_restore_output"
-grep -Fq '已确认宿主机端口绑定冲突' <<<"$standalone_restore_output"
+grep -Fq "原因：容器 ${container_name} 创建失败：宿主机端口" <<<"$standalone_restore_output"
+grep -Fq '已被其他程序占用' <<<"$standalone_restore_output"
+grep -Fq '日志：' <<<"$standalone_restore_output"
 ! grep -Fq '结果：✅ 恢复成功' <<<"$standalone_restore_output"
 docker rm -f "$blocker_name" >/dev/null
 
@@ -496,11 +502,12 @@ if volume_failure_output="$(
   echo "injected volume extraction failure unexpectedly succeeded" >&2
   exit 1
 fi
-grep -Fq 'tar: injected extraction write failure' <<<"$volume_failure_output"
-grep -Fq '详细日志：' <<<"$volume_failure_output"
+volume_failure_log="$(sed -n 's/^日志：//p' <<<"$volume_failure_output" | head -n1)"
+[[ -f "$volume_failure_log" ]]
+grep -Fq 'tar: injected extraction write failure' "$volume_failure_log"
+grep -Fq '原因：恢复数据卷' <<<"$volume_failure_output"
 grep -Fq '失败阶段：回灌命名卷' <<<"$volume_failure_output"
-if grep -Fq '[C] 回灌绑定目录' <<<"$volume_failure_output" ||
-  grep -Fq '[D] 恢复 Compose 项目' <<<"$volume_failure_output"; then
+if grep -Fq '启动服务' <<<"$volume_failure_output"; then
   echo "volume failure continued into later restore stages" >&2
   exit 1
 fi
@@ -573,7 +580,7 @@ PY
     echo "unsafe archive unexpectedly restored: $unsafe_case" >&2
     exit 1
   fi
-  if grep -Fq '[B] 回灌命名卷' <<<"$unsafe_output"; then
+  if grep -Fq '恢复数据' <<<"$unsafe_output"; then
     echo "unsafe archive reached the mutation stage: $unsafe_case" >&2
     exit 1
   fi
@@ -763,7 +770,9 @@ YAML
   [[ ! -e "${compose_bind_target}/source.txt" ]]
   [[ "$(docker inspect -f '{{.State.Running}}' "$compose_shared_writer_name")" == "true" ]]
 
-  compose_restore_output="$(cd "$compose_bundle" && bash restore.sh 2>&1)"
+  compose_restore_output="$(cd "$compose_bundle" && DOCKER_MIGRATE_LOG_DIR="${tmp}/log-compose" \
+    DOCKER_MIGRATE_KEEP_LOG=1 bash restore.sh 2>&1)"
+  compose_restore_log="$(cat "${tmp}"/log-compose/*.log)"
   [[ "$(grep -Fc 'Docker 迁移结果' <<<"$compose_restore_output")" -eq 1 ]]
   [[ "$(grep -Fc '结果：' <<<"$compose_restore_output")" -eq 1 ]]
   grep -Fq '结果：✅ 恢复成功' <<<"$compose_restore_output"
@@ -772,9 +781,9 @@ YAML
   ! grep -Fq '此步骤可能耗时较长' <<<"$compose_restore_output"
   ! grep -Fq '无需按键' <<<"$compose_restore_output"
   grep -Eq '\[完成\] Compose 服务健康检查：first · [0-9]+秒' \
-    <<<"$compose_restore_output"
+    <<<"$compose_restore_log"
   grep -Eq "\[完成\] Compose 项目健康检查：${compose_project} · [0-9]+秒" \
-    <<<"$compose_restore_output"
+    <<<"$compose_restore_log"
   docker inspect "${compose_project}-first-1" |
     jq -e '.[0].Config.Env | index("MIGRATION_TEST=merged-config") != null' >/dev/null
   grep -Fq 'MIGRATION_TEST: merged-config' "${compose_work}/_resolved_config.yml"

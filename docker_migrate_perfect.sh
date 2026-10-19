@@ -36,7 +36,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.4.0"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -77,6 +77,395 @@ sha256_file() {
   fi
 }
 
+# 运行日志：主脚本与生成的恢复脚本共用。
+#
+# 屏幕只显示阶段、进度、警告和最终结果；每一步的细节、执行的命令及其完整
+# 输出都写进日志文件。成功后日志自动删除，失败时保留并在结果中给出路径，
+# 方便用户反馈。子脚本（restore.sh、单容器恢复脚本）通过环境变量沿用父进程
+# 的日志文件，由创建日志的进程负责收尾。
+#
+# DOCKER_MIGRATE_VERBOSE=1（或 --verbose）时，细节同时显示在屏幕上。
+# DOCKER_MIGRATE_LOG_DIR 可指定日志目录，默认 ~/docker_migrate_logs。
+
+# 写入日志前隐藏敏感信息：迁移链接中的密钥，以及 -e/--env 传入或形如
+# *PASSWORD=*、*TOKEN=* 的环境变量值（容器配置里常有数据库密码）。
+log_redact() {
+  sed -E \
+    -e 's/((secret|iv|mac)=)[0-9A-Fa-f]+/\1***/g' \
+    -e 's/((^|[[:space:]])(-e|--env)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=)[^[:space:]]*/\1***/g' \
+    -e 's/(--env=[A-Za-z_][A-Za-z0-9_]*=)[^[:space:]]*/\1***/g' \
+    -e 's/([A-Za-z0-9_]*(PASS|PASSWD|PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL|pass|password|secret|token)[A-Za-z0-9_]*=)[^[:space:]"&]*/\1***/g'
+}
+
+log_timestamp() {
+  date '+%H:%M:%S'
+}
+
+# 追加一行到日志（不显示在屏幕上）。
+log_line() {
+  [[ -n "${DM_LOG_FILE:-}" ]] || return 0
+  printf '[%s] %s\n' "$(log_timestamp)" "$*" | log_redact >>"$DM_LOG_FILE" 2>/dev/null || true
+}
+
+# 细节信息：总是写入日志，--verbose 时也显示在屏幕上。
+detail() {
+  log_line "$*"
+  if [[ "${DOCKER_MIGRATE_VERBOSE:-0}" == "1" ]]; then
+    screen_clear_line
+    printf '    %s\n' "$*" >&2
+  fi
+}
+
+# 运行命令，把标准输出与错误输出都记进日志而不是丢弃；没有日志时保持静默。
+# 命令失败时记录退出码，失败原因因此有据可查。
+dm_quiet() {
+  local rc=0
+  if [[ -z "${DM_LOG_FILE:-}" ]]; then
+    "$@" >/dev/null 2>&1 || rc=$?
+    return "$rc"
+  fi
+  log_line "\$ $*"
+  "$@" >>"$DM_LOG_FILE" 2>&1 || rc=$?
+  ((rc == 0)) || log_line "  → 退出码 ${rc}"
+  return "$rc"
+}
+
+# 只把错误输出记进日志，标准输出照常返回给调用方（用于需要捕获输出的命令）。
+dm_logged() {
+  local rc=0
+  if [[ -z "${DM_LOG_FILE:-}" ]]; then
+    "$@" 2>/dev/null || rc=$?
+    return "$rc"
+  fi
+  log_line "\$ $*"
+  "$@" 2>>"$DM_LOG_FILE" || rc=$?
+  ((rc == 0)) || log_line "  → 退出码 ${rc}"
+  return "$rc"
+}
+
+# 日志开头的环境信息：反馈问题时最常需要的版本与资源情况。
+log_environment() {
+  local kind="$1"
+  shift
+  printf '===== Docker Migrate %s · %s · %s =====\n' "${SCRIPT_VERSION:-unknown}" "$kind" "$(date '+%Y-%m-%d %H:%M:%S %z')"
+  printf '参数：%s\n' "$*"
+  printf '系统：%s\n' "$(uname -srm 2>/dev/null || echo unknown)"
+  if [[ -r /etc/os-release ]]; then
+    printf '发行版：%s\n' "$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-${NAME:-unknown}}")"
+  fi
+  printf 'bash：%s\n' "${BASH_VERSION:-unknown}"
+  printf '用户：uid=%s\n' "$(id -u 2>/dev/null || echo unknown)"
+  printf 'Docker：%s\n' "$(docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}' 2>&1 | head -n1)"
+  printf 'Docker 存储：%s\n' "$(docker info --format '{{.Driver}} · {{.DockerRootDir}} · cgroup {{.CgroupVersion}}' 2>&1 | head -n1)"
+  printf 'Compose：%s\n' "$({ docker compose version --short 2>/dev/null || docker-compose version --short 2>/dev/null || echo '未安装'; } | head -n1)"
+  printf '工具：jq %s · python3 %s · openssl %s\n' \
+    "$(jq --version 2>/dev/null || echo '未安装')" \
+    "$(python3 --version 2>/dev/null | awk '{print $2}' || true)" \
+    "$(openssl version 2>/dev/null | awk '{print $2}' || true)"
+  printf '磁盘：\n'
+  df -h "$PWD" "$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /)" 2>/dev/null | sed 's/^/  /' || true
+  printf '%s\n' '=================================================='
+}
+
+# 创建日志文件；子进程已从父进程继承日志时直接沿用。
+log_init() {
+  local kind="$1" dir
+  shift
+  if [[ -n "${DM_LOG_FILE:-}" && -f "${DM_LOG_FILE}" ]]; then
+    return 0
+  fi
+  dir="${DOCKER_MIGRATE_LOG_DIR:-${HOME:-/tmp}/docker_migrate_logs}"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    dir="${TMPDIR:-/tmp}"
+  fi
+  chmod 700 "$dir" 2>/dev/null || true
+  DM_LOG_FILE="${dir}/${kind}-$(date +%Y%m%d-%H%M%S)-$$.log"
+  if ! : >"$DM_LOG_FILE" 2>/dev/null; then
+    DM_LOG_FILE=""
+    return 0
+  fi
+  chmod 600 "$DM_LOG_FILE" 2>/dev/null || true
+  DM_LOG_OWNER="$$"
+  DM_REASON_FILE="${DM_LOG_FILE%.log}.reason"
+  DM_WARN_FILE="${DM_LOG_FILE%.log}.warnings"
+  DM_TIMING_FILE="${DM_LOG_FILE%.log}.timings"
+  : >"$DM_REASON_FILE" 2>/dev/null || true
+  : >"$DM_WARN_FILE" 2>/dev/null || true
+  : >"$DM_TIMING_FILE" 2>/dev/null || true
+  export DM_LOG_FILE DM_LOG_OWNER DM_REASON_FILE DM_WARN_FILE DM_TIMING_FILE
+  log_environment "$kind" "$@" 2>&1 | log_redact >>"$DM_LOG_FILE" 2>/dev/null || true
+}
+
+# 创建日志的进程在结束时调用：成功则删除日志及附属文件，失败则保留。
+log_finish() {
+  local success="$1"
+  [[ -n "${DM_LOG_FILE:-}" && "${DM_LOG_OWNER:-}" == "$$" ]] || return 0
+  # DOCKER_MIGRATE_KEEP_LOG=1 时成功也保留日志，便于排查或测试。
+  [[ "${DOCKER_MIGRATE_KEEP_LOG:-0}" != "1" ]] || success=0
+  if [[ "$success" == "1" ]]; then
+    rm -f "$DM_LOG_FILE" "${DM_REASON_FILE:-}" "${DM_WARN_FILE:-}" "${DM_TIMING_FILE:-}" 2>/dev/null || true
+    rmdir "$(dirname "$DM_LOG_FILE")" 2>/dev/null || true
+  else
+    rm -f "${DM_WARN_FILE:-}" "${DM_TIMING_FILE:-}" 2>/dev/null || true
+  fi
+}
+
+# 记录本次失败的原因与建议；只保留第一条，它通常就是根因。
+fail_reason() {
+  local reason="$1" hint="${2:-}"
+  log_line "失败原因：${reason}${hint:+（建议：${hint}）}"
+  [[ -n "${DM_REASON_FILE:-}" ]] || return 0
+  if [[ ! -s "$DM_REASON_FILE" ]]; then
+    printf '%s\t%s\n' "$reason" "$hint" >"$DM_REASON_FILE" 2>/dev/null || true
+  fi
+}
+
+# 读取已记录的失败原因，输出“原因<TAB>建议”。
+fail_reason_read() {
+  [[ -n "${DM_REASON_FILE:-}" && -s "$DM_REASON_FILE" ]] || return 1
+  head -n1 "$DM_REASON_FILE"
+}
+
+# 屏幕输出：分阶段显示整体进度。主脚本与生成的恢复脚本共用。
+#
+# 每个阶段在屏幕上只占一行：进行中时由进度显示原地刷新这一行，完成后
+# 替换为“✓ 结果 · 耗时”。警告单独占一行并汇总到最终结果；细节只写日志。
+# 阶段信息通过环境变量传给子脚本，让它们的进度行带上同一个阶段前缀。
+
+screen_is_tty() {
+  [[ -t 2 ]]
+}
+
+screen_clear_line() {
+  screen_is_tty || return 0
+  printf '\r\033[K' >&2
+}
+
+screen_color() {
+  local code="$1"
+  shift
+  if screen_is_tty; then
+    printf '\033[%sm%s\033[0m' "$code" "$*"
+  else
+    printf '%s' "$*"
+  fi
+}
+
+# 当前阶段的前缀，例如“[5/7] 保存镜像”；不在任何阶段内时为空。
+stage_prefix() {
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '[%s/%s] %s' "${DM_STAGE_NUM:-?}" "${DM_STAGE_TOTAL:-?}" "$DM_STAGE_TITLE"
+}
+
+# 进度行开头：阶段前缀加上正在处理的对象。
+stage_label() {
+  local label="${1:-}" prefix
+  prefix="$(stage_prefix)"
+  # 子步骤与阶段同名时不重复显示。
+  [[ "$label" != "${DM_STAGE_TITLE:-}" ]] || label=""
+  if [[ -n "$prefix" && -n "$label" ]]; then
+    printf '%s · %s' "$prefix" "$label"
+  else
+    printf '%s' "${prefix}${label}"
+  fi
+}
+
+stage_begin() {
+  DM_STAGE_NUM="$1"
+  DM_STAGE_TOTAL="$2"
+  DM_STAGE_TITLE="$3"
+  DM_STAGE_STARTED=$SECONDS
+  export DM_STAGE_NUM DM_STAGE_TOTAL DM_STAGE_TITLE
+  log_line "===== [${DM_STAGE_NUM}/${DM_STAGE_TOTAL}] ${DM_STAGE_TITLE} ====="
+  if screen_is_tty; then
+    printf '\r%s\033[K' "$(stage_prefix) …" >&2
+  else
+    printf '%s\n' "$(stage_prefix)" >&2
+  fi
+}
+
+# 阶段内需要提问或列出菜单时，先把阶段标题固定成一整行。
+stage_hold() {
+  screen_is_tty || return 0
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '\r%s\033[K\n' "$(stage_prefix)" >&2
+}
+
+stage_record_timing() {
+  local elapsed="$1"
+  [[ -n "${DM_TIMING_FILE:-}" && -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '%s\t%s\n' "$DM_STAGE_TITLE" "$elapsed" >>"$DM_TIMING_FILE" 2>/dev/null || true
+}
+
+stage_end() {
+  local summary="${1:-}" elapsed
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
+  stage_record_timing "$elapsed"
+  log_line "完成：$(stage_prefix)${summary:+ · ${summary}} · $(format_elapsed "$elapsed")"
+  screen_clear_line
+  printf '%s %s %s%s\n' "$(stage_prefix)" "$(screen_color '1;32' '✓')" \
+    "${summary:+${summary} · }" "$(format_elapsed "$elapsed")" >&2
+  DM_STAGE_TITLE=""
+  export DM_STAGE_TITLE
+}
+
+stage_fail() {
+  local summary="${1:-}" elapsed
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
+  stage_record_timing "$elapsed"
+  log_line "失败：$(stage_prefix)${summary:+ · ${summary}}"
+  screen_clear_line
+  printf '%s %s%s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" "${summary:+ ${summary}}" >&2
+  DM_FAILED_STAGE="$(stage_prefix)"
+  export DM_FAILED_STAGE
+  DM_STAGE_TITLE=""
+  export DM_STAGE_TITLE
+}
+
+# 警告：屏幕上单独一行，写入日志，并在最终结果中汇总。
+warn_user() {
+  log_line "警告：$*"
+  screen_clear_line
+  printf '    %s %s\n' "$(screen_color '1;33' '!')" "$*" >&2
+  if [[ -n "${DM_WARN_FILE:-}" ]]; then
+    printf '%s\n' "$*" >>"$DM_WARN_FILE" 2>/dev/null || true
+  fi
+}
+
+# 错误：写入日志并记录为失败原因；屏幕上的完整说明由最终结果统一给出。
+error_user() {
+  local reason="$1" hint="${2:-}"
+  fail_reason "$reason" "$hint"
+  if [[ "${DM_SUMMARY_ARMED:-0}" != "1" ]]; then
+    screen_clear_line
+    printf '%s %s\n' "$(screen_color '1;31' '✗')" "$reason" >&2
+    [[ -z "$hint" ]] || printf '  建议：%s\n' "$hint" >&2
+  fi
+}
+
+# 最终结果中的“阶段耗时”与“警告”部分。
+print_stage_timings() {
+  local title seconds line=""
+  [[ -n "${DM_TIMING_FILE:-}" && -s "$DM_TIMING_FILE" ]] || return 0
+  while IFS=$'\t' read -r title seconds; do
+    [[ -n "$title" ]] || continue
+    line+="${line:+ · }${title} $(format_elapsed "$seconds")"
+  done <"$DM_TIMING_FILE"
+  [[ -z "$line" ]] || printf '阶段耗时：%s\n' "$line"
+}
+
+print_warning_summary() {
+  local warning count
+  [[ -n "${DM_WARN_FILE:-}" && -s "$DM_WARN_FILE" ]] || return 0
+  count="$(awk 'NF' "$DM_WARN_FILE" | wc -l | tr -d ' ')"
+  printf '警告：%s 条\n' "$count"
+  while IFS= read -r warning; do
+    [[ -n "$warning" ]] || continue
+    printf '  · %s\n' "$warning"
+  done < <(awk 'NF && !seen[$0]++' "$DM_WARN_FILE" | head -n 10)
+}
+
+# 失败时的说明：原因、建议、日志位置与最近的日志内容。
+print_failure_details() {
+  local reason hint row
+  if row="$(fail_reason_read)"; then
+    IFS=$'\t' read -r reason hint <<<"$row"
+    [[ -z "$reason" ]] || printf '原因：%s\n' "$reason"
+    [[ -z "$hint" ]] || printf '建议：%s\n' "$hint"
+  fi
+  if [[ -n "${DM_LOG_FILE:-}" && -f "$DM_LOG_FILE" ]]; then
+    printf '日志：%s\n' "$DM_LOG_FILE"
+    printf '      反馈问题时请附上这个文件（密钥与密码已自动隐藏），或运行 --diagnose 生成诊断包。\n'
+    printf '最近日志：\n'
+    tail -n 15 "$DM_LOG_FILE" | sed 's/^/  /'
+  fi
+}
+
+# 常见错误识别：把 Docker、curl 等工具的英文报错翻译成“原因 + 建议”。
+# 主脚本与生成的恢复脚本共用。
+
+# 根据错误文本输出“原因<TAB>建议”；无法识别时返回 1。
+explain_error() {
+  local text="$1" port
+  shopt -s nocasematch
+  case "$text" in
+    *"port is already allocated"* | *"address already in use"* | *"failed to bind host port"* | *"Bind for "*" failed"*)
+      port="$(grep -oE '(Bind for [^ ]*:|host port |0\.0\.0\.0:|\]:)[0-9]+' <<<"$text" | grep -oE '[0-9]+$' | head -n1 || true)"
+      printf '宿主机端口%s已被其他程序占用\t执行 ss -lntp%s 查看占用的进程，停止它或修改端口后重试\n' \
+        "${port:+ ${port} }" "${port:+ | grep \":${port} \"}"
+      ;;
+    *"no space left on device"*)
+      printf '磁盘空间不足\t执行 df -h 查看剩余空间，清理后重试（docker system prune 可以清理无用的镜像和容器）\n'
+      ;;
+    *"permission denied while trying to connect to the docker"*)
+      printf '当前用户没有访问 Docker 的权限\t请用 root 运行，或用 sudo 运行脚本\n'
+      ;;
+    *"cannot connect to the docker daemon"* | *"is the docker daemon running"*)
+      printf 'Docker 服务没有运行\t执行 systemctl start docker 启动 Docker 后重试\n'
+      ;;
+    *"exec format error"* | *"does not match the detected host platform"* | *"no matching manifest for"*)
+      printf '镜像的 CPU 架构与本机不一致\t请在相同 CPU 架构（如都是 x86_64 或都是 arm64）的服务器之间迁移\n'
+      ;;
+    *"pull access denied"* | *"repository does not exist"* | *"manifest unknown"* | *"not found: manifest"*)
+      printf '镜像仓库中找不到该镜像，或需要登录才能拉取\t检查镜像名；私有镜像请先执行 docker login\n'
+      ;;
+    *"tls handshake timeout"* | *"i/o timeout"* | *"client.timeout exceeded"* | *"request canceled while waiting"*)
+      printf '连接镜像仓库超时\t检查服务器网络，或为 Docker 配置可用的镜像加速地址后重试\n'
+      ;;
+    *"is already in use by container"*)
+      printf '容器名称已被其他容器占用\t删除或重命名同名容器，或设置 RESTORE_EXISTING=replace\n'
+      ;;
+    *"bind source path does not exist"* | *"invalid mount config"*)
+      printf '挂载的宿主机路径不存在\t确认该路径在本机存在后重试\n'
+      ;;
+    *"could not resolve host"*)
+      printf '无法解析链接中的主机名\t检查链接是否完整、DNS 是否可用\n'
+      ;;
+    *"failed to connect"* | *"connection refused"* | *"couldn't connect to server"*)
+      printf '无法连接旧服务器的下载服务\t确认旧服务器上的脚本仍在运行，并检查旧服务器防火墙和云厂商安全组是否放行了下载端口\n'
+      ;;
+    *"unhealthy"* | *"did not become healthy"* | *"healthcheck timed out"*)
+      printf '容器启动后健康检查没有通过\t执行 docker logs <容器名> 查看应用日志；启动较慢的服务可以调大 RESTORE_HEALTH_TIMEOUT\n'
+      ;;
+    *"timed out"* | *"connection reset"*)
+      printf '与旧服务器的连接超时或中断\t检查两台服务器之间的网络，以及旧服务器防火墙和安全组设置，然后重试\n'
+      ;;
+    *"returned error: 404"* | *"404 not found"*)
+      printf '下载地址不存在\t旧服务器可能已经结束传输，或链接没有完整复制；请在旧服务器重新运行备份\n'
+      ;;
+    *"did not remain running"*)
+      printf '容器启动后立即退出\t执行 docker logs <容器名> 查看应用日志\n'
+      ;;
+    *"operation not permitted"* | *"permission denied"*)
+      printf '权限不足\t请用 root 或 sudo 运行脚本\n'
+      ;;
+    *)
+      shopt -u nocasematch
+      return 1
+      ;;
+  esac
+  shopt -u nocasematch
+}
+
+# 记录失败原因：能识别的报错给出具体原因和建议，否则使用调用方给出的描述。
+fail_with_output() {
+  local fallback="$1" output="${2:-}" row reason hint
+  if [[ -n "$output" ]] && row="$(explain_error "$output")"; then
+    IFS=$'\t' read -r reason hint <<<"$row"
+    error_user "${fallback}：${reason}" "$hint"
+  else
+    error_user "$fallback" "${3:-查看下方日志中的最后几行了解详情}"
+  fi
+}
+
+# 日志末尾的报错文本，用于在命令失败后识别原因。
+log_tail_text() {
+  [[ -n "${DM_LOG_FILE:-}" && -f "$DM_LOG_FILE" ]] || return 0
+  tail -n "${1:-30}" "$DM_LOG_FILE" 2>/dev/null || true
+}
+
 # 终端输出：颜色、耗时、结果摘要与帮助信息。
 
 result_rule() {
@@ -99,6 +488,8 @@ print_restore_result_summary() {
       [[ -z "$container_line" ]] || printf '%s\n' "$container_line"
       [[ -z "$data_line" ]] || printf '%s\n' "$data_line"
       printf '验证：完整性校验、服务启动与健康检查均已通过\n'
+      print_stage_timings
+      print_warning_summary
       ;;
     FAILED_ROLLED_BACK)
       printf '结果：❌ 恢复失败，已安全回滚\n'
@@ -138,6 +529,10 @@ print_restore_result_summary() {
   [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
   [[ -z "$diagnostic_dir" ]] || printf '诊断目录：%s\n' "$diagnostic_dir"
   [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+  if [[ "$status" != "SUCCESS" ]]; then
+    print_warning_summary
+    print_failure_details
+  fi
   result_end_rule
 }
 
@@ -152,6 +547,8 @@ print_source_result_summary() {
       printf '结果：✅ 源端任务已安全结束\n'
       [[ -z "$source_line" ]] || printf '源容器：%s\n' "$source_line"
       [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+      print_stage_timings
+      print_warning_summary
       result_end_rule
       return 0
       ;;
@@ -163,6 +560,8 @@ print_source_result_summary() {
   [[ -z "$source_line" ]] || printf '源容器：%s\n' "$source_line"
   [[ -z "$cleanup_line" ]] || printf '清理：%s\n' "$cleanup_line"
   [[ -z "$elapsed" ]] || printf '耗时：%s\n' "$elapsed"
+  print_warning_summary
+  print_failure_details
   result_end_rule
 }
 
@@ -216,8 +615,12 @@ BANNER
 show_help() {
   cat <<'HLP'
 用法:
-  bash docker_migrate_perfect.sh [--backup] [--no-stop] [--include=name1,name2]
-  bash docker_migrate_perfect.sh --restore[=URL]
+  bash docker_migrate_perfect.sh [--backup] [--no-stop] [--include=name1,name2] [--verbose]
+  bash docker_migrate_perfect.sh --restore[=URL] [--verbose]
+  bash docker_migrate_perfect.sh --diagnose
+
+  --verbose                 在屏幕上显示每一步的细节（默认只写进日志）
+  --diagnose                收集系统、Docker 与最近日志，生成可附到 issue 的诊断文件
 
 环境变量:
   PORT=8080                 HTTP 端口（被占用会自动递增）
@@ -230,6 +633,9 @@ show_help() {
                             可写层快照：auto 仅在容器内有改动时快照（默认），
                             always 总是快照，never 不迁移容器内未挂载的改动
   STOP_SHARED_MOUNTS=1      非交互模式下允许临时停止共享挂载的其他容器
+  DOCKER_MIGRATE_LOG_DIR    日志目录（默认 ~/docker_migrate_logs）；成功后日志自动删除，
+                            失败时保留并在结果中给出路径
+  DOCKER_MIGRATE_KEEP_LOG=1 成功后也保留日志
 
 宿主机系统路径（如 /etc/localtime、/proc、/sys、/dev）只在新服务器重建挂载，不迁移内容。
 不带参数运行时仍使用原有交互菜单。
@@ -283,17 +689,32 @@ pm_install() {
     zypper) asudo zypper --non-interactive install -y "$@" ;;
     apk) asudo apk add --no-cache "$@" ;;
     *)
-      RED "[ERR] 不支持的包管理器：$pm，请手动安装：$*"
-      exit 1
+      return 1
       ;;
   esac
 }
 
+# 安装软件包：输出写入日志、屏幕只显示进度。需要输入 sudo 密码时改为
+# 前台运行，保证密码提示可见。
+install_package() {
+  local bin="$1" pkg="$2"
+  if [[ ${EUID:-$(id -u)} -eq 0 ]] || sudo -n true 2>/dev/null; then
+    DM_PROGRESS_HINT="正在通过系统包管理器安装，网络较慢时可能需要几分钟" \
+      run_with_activity "安装 ${bin}" dm_quiet pm_install "$PKGMGR" "$pkg"
+  else
+    stage_hold
+    printf '    需要安装 %s，请按提示输入 sudo 密码：\n' "$bin" >&2
+    pm_install "$PKGMGR" "$pkg"
+  fi
+}
+
 need_bin() {
   local bin="$1" pkg="$2"
-  if ! command -v "$bin" >/dev/null 2>&1; then
-    echo "[INFO] 安装依赖：$bin（可能耗时；如出现 sudo 密码提示，请按提示输入）"
-    pm_install "$PKGMGR" "$pkg"
+  command -v "$bin" >/dev/null 2>&1 && return 0
+  if [[ "${PKGMGR:-none}" == "none" ]] || ! install_package "$bin" "$pkg" ||
+    ! command -v "$bin" >/dev/null 2>&1; then
+    error_user "缺少命令 ${bin}，自动安装失败" "请手动安装 ${pkg} 后重试"
+    exit 1
   fi
 }
 
@@ -301,38 +722,41 @@ try_optional_bin() {
   local bin="$1" pkg="$2"
   command -v "$bin" >/dev/null 2>&1 && return 0
   [[ "${PKGMGR:-none}" != "none" ]] || return 0
-  echo "[INFO] 安装可选依赖：$bin（可能耗时；如出现 sudo 密码提示，请按提示输入）"
-  pm_install "$PKGMGR" "$pkg" || true
+  install_package "$bin" "$pkg" || detail "可选依赖 ${bin} 安装失败，继续运行"
 }
 
 ensure_docker_running() {
+  local info_error
   if ! command -v docker >/dev/null 2>&1; then
-    RED "[ERR] 未检测到 docker，请先安装 Docker 再运行本脚本。"
+    error_user "未检测到 Docker" "请先安装 Docker（https://docs.docker.com/engine/install/）再运行本脚本"
     exit 1
   fi
 
-  if docker info >/dev/null 2>&1; then
+  if info_error="$(docker info 2>&1 >/dev/null)"; then
     return 0
   fi
+  log_line "docker info 失败：${info_error}"
+  if [[ "$info_error" == *"permission denied"* ]]; then
+    error_user "当前用户没有访问 Docker 的权限" "请用 root 运行，或用 sudo 运行脚本"
+    exit 1
+  fi
 
-  YEL "[INFO] 尝试启动 Docker 服务..."
+  detail "Docker 未运行，尝试启动 Docker 服务"
   if command -v systemctl >/dev/null 2>&1; then
-    YEL "[INFO] 正在通过 systemctl 启动 Docker；如出现 sudo 密码提示，请按提示输入。"
-    asudo systemctl enable --now docker || true
+    run_with_activity "启动 Docker 服务" dm_quiet asudo systemctl enable --now docker || true
   fi
   if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
-    YEL "[INFO] 正在通过 service 启动 Docker；如出现 sudo 密码提示，请按提示输入。"
-    asudo service docker start || true
+    run_with_activity "启动 Docker 服务" dm_quiet asudo service docker start || true
   fi
   if ! docker info >/dev/null 2>&1; then
-    YEL "[WARN] 尝试后台直接启动 dockerd ..."
+    detail "尝试后台直接启动 dockerd"
     if command -v dockerd >/dev/null 2>&1; then
       asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &
       sleep 3
     fi
   fi
   if ! docker info >/dev/null 2>&1; then
-    RED "[ERR] Docker 仍未正常启动，请手动检查后重试。"
+    error_user "Docker 服务无法启动" "执行 systemctl status docker 与 journalctl -u docker 查看原因"
     exit 1
   fi
 }
@@ -348,11 +772,19 @@ ensure_free_space() {
   free="$(free_disk_bytes "$dir")"
   [[ "$free" =~ ^[0-9]+$ && "$need" =~ ^[0-9]+$ ]] || return 0
   ((free >= need)) && return 0
-  RED "[ERR] ${label}需要约 $(human "$need") 可用空间，${dir} 所在磁盘只剩 $(human "$free")。"
+  error_user "磁盘空间不足：${label}需要约 $(human "$need")，${dir} 所在磁盘只剩 $(human "$free")" \
+    "执行 df -h 查看并清理磁盘后重试"
   return 1
 }
 
 # 进度显示与耗时格式化：主脚本与生成的恢复脚本共用。
+#
+# 耗时操作统一通过 run_with_progress 执行，后台 watcher 每秒（非终端每 10 秒）
+# 刷新一行：
+#   知道总量时：[5/7] 保存镜像 ██████░░░░ 58% · 1.2GB/2.1GB · 45MB/s · 剩余约 20 秒
+#   不知道总量：[4/7] 停机并打包数据 · 卷 mysql_data ⠹ 已处理 1.2GB · 45MB/s · 1 分 3 秒
+#   没有字节数：[7/8] 启动服务 · nginx ⠹ 1 分 3 秒
+# 长时间没有进展时追加说明（DM_PROGRESS_HINT），让用户知道程序仍在运行、在等什么。
 
 format_elapsed() {
   local seconds="${1:-0}"
@@ -366,15 +798,21 @@ format_elapsed() {
   fi
 }
 
+# 1536 → 1.5KB；整数部分达到两位后不再保留小数。
 human() {
   local b="${1:-0}"
-  local -a units=(B KB MB GB TB PB)
-  local i=0
-  while ((b >= 1024 && i < ${#units[@]} - 1)); do
-    b=$((b / 1024))
-    i=$((i + 1))
-  done
-  echo "${b}${units[$i]}"
+  [[ "$b" =~ ^[0-9]+$ ]] || b=0
+  awk -v b="$b" 'BEGIN {
+    split("B KB MB GB TB PB", u, " ")
+    i = 1
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    if (i == 1 || b >= 10) printf "%d%s\n", b, u[i]
+    else {
+      s = sprintf("%.1f", b)
+      sub(/\.0$/, "", s)
+      printf "%s%s\n", s, u[i]
+    }
+  }'
 }
 
 progress_file_size() {
@@ -382,32 +820,114 @@ progress_file_size() {
   stat -c %s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
 }
 
-# 只在确实知道总字节数时显示百分比；未知总量时仅报告已处理字节和耗时，
-# 避免用“假进度条”误导用户。该函数保持纯输出，便于单元测试。
+# 当前已处理字节数。spec 为空时没有字节数；"count:路径" 读取计数文件
+# （由 progress_meter 写入）；其他情况视为正在增长的输出文件。
+progress_current() {
+  local spec="${1:-}" value
+  case "$spec" in
+    "") echo 0 ;;
+    count:*)
+      value="$(cat "${spec#count:}" 2>/dev/null || true)"
+      [[ "$value" =~ ^[0-9]+$ ]] || value=0
+      echo "$value"
+      ;;
+    *) progress_file_size "$spec" ;;
+  esac
+}
+
+# 总字节数。可以是数字，也可以是 "header:路径"：从 curl -D 写出的响应头中
+# 读取 Content-Length（下载开始前未知，开始后才能确定）。
+progress_total() {
+  local spec="${1:-0}" value
+  case "$spec" in
+    header:*)
+      value="$(tr -d '\r' <"${spec#header:}" 2>/dev/null |
+        awk 'tolower($1) == "content-length:" { v = $2 } END { print v + 0 }')"
+      ;;
+    *) value="$spec" ;;
+  esac
+  [[ "$value" =~ ^[0-9]+$ ]] || value=0
+  echo "$value"
+}
+
+# 在管道中计数：原样转发标准输入到标准输出，并把累计字节数写入计数文件。
+# 没有 python3 时退化为 cat（只是不显示字节数）。
+progress_meter() {
+  local count_file="${1:-}"
+  if [[ -z "$count_file" || "$count_file" == /dev/null ]] || ! command -v python3 >/dev/null 2>&1; then
+    cat
+    return
+  fi
+  python3 -c '
+import os, sys, time
+path = sys.argv[1]
+src, dst = sys.stdin.buffer, sys.stdout.buffer
+total, last = 0, 0.0
+def flush():
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(total))
+    os.replace(tmp, path)
+while True:
+    chunk = src.read(1024 * 1024)
+    if not chunk:
+        break
+    dst.write(chunk)
+    total += len(chunk)
+    now = time.monotonic()
+    if now - last >= 0.5:
+        flush()
+        last = now
+dst.flush()
+flush()
+' "$count_file"
+}
+
+progress_bar() {
+  local percent="$1" width=20 filled bar empty
+  filled=$((percent * width / 100))
+  printf -v bar '%*s' "$filled" ''
+  printf -v empty '%*s' "$((width - filled))" ''
+  printf '%s%s' "${bar// /█}" "${empty// /░}"
+}
+
+# 生成一行进度文字（不含换行）。保持纯函数，便于单元测试。
+#   label current total elapsed [rate 字节/秒] [spinner] [hint]
+# 只在确实知道总量时显示百分比，避免用“假进度条”误导用户。
 progress_render() {
   local label="$1" current="${2:-0}" total="${3:-0}" elapsed="${4:-0}"
-  local percent filled empty bar
+  local rate="${5:-0}" spinner="${6:-}" hint="${7:-}"
+  local percent line remaining
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
   [[ "$elapsed" =~ ^[0-9]+$ ]] || elapsed=0
+  [[ "$rate" =~ ^[0-9]+$ ]] || rate=0
   if ((total > 0)); then
     ((current <= total)) || current=$total
     percent=$((current * 100 / total))
-    filled=$((percent * 24 / 100))
-    empty=$((24 - filled))
-    printf -v bar '%*s' "$filled" ''
-    bar=${bar// /#}
-    printf -v empty '%*s' "$empty" ''
-    empty=${empty// /-}
-    printf '[进度] %s [%s%s] %d%% · %s/%s · %s' \
-      "$label" "$bar" "$empty" "$percent" "$(human "$current")" \
-      "$(human "$total")" "$(format_elapsed "$elapsed")"
+    # 总量是估算值时，在命令真正结束前不显示 100%。
+    ((percent < 100)) || percent=99
+    line="${label} $(progress_bar "$percent") ${percent}% · $(human "$current")/$(human "$total")"
+    ((rate == 0)) || line+=" · $(human "$rate")/s"
+    if ((rate > 0 && total > current)); then
+      remaining=$(((total - current) / rate))
+      if ((remaining > 0)); then
+        line+=" · 剩余约 $(format_elapsed "$remaining")"
+      else
+        line+=" · 即将完成"
+      fi
+    else
+      line+=" · $(format_elapsed "$elapsed")"
+    fi
   elif ((current > 0)); then
-    printf '[进度] %s · %s · %s' \
-      "$label" "$(human "$current")" "$(format_elapsed "$elapsed")"
+    line="${label}${spinner:+ ${spinner}} 已处理 $(human "$current")"
+    ((rate == 0)) || line+=" · $(human "$rate")/s"
+    line+=" · $(format_elapsed "$elapsed")"
   else
-    printf '[进度] %s · %s' "$label" "$(format_elapsed "$elapsed")"
+    line="${label}${spinner:+ ${spinner}} $(format_elapsed "$elapsed")"
   fi
+  [[ -z "$hint" ]] || line+=" · ${hint}"
+  printf '%s' "$line"
 }
 
 progress_tty_draw() {
@@ -420,31 +940,44 @@ progress_tty_clear() {
   printf '\r\033[K' >&2
 }
 
+# 命令失败只记日志：失败原因由阶段结果与最终结果统一说明，避免屏幕上重复报错。
 progress_finish() {
   local label="$1" rc="$2" elapsed="$3" current="${4:-0}"
-  local suffix=""
   ((rc != 0)) || return 0
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
-  ((current == 0)) || suffix=" · $(human "$current")"
-  printf '[失败] %s · %s%s\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
+  log_line "失败：${label}（退出码 ${rc}，耗时 $(format_elapsed "$elapsed")$( ((current == 0)) || printf '，已处理 %s' "$(human "$current")")）"
 }
 
+# 逐个处理对象时（如扫描容器）在阶段行里显示“第几个/共几个”。
 progress_count() {
   local label="$1" current="$2" total="$3" item="${4:-}"
-  local suffix="" line
-  [[ -z "$item" ]] || suffix="（${item}）"
+  local line
+  printf -v line '%s %d/%d%s' "$label" "$current" "$total" "${item:+（${item}）}"
   if [[ -t 2 ]]; then
-    printf -v line '[进度] %s：%d/%d%s' "$label" "$current" "$total" "$suffix"
-    progress_tty_draw "$line"
-    ((current < total)) || printf '\n' >&2
-  elif ((current == 1 || current == total || current % 10 == 0)); then
-    printf '[进度] %s：%d/%d%s\n' "$label" "$current" "$total" "$suffix" >&2
+    progress_tty_draw "$(stage_label "$line")"
+  elif ((current == total || current % 20 == 0)); then
+    printf '[进度] %s\n' "$(stage_label "$line")" >&2
+  fi
+}
+
+# 不在 run_with_progress 中的等待循环（如健康检查）用它刷新阶段行。
+# 非终端时每 10 秒最多输出一行，避免刷屏。
+progress_note() {
+  local text="$1" now=$SECONDS
+  if [[ -t 2 ]]; then
+    progress_tty_draw "$(stage_label "$text")"
+  elif ((now - ${DM_LAST_NOTE_AT:--100} >= 10)); then
+    DM_LAST_NOTE_AT=$now
+    printf '[进度] %s\n' "$(stage_label "$text")" >&2
   fi
 }
 
 progress_watch() {
-  local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed line timer_pid=""
+  local label="$1" spec="$2" total_spec="$3" started="$4" owner_pid="$5"
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current total elapsed line timer_pid=""
+  local last_bytes=0 last_time=$SECONDS rate=0 sample changed_at=$SECONDS hint="" tick=0
+  local stall="${DM_PROGRESS_STALL:-30}" spinner
+  local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -454,6 +987,7 @@ progress_watch() {
     interval=10
   fi
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  [[ "$stall" =~ ^[1-9][0-9]*$ ]] || stall=30
   # watcher 被主流程终止时，也必须立即终止其 sleep 子进程。否则 sleep 会继续
   # 持有命令替换/进程替换的管道，使已经完成的步骤一直等到 interval 到期。
   trap '
@@ -472,26 +1006,42 @@ progress_watch() {
     wait "$timer_pid" 2>/dev/null || true
     timer_pid=""
     kill -0 "$owner_pid" 2>/dev/null || break
-    current=0
-    [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+    current="$(progress_current "$spec")"
+    total="$(progress_total "$total_spec")"
     elapsed=$((SECONDS - started))
+    # 速度取指数平滑，避免网络抖动时数字跳得太厉害。
+    if ((SECONDS > last_time)); then
+      sample=$(((current - last_bytes) / (SECONDS - last_time)))
+      ((sample >= 0)) || sample=0
+      if ((rate == 0)); then rate=$sample; else rate=$(((rate * 7 + sample * 3) / 10)); fi
+    fi
+    ((current == last_bytes)) || changed_at=$SECONDS
+    last_bytes=$current
+    last_time=$SECONDS
+    hint=""
+    if ((SECONDS - changed_at >= stall)); then
+      hint="${DM_PROGRESS_HINT:-仍在进行，请耐心等待}"
+    fi
+    spinner="${frames[$((tick % 10))]}"
+    tick=$((tick + 1))
     if [[ -t 2 ]]; then
-      line="$(progress_render "$label" "$current" "$total" "$elapsed")"
+      line="$(progress_render "$(stage_label "$label")" "$current" "$total" "$elapsed" "$rate" "$spinner" "$hint")"
       progress_tty_draw "$line"
     else
-      progress_render "$label" "$current" "$total" "$elapsed" >&2
-      printf '\n' >&2
+      printf '[进度] %s\n' "$(progress_render "$(stage_label "$label")" "$current" "$total" "$elapsed" "$rate" "" "$hint")" >&2
     fi
   done
   trap - TERM INT HUP
 }
 
+# 运行命令并显示进度。spec/total 的含义见 progress_current / progress_total。
 run_with_progress() {
-  local label="$1" file="$2" total="$3"
+  local label="$1" spec="$2" total="$3"
   shift 3
   local started=$SECONDS watcher_pid rc current=0 restore_errexit=0
+  log_line "开始：${label}"
   case $- in *e*) restore_errexit=1 ;; esac
-  progress_watch "$label" "$file" "$total" "$started" "$$" &
+  progress_watch "$label" "$spec" "$total" "$started" "$$" &
   watcher_pid=$!
   set +e
   "$@"
@@ -499,9 +1049,17 @@ run_with_progress() {
   ((restore_errexit == 0)) || set -e
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || progress_tty_clear
-  [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+  if [[ -t 2 ]]; then
+    # 回到阶段行，不留下已完成子步骤的进度文字。
+    if [[ -n "${DM_STAGE_TITLE:-}" ]]; then
+      progress_tty_draw "$(stage_prefix) …"
+    else
+      progress_tty_clear
+    fi
+  fi
+  current="$(progress_current "$spec")"
   progress_finish "$label" "$rc" "$((SECONDS - started))" "$current"
+  ((rc != 0)) || log_line "完成：${label} · $(format_elapsed "$((SECONDS - started))")$( ((current == 0)) || printf ' · %s' "$(human "$current")")"
   return "$rc"
 }
 
@@ -576,7 +1134,7 @@ bind_resolve_source() {
 rename_container_with_retry() {
   local old_name="$1" new_name="$2"
   for _ in {1..20}; do
-    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
+    if dm_quiet docker rename "$old_name" "$new_name"; then
       return 0
     fi
     sleep 0.1
@@ -598,7 +1156,7 @@ restore_container_networks() {
     fi
     connect_args=()
     if [[ "$network" == "bridge" ]]; then
-      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
+      dm_quiet docker network connect "$network" "$container" || return 1
       continue
     fi
     ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
@@ -608,7 +1166,7 @@ restore_container_networks() {
     while IFS= read -r alias; do
       [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
     done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
-    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
+    dm_quiet docker network connect "${connect_args[@]}" "$network" "$container" || return 1
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
@@ -757,7 +1315,7 @@ gzip_compress_stream() {
 
 bundle_pack_encrypt_directory() {
   local bundle_root="$1" member="$2" output="$3"
-  local encryption_key="$4" mac_key="$5" iv="$6"
+  local encryption_key="$4" mac_key="$5" iv="$6" count_file="${7:-}"
   local result sha mac extra rc=0
   [[ -d "${bundle_root}/${member}" ]] || return 1
   valid_hex_length "$encryption_key" 64 || return 2
@@ -771,6 +1329,7 @@ bundle_pack_encrypt_directory() {
     # 密文也无需为了 HMAC/SHA 再从磁盘完整读取一次。
     if result="$(
       tar -C "$bundle_root" -cf - "$member" |
+        progress_meter "$count_file" |
         gzip_compress_stream |
         openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$iv" |
         python3 -c '
@@ -802,6 +1361,7 @@ print(sha.hexdigest() + "\t" + mac.hexdigest())
   else
     # 无 Python 时仍保留流式压缩加密和格式兼容，只在生成后回退为摘要扫描。
     if tar -C "$bundle_root" -cf - "$member" |
+      progress_meter "$count_file" |
       gzip_compress_stream |
       openssl enc -aes-256-ctr -nosalt -K "$encryption_key" -iv "$iv" \
         -out "$output"; then
@@ -1272,11 +1832,28 @@ collect_shared_running_containers() {
   done < <(docker ps --format '{{.ID}}\t{{.Names}}')
 }
 
+# 估算数据卷大小（字节），用于显示进度百分比；无法读取挂载点时输出 0。
+volume_size_bytes() {
+  local mountpoint
+  mountpoint="$(docker volume inspect -f '{{.Mountpoint}}' "$1" 2>/dev/null || true)"
+  [[ -n "$mountpoint" && -d "$mountpoint" ]] || {
+    echo 0
+    return 0
+  }
+  path_size_bytes "$mountpoint"
+}
+
+path_size_bytes() {
+  du -sk "$1" 2>/dev/null | awk '{ printf "%.0f\n", $1 * 1024 } END { if (NR == 0) print 0 }'
+}
+
+# count_file 非空时统计打包的原始字节数，供进度显示使用。
 archive_volume_to_gzip() {
-  local volume="$1" output="$2" rc=0
+  local volume="$1" output="$2" count_file="${3:-/dev/null}" rc=0
   rm -f -- "$output"
   if docker run --rm -v "${volume}:/from:ro" alpine:3.20 \
-    tar -C /from -cf - . | gzip_compress_stream >"$output"; then
+    tar -C /from -cf - . 2>>"${DM_LOG_FILE:-/dev/null}" |
+    progress_meter "$count_file" | gzip_compress_stream >"$output"; then
     return 0
   else
     rc=$?
@@ -1286,9 +1863,10 @@ archive_volume_to_gzip() {
 }
 
 archive_bind_to_gzip() {
-  local source="$1" output="$2" rc=0
+  local source="$1" output="$2" count_file="${3:-/dev/null}" rc=0
   rm -f -- "$output"
-  if tar -C / -cf - "${source#/}" | gzip_compress_stream >"$output"; then
+  if tar -C / -cf - "${source#/}" 2>>"${DM_LOG_FILE:-/dev/null}" |
+    progress_meter "$count_file" | gzip_compress_stream >"$output"; then
     return 0
   else
     rc=$?
@@ -1303,47 +1881,42 @@ docker_stop_batch_verified() {
   local name running stop_rc=0 verify_rc=0
   (($# > 0)) || return 0
 
-  run_with_activity "$label" docker stop "$@" >/dev/null || stop_rc=$?
+  DM_PROGRESS_HINT="容器正在处理退出信号，最长等待约 10 秒后会被强制停止" \
+    run_with_activity "$label" dm_quiet docker stop "$@" || stop_rc=$?
   # Docker CLI 的聚合退出码无法指出具体失败项；以 daemon 的最终状态为准，
   # 同时逐个确认，避免部分停止后误以为已经取得一致性快照。
   for name in "$@"; do
     if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)"; then
-      RED "[ERR] 停机后无法确认容器状态：$name"
+      log_line "停机后无法确认容器状态：$name"
       verify_rc=1
     elif [[ "$running" != "false" ]]; then
-      RED "[ERR] 容器仍在运行：$name"
+      log_line "容器仍在运行：$name"
       verify_rc=1
     fi
   done
   ((verify_rc == 0)) || return 1
   if ((stop_rc != 0)); then
-    YEL "[WARN] docker stop 返回异常，但已逐个确认所有目标容器停止。"
+    log_line "docker stop 返回异常，但已逐个确认所有目标容器停止"
   fi
   return 0
 }
 
+# 保存镜像到 images.tar，按镜像层总大小显示进度。
 progress_docker_save() {
-  local outfile="$1"
-  shift
-  local rc=0 started=$SECONDS current=0 restore_errexit=0
-  if command -v pv >/dev/null 2>&1; then
-    case $- in *e*) restore_errexit=1 ;; esac
-    set +e
-    # -f 保证日志被重定向时也持续输出；pipefail 保留 docker save 的失败状态。
-    "$@" | pv -f -b >"$outfile"
-    rc=$?
-    ((restore_errexit == 0)) || set -e
-    current="$(progress_file_size "$outfile")"
-    progress_finish "保存镜像 images.tar" "$rc" "$((SECONDS - started))" "$current"
-  else
-    if run_with_file_progress "保存镜像 images.tar" "$outfile" 0 \
-      progress_capture_stdout "$outfile" "$@"; then
-      rc=0
-    else
-      rc=$?
-    fi
-  fi
-  return "$rc"
+  local outfile="$1" total="$2"
+  shift 2
+  DM_PROGRESS_HINT="镜像较大时需要几分钟，请耐心等待" \
+    run_with_progress "保存镜像" "$outfile" "$total" \
+    progress_capture_stdout "$outfile" dm_logged "$@"
+}
+
+# 镜像大小之和，作为 docker save 输出大小的估算值。
+images_total_bytes() {
+  (($# > 0)) || {
+    echo 0
+    return 0
+  }
+  docker image inspect -f '{{.Size}}' "$@" 2>/dev/null | awk '{ s += $1 } END { printf "%.0f\n", s }'
 }
 
 snapshot_image_ref() {
@@ -1361,7 +1934,7 @@ snapshot_container_image() {
   running="$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || echo false)"
   # 用户选择不停机时不偷偷暂停业务；这种模式本身已明确提示快照可能不一致。
   [[ "$running" != "true" ]] || commit_args+=(--pause=false)
-  if ! "${commit_args[@]}" "$container_id" "$snapshot_image" >/dev/null; then
+  if ! dm_quiet "${commit_args[@]}" "$container_id" "$snapshot_image"; then
     return 1
   fi
   TEMP_IMAGES+=("$snapshot_image")
@@ -1448,7 +2021,7 @@ cleanup_snapshot_images() {
   local image rc=0
   local -a remaining=()
   for image in "${TEMP_IMAGES[@]}"; do
-    if docker image rm "$image" >/dev/null 2>&1; then
+    if dm_quiet docker image rm "$image"; then
       continue
     fi
     # rm 失败后，只有在 Docker daemon 可用且明确查不到镜像时才视为已清理；
@@ -1478,7 +2051,403 @@ umask 077
 BUNDLE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 META="${BUNDLE_DIR}/meta/__NAME__.inspect.json"
 
+# 运行日志：主脚本与生成的恢复脚本共用。
+#
+# 屏幕只显示阶段、进度、警告和最终结果；每一步的细节、执行的命令及其完整
+# 输出都写进日志文件。成功后日志自动删除，失败时保留并在结果中给出路径，
+# 方便用户反馈。子脚本（restore.sh、单容器恢复脚本）通过环境变量沿用父进程
+# 的日志文件，由创建日志的进程负责收尾。
+#
+# DOCKER_MIGRATE_VERBOSE=1（或 --verbose）时，细节同时显示在屏幕上。
+# DOCKER_MIGRATE_LOG_DIR 可指定日志目录，默认 ~/docker_migrate_logs。
+
+# 写入日志前隐藏敏感信息：迁移链接中的密钥，以及 -e/--env 传入或形如
+# *PASSWORD=*、*TOKEN=* 的环境变量值（容器配置里常有数据库密码）。
+log_redact() {
+  sed -E \
+    -e 's/((secret|iv|mac)=)[0-9A-Fa-f]+/\1***/g' \
+    -e 's/((^|[[:space:]])(-e|--env)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=)[^[:space:]]*/\1***/g' \
+    -e 's/(--env=[A-Za-z_][A-Za-z0-9_]*=)[^[:space:]]*/\1***/g' \
+    -e 's/([A-Za-z0-9_]*(PASS|PASSWD|PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL|pass|password|secret|token)[A-Za-z0-9_]*=)[^[:space:]"&]*/\1***/g'
+}
+
+log_timestamp() {
+  date '+%H:%M:%S'
+}
+
+# 追加一行到日志（不显示在屏幕上）。
+log_line() {
+  [[ -n "${DM_LOG_FILE:-}" ]] || return 0
+  printf '[%s] %s\n' "$(log_timestamp)" "$*" | log_redact >>"$DM_LOG_FILE" 2>/dev/null || true
+}
+
+# 细节信息：总是写入日志，--verbose 时也显示在屏幕上。
+detail() {
+  log_line "$*"
+  if [[ "${DOCKER_MIGRATE_VERBOSE:-0}" == "1" ]]; then
+    screen_clear_line
+    printf '    %s\n' "$*" >&2
+  fi
+}
+
+# 运行命令，把标准输出与错误输出都记进日志而不是丢弃；没有日志时保持静默。
+# 命令失败时记录退出码，失败原因因此有据可查。
+dm_quiet() {
+  local rc=0
+  if [[ -z "${DM_LOG_FILE:-}" ]]; then
+    "$@" >/dev/null 2>&1 || rc=$?
+    return "$rc"
+  fi
+  log_line "\$ $*"
+  "$@" >>"$DM_LOG_FILE" 2>&1 || rc=$?
+  ((rc == 0)) || log_line "  → 退出码 ${rc}"
+  return "$rc"
+}
+
+# 只把错误输出记进日志，标准输出照常返回给调用方（用于需要捕获输出的命令）。
+dm_logged() {
+  local rc=0
+  if [[ -z "${DM_LOG_FILE:-}" ]]; then
+    "$@" 2>/dev/null || rc=$?
+    return "$rc"
+  fi
+  log_line "\$ $*"
+  "$@" 2>>"$DM_LOG_FILE" || rc=$?
+  ((rc == 0)) || log_line "  → 退出码 ${rc}"
+  return "$rc"
+}
+
+# 日志开头的环境信息：反馈问题时最常需要的版本与资源情况。
+log_environment() {
+  local kind="$1"
+  shift
+  printf '===== Docker Migrate %s · %s · %s =====\n' "${SCRIPT_VERSION:-unknown}" "$kind" "$(date '+%Y-%m-%d %H:%M:%S %z')"
+  printf '参数：%s\n' "$*"
+  printf '系统：%s\n' "$(uname -srm 2>/dev/null || echo unknown)"
+  if [[ -r /etc/os-release ]]; then
+    printf '发行版：%s\n' "$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-${NAME:-unknown}}")"
+  fi
+  printf 'bash：%s\n' "${BASH_VERSION:-unknown}"
+  printf '用户：uid=%s\n' "$(id -u 2>/dev/null || echo unknown)"
+  printf 'Docker：%s\n' "$(docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}' 2>&1 | head -n1)"
+  printf 'Docker 存储：%s\n' "$(docker info --format '{{.Driver}} · {{.DockerRootDir}} · cgroup {{.CgroupVersion}}' 2>&1 | head -n1)"
+  printf 'Compose：%s\n' "$({ docker compose version --short 2>/dev/null || docker-compose version --short 2>/dev/null || echo '未安装'; } | head -n1)"
+  printf '工具：jq %s · python3 %s · openssl %s\n' \
+    "$(jq --version 2>/dev/null || echo '未安装')" \
+    "$(python3 --version 2>/dev/null | awk '{print $2}' || true)" \
+    "$(openssl version 2>/dev/null | awk '{print $2}' || true)"
+  printf '磁盘：\n'
+  df -h "$PWD" "$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /)" 2>/dev/null | sed 's/^/  /' || true
+  printf '%s\n' '=================================================='
+}
+
+# 创建日志文件；子进程已从父进程继承日志时直接沿用。
+log_init() {
+  local kind="$1" dir
+  shift
+  if [[ -n "${DM_LOG_FILE:-}" && -f "${DM_LOG_FILE}" ]]; then
+    return 0
+  fi
+  dir="${DOCKER_MIGRATE_LOG_DIR:-${HOME:-/tmp}/docker_migrate_logs}"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    dir="${TMPDIR:-/tmp}"
+  fi
+  chmod 700 "$dir" 2>/dev/null || true
+  DM_LOG_FILE="${dir}/${kind}-$(date +%Y%m%d-%H%M%S)-$$.log"
+  if ! : >"$DM_LOG_FILE" 2>/dev/null; then
+    DM_LOG_FILE=""
+    return 0
+  fi
+  chmod 600 "$DM_LOG_FILE" 2>/dev/null || true
+  DM_LOG_OWNER="$$"
+  DM_REASON_FILE="${DM_LOG_FILE%.log}.reason"
+  DM_WARN_FILE="${DM_LOG_FILE%.log}.warnings"
+  DM_TIMING_FILE="${DM_LOG_FILE%.log}.timings"
+  : >"$DM_REASON_FILE" 2>/dev/null || true
+  : >"$DM_WARN_FILE" 2>/dev/null || true
+  : >"$DM_TIMING_FILE" 2>/dev/null || true
+  export DM_LOG_FILE DM_LOG_OWNER DM_REASON_FILE DM_WARN_FILE DM_TIMING_FILE
+  log_environment "$kind" "$@" 2>&1 | log_redact >>"$DM_LOG_FILE" 2>/dev/null || true
+}
+
+# 创建日志的进程在结束时调用：成功则删除日志及附属文件，失败则保留。
+log_finish() {
+  local success="$1"
+  [[ -n "${DM_LOG_FILE:-}" && "${DM_LOG_OWNER:-}" == "$$" ]] || return 0
+  # DOCKER_MIGRATE_KEEP_LOG=1 时成功也保留日志，便于排查或测试。
+  [[ "${DOCKER_MIGRATE_KEEP_LOG:-0}" != "1" ]] || success=0
+  if [[ "$success" == "1" ]]; then
+    rm -f "$DM_LOG_FILE" "${DM_REASON_FILE:-}" "${DM_WARN_FILE:-}" "${DM_TIMING_FILE:-}" 2>/dev/null || true
+    rmdir "$(dirname "$DM_LOG_FILE")" 2>/dev/null || true
+  else
+    rm -f "${DM_WARN_FILE:-}" "${DM_TIMING_FILE:-}" 2>/dev/null || true
+  fi
+}
+
+# 记录本次失败的原因与建议；只保留第一条，它通常就是根因。
+fail_reason() {
+  local reason="$1" hint="${2:-}"
+  log_line "失败原因：${reason}${hint:+（建议：${hint}）}"
+  [[ -n "${DM_REASON_FILE:-}" ]] || return 0
+  if [[ ! -s "$DM_REASON_FILE" ]]; then
+    printf '%s\t%s\n' "$reason" "$hint" >"$DM_REASON_FILE" 2>/dev/null || true
+  fi
+}
+
+# 读取已记录的失败原因，输出“原因<TAB>建议”。
+fail_reason_read() {
+  [[ -n "${DM_REASON_FILE:-}" && -s "$DM_REASON_FILE" ]] || return 1
+  head -n1 "$DM_REASON_FILE"
+}
+
+# 屏幕输出：分阶段显示整体进度。主脚本与生成的恢复脚本共用。
+#
+# 每个阶段在屏幕上只占一行：进行中时由进度显示原地刷新这一行，完成后
+# 替换为“✓ 结果 · 耗时”。警告单独占一行并汇总到最终结果；细节只写日志。
+# 阶段信息通过环境变量传给子脚本，让它们的进度行带上同一个阶段前缀。
+
+screen_is_tty() {
+  [[ -t 2 ]]
+}
+
+screen_clear_line() {
+  screen_is_tty || return 0
+  printf '\r\033[K' >&2
+}
+
+screen_color() {
+  local code="$1"
+  shift
+  if screen_is_tty; then
+    printf '\033[%sm%s\033[0m' "$code" "$*"
+  else
+    printf '%s' "$*"
+  fi
+}
+
+# 当前阶段的前缀，例如“[5/7] 保存镜像”；不在任何阶段内时为空。
+stage_prefix() {
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '[%s/%s] %s' "${DM_STAGE_NUM:-?}" "${DM_STAGE_TOTAL:-?}" "$DM_STAGE_TITLE"
+}
+
+# 进度行开头：阶段前缀加上正在处理的对象。
+stage_label() {
+  local label="${1:-}" prefix
+  prefix="$(stage_prefix)"
+  # 子步骤与阶段同名时不重复显示。
+  [[ "$label" != "${DM_STAGE_TITLE:-}" ]] || label=""
+  if [[ -n "$prefix" && -n "$label" ]]; then
+    printf '%s · %s' "$prefix" "$label"
+  else
+    printf '%s' "${prefix}${label}"
+  fi
+}
+
+stage_begin() {
+  DM_STAGE_NUM="$1"
+  DM_STAGE_TOTAL="$2"
+  DM_STAGE_TITLE="$3"
+  DM_STAGE_STARTED=$SECONDS
+  export DM_STAGE_NUM DM_STAGE_TOTAL DM_STAGE_TITLE
+  log_line "===== [${DM_STAGE_NUM}/${DM_STAGE_TOTAL}] ${DM_STAGE_TITLE} ====="
+  if screen_is_tty; then
+    printf '\r%s\033[K' "$(stage_prefix) …" >&2
+  else
+    printf '%s\n' "$(stage_prefix)" >&2
+  fi
+}
+
+# 阶段内需要提问或列出菜单时，先把阶段标题固定成一整行。
+stage_hold() {
+  screen_is_tty || return 0
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '\r%s\033[K\n' "$(stage_prefix)" >&2
+}
+
+stage_record_timing() {
+  local elapsed="$1"
+  [[ -n "${DM_TIMING_FILE:-}" && -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '%s\t%s\n' "$DM_STAGE_TITLE" "$elapsed" >>"$DM_TIMING_FILE" 2>/dev/null || true
+}
+
+stage_end() {
+  local summary="${1:-}" elapsed
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
+  stage_record_timing "$elapsed"
+  log_line "完成：$(stage_prefix)${summary:+ · ${summary}} · $(format_elapsed "$elapsed")"
+  screen_clear_line
+  printf '%s %s %s%s\n' "$(stage_prefix)" "$(screen_color '1;32' '✓')" \
+    "${summary:+${summary} · }" "$(format_elapsed "$elapsed")" >&2
+  DM_STAGE_TITLE=""
+  export DM_STAGE_TITLE
+}
+
+stage_fail() {
+  local summary="${1:-}" elapsed
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
+  stage_record_timing "$elapsed"
+  log_line "失败：$(stage_prefix)${summary:+ · ${summary}}"
+  screen_clear_line
+  printf '%s %s%s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" "${summary:+ ${summary}}" >&2
+  DM_FAILED_STAGE="$(stage_prefix)"
+  export DM_FAILED_STAGE
+  DM_STAGE_TITLE=""
+  export DM_STAGE_TITLE
+}
+
+# 警告：屏幕上单独一行，写入日志，并在最终结果中汇总。
+warn_user() {
+  log_line "警告：$*"
+  screen_clear_line
+  printf '    %s %s\n' "$(screen_color '1;33' '!')" "$*" >&2
+  if [[ -n "${DM_WARN_FILE:-}" ]]; then
+    printf '%s\n' "$*" >>"$DM_WARN_FILE" 2>/dev/null || true
+  fi
+}
+
+# 错误：写入日志并记录为失败原因；屏幕上的完整说明由最终结果统一给出。
+error_user() {
+  local reason="$1" hint="${2:-}"
+  fail_reason "$reason" "$hint"
+  if [[ "${DM_SUMMARY_ARMED:-0}" != "1" ]]; then
+    screen_clear_line
+    printf '%s %s\n' "$(screen_color '1;31' '✗')" "$reason" >&2
+    [[ -z "$hint" ]] || printf '  建议：%s\n' "$hint" >&2
+  fi
+}
+
+# 最终结果中的“阶段耗时”与“警告”部分。
+print_stage_timings() {
+  local title seconds line=""
+  [[ -n "${DM_TIMING_FILE:-}" && -s "$DM_TIMING_FILE" ]] || return 0
+  while IFS=$'\t' read -r title seconds; do
+    [[ -n "$title" ]] || continue
+    line+="${line:+ · }${title} $(format_elapsed "$seconds")"
+  done <"$DM_TIMING_FILE"
+  [[ -z "$line" ]] || printf '阶段耗时：%s\n' "$line"
+}
+
+print_warning_summary() {
+  local warning count
+  [[ -n "${DM_WARN_FILE:-}" && -s "$DM_WARN_FILE" ]] || return 0
+  count="$(awk 'NF' "$DM_WARN_FILE" | wc -l | tr -d ' ')"
+  printf '警告：%s 条\n' "$count"
+  while IFS= read -r warning; do
+    [[ -n "$warning" ]] || continue
+    printf '  · %s\n' "$warning"
+  done < <(awk 'NF && !seen[$0]++' "$DM_WARN_FILE" | head -n 10)
+}
+
+# 失败时的说明：原因、建议、日志位置与最近的日志内容。
+print_failure_details() {
+  local reason hint row
+  if row="$(fail_reason_read)"; then
+    IFS=$'\t' read -r reason hint <<<"$row"
+    [[ -z "$reason" ]] || printf '原因：%s\n' "$reason"
+    [[ -z "$hint" ]] || printf '建议：%s\n' "$hint"
+  fi
+  if [[ -n "${DM_LOG_FILE:-}" && -f "$DM_LOG_FILE" ]]; then
+    printf '日志：%s\n' "$DM_LOG_FILE"
+    printf '      反馈问题时请附上这个文件（密钥与密码已自动隐藏），或运行 --diagnose 生成诊断包。\n'
+    printf '最近日志：\n'
+    tail -n 15 "$DM_LOG_FILE" | sed 's/^/  /'
+  fi
+}
+
+# 常见错误识别：把 Docker、curl 等工具的英文报错翻译成“原因 + 建议”。
+# 主脚本与生成的恢复脚本共用。
+
+# 根据错误文本输出“原因<TAB>建议”；无法识别时返回 1。
+explain_error() {
+  local text="$1" port
+  shopt -s nocasematch
+  case "$text" in
+    *"port is already allocated"* | *"address already in use"* | *"failed to bind host port"* | *"Bind for "*" failed"*)
+      port="$(grep -oE '(Bind for [^ ]*:|host port |0\.0\.0\.0:|\]:)[0-9]+' <<<"$text" | grep -oE '[0-9]+$' | head -n1 || true)"
+      printf '宿主机端口%s已被其他程序占用\t执行 ss -lntp%s 查看占用的进程，停止它或修改端口后重试\n' \
+        "${port:+ ${port} }" "${port:+ | grep \":${port} \"}"
+      ;;
+    *"no space left on device"*)
+      printf '磁盘空间不足\t执行 df -h 查看剩余空间，清理后重试（docker system prune 可以清理无用的镜像和容器）\n'
+      ;;
+    *"permission denied while trying to connect to the docker"*)
+      printf '当前用户没有访问 Docker 的权限\t请用 root 运行，或用 sudo 运行脚本\n'
+      ;;
+    *"cannot connect to the docker daemon"* | *"is the docker daemon running"*)
+      printf 'Docker 服务没有运行\t执行 systemctl start docker 启动 Docker 后重试\n'
+      ;;
+    *"exec format error"* | *"does not match the detected host platform"* | *"no matching manifest for"*)
+      printf '镜像的 CPU 架构与本机不一致\t请在相同 CPU 架构（如都是 x86_64 或都是 arm64）的服务器之间迁移\n'
+      ;;
+    *"pull access denied"* | *"repository does not exist"* | *"manifest unknown"* | *"not found: manifest"*)
+      printf '镜像仓库中找不到该镜像，或需要登录才能拉取\t检查镜像名；私有镜像请先执行 docker login\n'
+      ;;
+    *"tls handshake timeout"* | *"i/o timeout"* | *"client.timeout exceeded"* | *"request canceled while waiting"*)
+      printf '连接镜像仓库超时\t检查服务器网络，或为 Docker 配置可用的镜像加速地址后重试\n'
+      ;;
+    *"is already in use by container"*)
+      printf '容器名称已被其他容器占用\t删除或重命名同名容器，或设置 RESTORE_EXISTING=replace\n'
+      ;;
+    *"bind source path does not exist"* | *"invalid mount config"*)
+      printf '挂载的宿主机路径不存在\t确认该路径在本机存在后重试\n'
+      ;;
+    *"could not resolve host"*)
+      printf '无法解析链接中的主机名\t检查链接是否完整、DNS 是否可用\n'
+      ;;
+    *"failed to connect"* | *"connection refused"* | *"couldn't connect to server"*)
+      printf '无法连接旧服务器的下载服务\t确认旧服务器上的脚本仍在运行，并检查旧服务器防火墙和云厂商安全组是否放行了下载端口\n'
+      ;;
+    *"unhealthy"* | *"did not become healthy"* | *"healthcheck timed out"*)
+      printf '容器启动后健康检查没有通过\t执行 docker logs <容器名> 查看应用日志；启动较慢的服务可以调大 RESTORE_HEALTH_TIMEOUT\n'
+      ;;
+    *"timed out"* | *"connection reset"*)
+      printf '与旧服务器的连接超时或中断\t检查两台服务器之间的网络，以及旧服务器防火墙和安全组设置，然后重试\n'
+      ;;
+    *"returned error: 404"* | *"404 not found"*)
+      printf '下载地址不存在\t旧服务器可能已经结束传输，或链接没有完整复制；请在旧服务器重新运行备份\n'
+      ;;
+    *"did not remain running"*)
+      printf '容器启动后立即退出\t执行 docker logs <容器名> 查看应用日志\n'
+      ;;
+    *"operation not permitted"* | *"permission denied"*)
+      printf '权限不足\t请用 root 或 sudo 运行脚本\n'
+      ;;
+    *)
+      shopt -u nocasematch
+      return 1
+      ;;
+  esac
+  shopt -u nocasematch
+}
+
+# 记录失败原因：能识别的报错给出具体原因和建议，否则使用调用方给出的描述。
+fail_with_output() {
+  local fallback="$1" output="${2:-}" row reason hint
+  if [[ -n "$output" ]] && row="$(explain_error "$output")"; then
+    IFS=$'\t' read -r reason hint <<<"$row"
+    error_user "${fallback}：${reason}" "$hint"
+  else
+    error_user "$fallback" "${3:-查看下方日志中的最后几行了解详情}"
+  fi
+}
+
+# 日志末尾的报错文本，用于在命令失败后识别原因。
+log_tail_text() {
+  [[ -n "${DM_LOG_FILE:-}" && -f "$DM_LOG_FILE" ]] || return 0
+  tail -n "${1:-30}" "$DM_LOG_FILE" 2>/dev/null || true
+}
+
 # 进度显示与耗时格式化：主脚本与生成的恢复脚本共用。
+#
+# 耗时操作统一通过 run_with_progress 执行，后台 watcher 每秒（非终端每 10 秒）
+# 刷新一行：
+#   知道总量时：[5/7] 保存镜像 ██████░░░░ 58% · 1.2GB/2.1GB · 45MB/s · 剩余约 20 秒
+#   不知道总量：[4/7] 停机并打包数据 · 卷 mysql_data ⠹ 已处理 1.2GB · 45MB/s · 1 分 3 秒
+#   没有字节数：[7/8] 启动服务 · nginx ⠹ 1 分 3 秒
+# 长时间没有进展时追加说明（DM_PROGRESS_HINT），让用户知道程序仍在运行、在等什么。
 
 format_elapsed() {
   local seconds="${1:-0}"
@@ -1492,15 +2461,21 @@ format_elapsed() {
   fi
 }
 
+# 1536 → 1.5KB；整数部分达到两位后不再保留小数。
 human() {
   local b="${1:-0}"
-  local -a units=(B KB MB GB TB PB)
-  local i=0
-  while ((b >= 1024 && i < ${#units[@]} - 1)); do
-    b=$((b / 1024))
-    i=$((i + 1))
-  done
-  echo "${b}${units[$i]}"
+  [[ "$b" =~ ^[0-9]+$ ]] || b=0
+  awk -v b="$b" 'BEGIN {
+    split("B KB MB GB TB PB", u, " ")
+    i = 1
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    if (i == 1 || b >= 10) printf "%d%s\n", b, u[i]
+    else {
+      s = sprintf("%.1f", b)
+      sub(/\.0$/, "", s)
+      printf "%s%s\n", s, u[i]
+    }
+  }'
 }
 
 progress_file_size() {
@@ -1508,32 +2483,114 @@ progress_file_size() {
   stat -c %s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
 }
 
-# 只在确实知道总字节数时显示百分比；未知总量时仅报告已处理字节和耗时，
-# 避免用“假进度条”误导用户。该函数保持纯输出，便于单元测试。
+# 当前已处理字节数。spec 为空时没有字节数；"count:路径" 读取计数文件
+# （由 progress_meter 写入）；其他情况视为正在增长的输出文件。
+progress_current() {
+  local spec="${1:-}" value
+  case "$spec" in
+    "") echo 0 ;;
+    count:*)
+      value="$(cat "${spec#count:}" 2>/dev/null || true)"
+      [[ "$value" =~ ^[0-9]+$ ]] || value=0
+      echo "$value"
+      ;;
+    *) progress_file_size "$spec" ;;
+  esac
+}
+
+# 总字节数。可以是数字，也可以是 "header:路径"：从 curl -D 写出的响应头中
+# 读取 Content-Length（下载开始前未知，开始后才能确定）。
+progress_total() {
+  local spec="${1:-0}" value
+  case "$spec" in
+    header:*)
+      value="$(tr -d '\r' <"${spec#header:}" 2>/dev/null |
+        awk 'tolower($1) == "content-length:" { v = $2 } END { print v + 0 }')"
+      ;;
+    *) value="$spec" ;;
+  esac
+  [[ "$value" =~ ^[0-9]+$ ]] || value=0
+  echo "$value"
+}
+
+# 在管道中计数：原样转发标准输入到标准输出，并把累计字节数写入计数文件。
+# 没有 python3 时退化为 cat（只是不显示字节数）。
+progress_meter() {
+  local count_file="${1:-}"
+  if [[ -z "$count_file" || "$count_file" == /dev/null ]] || ! command -v python3 >/dev/null 2>&1; then
+    cat
+    return
+  fi
+  python3 -c '
+import os, sys, time
+path = sys.argv[1]
+src, dst = sys.stdin.buffer, sys.stdout.buffer
+total, last = 0, 0.0
+def flush():
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(total))
+    os.replace(tmp, path)
+while True:
+    chunk = src.read(1024 * 1024)
+    if not chunk:
+        break
+    dst.write(chunk)
+    total += len(chunk)
+    now = time.monotonic()
+    if now - last >= 0.5:
+        flush()
+        last = now
+dst.flush()
+flush()
+' "$count_file"
+}
+
+progress_bar() {
+  local percent="$1" width=20 filled bar empty
+  filled=$((percent * width / 100))
+  printf -v bar '%*s' "$filled" ''
+  printf -v empty '%*s' "$((width - filled))" ''
+  printf '%s%s' "${bar// /█}" "${empty// /░}"
+}
+
+# 生成一行进度文字（不含换行）。保持纯函数，便于单元测试。
+#   label current total elapsed [rate 字节/秒] [spinner] [hint]
+# 只在确实知道总量时显示百分比，避免用“假进度条”误导用户。
 progress_render() {
   local label="$1" current="${2:-0}" total="${3:-0}" elapsed="${4:-0}"
-  local percent filled empty bar
+  local rate="${5:-0}" spinner="${6:-}" hint="${7:-}"
+  local percent line remaining
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
   [[ "$elapsed" =~ ^[0-9]+$ ]] || elapsed=0
+  [[ "$rate" =~ ^[0-9]+$ ]] || rate=0
   if ((total > 0)); then
     ((current <= total)) || current=$total
     percent=$((current * 100 / total))
-    filled=$((percent * 24 / 100))
-    empty=$((24 - filled))
-    printf -v bar '%*s' "$filled" ''
-    bar=${bar// /#}
-    printf -v empty '%*s' "$empty" ''
-    empty=${empty// /-}
-    printf '[进度] %s [%s%s] %d%% · %s/%s · %s' \
-      "$label" "$bar" "$empty" "$percent" "$(human "$current")" \
-      "$(human "$total")" "$(format_elapsed "$elapsed")"
+    # 总量是估算值时，在命令真正结束前不显示 100%。
+    ((percent < 100)) || percent=99
+    line="${label} $(progress_bar "$percent") ${percent}% · $(human "$current")/$(human "$total")"
+    ((rate == 0)) || line+=" · $(human "$rate")/s"
+    if ((rate > 0 && total > current)); then
+      remaining=$(((total - current) / rate))
+      if ((remaining > 0)); then
+        line+=" · 剩余约 $(format_elapsed "$remaining")"
+      else
+        line+=" · 即将完成"
+      fi
+    else
+      line+=" · $(format_elapsed "$elapsed")"
+    fi
   elif ((current > 0)); then
-    printf '[进度] %s · %s · %s' \
-      "$label" "$(human "$current")" "$(format_elapsed "$elapsed")"
+    line="${label}${spinner:+ ${spinner}} 已处理 $(human "$current")"
+    ((rate == 0)) || line+=" · $(human "$rate")/s"
+    line+=" · $(format_elapsed "$elapsed")"
   else
-    printf '[进度] %s · %s' "$label" "$(format_elapsed "$elapsed")"
+    line="${label}${spinner:+ ${spinner}} $(format_elapsed "$elapsed")"
   fi
+  [[ -z "$hint" ]] || line+=" · ${hint}"
+  printf '%s' "$line"
 }
 
 progress_tty_draw() {
@@ -1546,31 +2603,44 @@ progress_tty_clear() {
   printf '\r\033[K' >&2
 }
 
+# 命令失败只记日志：失败原因由阶段结果与最终结果统一说明，避免屏幕上重复报错。
 progress_finish() {
   local label="$1" rc="$2" elapsed="$3" current="${4:-0}"
-  local suffix=""
   ((rc != 0)) || return 0
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
-  ((current == 0)) || suffix=" · $(human "$current")"
-  printf '[失败] %s · %s%s\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
+  log_line "失败：${label}（退出码 ${rc}，耗时 $(format_elapsed "$elapsed")$( ((current == 0)) || printf '，已处理 %s' "$(human "$current")")）"
 }
 
+# 逐个处理对象时（如扫描容器）在阶段行里显示“第几个/共几个”。
 progress_count() {
   local label="$1" current="$2" total="$3" item="${4:-}"
-  local suffix="" line
-  [[ -z "$item" ]] || suffix="（${item}）"
+  local line
+  printf -v line '%s %d/%d%s' "$label" "$current" "$total" "${item:+（${item}）}"
   if [[ -t 2 ]]; then
-    printf -v line '[进度] %s：%d/%d%s' "$label" "$current" "$total" "$suffix"
-    progress_tty_draw "$line"
-    ((current < total)) || printf '\n' >&2
-  elif ((current == 1 || current == total || current % 10 == 0)); then
-    printf '[进度] %s：%d/%d%s\n' "$label" "$current" "$total" "$suffix" >&2
+    progress_tty_draw "$(stage_label "$line")"
+  elif ((current == total || current % 20 == 0)); then
+    printf '[进度] %s\n' "$(stage_label "$line")" >&2
+  fi
+}
+
+# 不在 run_with_progress 中的等待循环（如健康检查）用它刷新阶段行。
+# 非终端时每 10 秒最多输出一行，避免刷屏。
+progress_note() {
+  local text="$1" now=$SECONDS
+  if [[ -t 2 ]]; then
+    progress_tty_draw "$(stage_label "$text")"
+  elif ((now - ${DM_LAST_NOTE_AT:--100} >= 10)); then
+    DM_LAST_NOTE_AT=$now
+    printf '[进度] %s\n' "$(stage_label "$text")" >&2
   fi
 }
 
 progress_watch() {
-  local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed line timer_pid=""
+  local label="$1" spec="$2" total_spec="$3" started="$4" owner_pid="$5"
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current total elapsed line timer_pid=""
+  local last_bytes=0 last_time=$SECONDS rate=0 sample changed_at=$SECONDS hint="" tick=0
+  local stall="${DM_PROGRESS_STALL:-30}" spinner
+  local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -1580,6 +2650,7 @@ progress_watch() {
     interval=10
   fi
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  [[ "$stall" =~ ^[1-9][0-9]*$ ]] || stall=30
   # watcher 被主流程终止时，也必须立即终止其 sleep 子进程。否则 sleep 会继续
   # 持有命令替换/进程替换的管道，使已经完成的步骤一直等到 interval 到期。
   trap '
@@ -1598,26 +2669,42 @@ progress_watch() {
     wait "$timer_pid" 2>/dev/null || true
     timer_pid=""
     kill -0 "$owner_pid" 2>/dev/null || break
-    current=0
-    [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+    current="$(progress_current "$spec")"
+    total="$(progress_total "$total_spec")"
     elapsed=$((SECONDS - started))
+    # 速度取指数平滑，避免网络抖动时数字跳得太厉害。
+    if ((SECONDS > last_time)); then
+      sample=$(((current - last_bytes) / (SECONDS - last_time)))
+      ((sample >= 0)) || sample=0
+      if ((rate == 0)); then rate=$sample; else rate=$(((rate * 7 + sample * 3) / 10)); fi
+    fi
+    ((current == last_bytes)) || changed_at=$SECONDS
+    last_bytes=$current
+    last_time=$SECONDS
+    hint=""
+    if ((SECONDS - changed_at >= stall)); then
+      hint="${DM_PROGRESS_HINT:-仍在进行，请耐心等待}"
+    fi
+    spinner="${frames[$((tick % 10))]}"
+    tick=$((tick + 1))
     if [[ -t 2 ]]; then
-      line="$(progress_render "$label" "$current" "$total" "$elapsed")"
+      line="$(progress_render "$(stage_label "$label")" "$current" "$total" "$elapsed" "$rate" "$spinner" "$hint")"
       progress_tty_draw "$line"
     else
-      progress_render "$label" "$current" "$total" "$elapsed" >&2
-      printf '\n' >&2
+      printf '[进度] %s\n' "$(progress_render "$(stage_label "$label")" "$current" "$total" "$elapsed" "$rate" "" "$hint")" >&2
     fi
   done
   trap - TERM INT HUP
 }
 
+# 运行命令并显示进度。spec/total 的含义见 progress_current / progress_total。
 run_with_progress() {
-  local label="$1" file="$2" total="$3"
+  local label="$1" spec="$2" total="$3"
   shift 3
   local started=$SECONDS watcher_pid rc current=0 restore_errexit=0
+  log_line "开始：${label}"
   case $- in *e*) restore_errexit=1 ;; esac
-  progress_watch "$label" "$file" "$total" "$started" "$$" &
+  progress_watch "$label" "$spec" "$total" "$started" "$$" &
   watcher_pid=$!
   set +e
   "$@"
@@ -1625,9 +2712,17 @@ run_with_progress() {
   ((restore_errexit == 0)) || set -e
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || progress_tty_clear
-  [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+  if [[ -t 2 ]]; then
+    # 回到阶段行，不留下已完成子步骤的进度文字。
+    if [[ -n "${DM_STAGE_TITLE:-}" ]]; then
+      progress_tty_draw "$(stage_prefix) …"
+    else
+      progress_tty_clear
+    fi
+  fi
+  current="$(progress_current "$spec")"
   progress_finish "$label" "$rc" "$((SECONDS - started))" "$current"
+  ((rc != 0)) || log_line "完成：${label} · $(format_elapsed "$((SECONDS - started))")$( ((current == 0)) || printf ' · %s' "$(human "$current")")"
   return "$rc"
 }
 
@@ -1654,7 +2749,7 @@ progress_capture_stdout() {
 rename_container_with_retry() {
   local old_name="$1" new_name="$2"
   for _ in {1..20}; do
-    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
+    if dm_quiet docker rename "$old_name" "$new_name"; then
       return 0
     fi
     sleep 0.1
@@ -1676,7 +2771,7 @@ restore_container_networks() {
     fi
     connect_args=()
     if [[ "$network" == "bridge" ]]; then
-      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
+      dm_quiet docker network connect "$network" "$container" || return 1
       continue
     fi
     ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
@@ -1686,7 +2781,7 @@ restore_container_networks() {
     while IFS= read -r alias; do
       [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
     done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
-    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
+    dm_quiet docker network connect "${connect_args[@]}" "$network" "$container" || return 1
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
@@ -1697,11 +2792,11 @@ dm_capture_command() {
 }
 
 if [[ ! -f "$META" ]]; then
-  echo "[WARN] missing metadata: $META" >&2
+  error_user "迁移包缺少容器 __NAME__ 的配置文件" "请在旧服务器重新运行备份"
   exit 1
 fi
 if ! command -v jq >/dev/null 2>&1; then
-  echo "[WARN] jq is required to restore container: __NAME__" >&2
+  error_user "恢复容器 __NAME__ 需要 jq" "安装 jq 后重试"
   exit 1
 fi
 
@@ -1726,7 +2821,8 @@ resolve_container_mode() {
       return 0
     fi
   done
-  echo "[WARN] 依附的容器 ${ref:0:12} 不在迁移包中，请在源服务器把它一起迁移" >&2
+  log_line "依附的容器 ${ref:0:12} 不在迁移包中"
+  fail_reason "依附的容器 ${ref:0:12} 不在迁移包中" "请在旧服务器把它和依附它的容器一起迁移"
   printf '%s\n' "$mode"
 }
 
@@ -1741,7 +2837,7 @@ decode_base64() {
 name="$(jq -r '.[0].Name | ltrimstr("/")' "$META")"
 image="$(jq -r '.[0].Config.Image' "$META")"
 if [[ -z "$name" || -z "$image" || "$image" == "null" ]]; then
-  echo "[WARN] invalid container metadata for __NAME__" >&2
+  error_user "容器 __NAME__ 的配置文件无效" "请在旧服务器重新运行备份"
   exit 1
 fi
 
@@ -1758,38 +2854,38 @@ disconnect_container_networks() {
   local container="$1" metadata_file="$2" network
   while IFS= read -r network; do
     case "$network" in "" | host | none) continue ;; esac
-    docker network disconnect -f "$network" "$container" >/dev/null 2>&1 || return 1
+    dm_quiet docker network disconnect -f "$network" "$container" || return 1
   done < <(jq -r 'keys[]?' "$metadata_file")
 }
 
 restore_previous_container() {
   ((replacement_active == 1)) || return 0
-  echo "[WARN] new container failed; preserving previous container for rollback: $name" >&2
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  log_line "新容器 ${name} 未能通过验证，删除它并还原旧容器"
+  dm_quiet docker rm -f "$name" || true
   if ((transaction_mode == 1)); then
     # 数据必须先由主恢复脚本回滚；旧容器在那之后才会改回原名并恢复状态。
     replacement_active=0
     return 0
   fi
   if ! rename_container_with_retry "$replacement_backup_name" "$name"; then
-    echo "[WARN] automatic rollback failed; previous container remains as: $replacement_backup_name" >&2
+    warn_user "旧容器自动还原失败，它目前的名称是 ${replacement_backup_name}"
     return 1
   fi
   if ! restore_container_networks "$name" "$replacement_networks_file"; then
-    echo "[WARN] previous container name was restored, but its networks could not be fully reconnected: $name" >&2
+    warn_user "旧容器 ${name} 已改回原名，但网络没有完全重新连接"
     return 1
   fi
   case "$replacement_original_state" in
     running | restarting)
-      docker start "$name" >/dev/null 2>&1 || return 1
+      dm_quiet docker start "$name" || return 1
       ;;
     paused)
-      docker start "$name" >/dev/null 2>&1 || return 1
-      docker pause "$name" >/dev/null 2>&1 || return 1
+      dm_quiet docker start "$name" || return 1
+      dm_quiet docker pause "$name" || return 1
       ;;
   esac
   replacement_active=0
-  echo "[INFO] previous container restored: $name" >&2
+  log_line "旧容器已还原：${name}"
 }
 
 replacement_exit_handler() {
@@ -1806,9 +2902,10 @@ replacement_exit_handler() {
 trap replacement_exit_handler EXIT
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then
-  echo "[INFO] image is not loaded; pull before changing any existing container: $image"
-  run_with_activity "拉取容器镜像：$image" docker pull "$image" || {
-    echo "[WARN] image is unavailable; existing container was left unchanged: $image" >&2
+  detail "镜像 ${image} 不在本机，先在线拉取（此时还没有改动已有容器）"
+  DM_PROGRESS_HINT="正在从镜像仓库下载，网络较慢时可能需要几分钟" \
+    run_with_activity "拉取镜像 ${image}" dm_quiet docker pull "$image" || {
+    fail_with_output "容器 ${name} 的镜像 ${image} 拉取失败（已有容器保持不变）" "$(log_tail_text 10)"
     exit 1
   }
 fi
@@ -1822,11 +2919,11 @@ if docker container inspect "$name" >/dev/null 2>&1; then
   fi
   case "${RESTORE_EXISTING:-replace}" in
     replace)
-      echo "[WARN] container exists; replace it to restore the complete configuration: $name"
+      detail "新服务器已有同名容器 ${name}，替换它以恢复完整配置（失败时会还原）"
       replacement_original_state="$existing_state"
       replacement_backup_name="${name}.docker-migrate-backup-$$"
       if docker container inspect "$replacement_backup_name" >/dev/null 2>&1; then
-        echo "[WARN] rollback container name already exists: $replacement_backup_name" >&2
+        error_user "回滚用的容器名 ${replacement_backup_name} 已被占用" "删除或重命名这个容器后重试"
         exit 1
       fi
       if ((transaction_mode == 1)); then
@@ -1837,7 +2934,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
       fi
       if ! docker inspect "$name" | jq '.[0].NetworkSettings.Networks // {}' \
         >"$replacement_networks_file"; then
-        echo "[WARN] failed to preserve existing container networks: $name" >&2
+        error_user "无法记录已有容器 ${name} 的网络配置（已有容器保持不变）"
         exit 1
       fi
       if ((transaction_mode == 1)); then
@@ -1845,35 +2942,35 @@ if docker container inspect "$name" >/dev/null 2>&1; then
         printf '%s\t%s\t%s\n' "$name" "$replacement_backup_name" "$replacement_original_state" \
           >>"${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv" || exit 1
       fi
-      [[ "$existing_state" == "paused" ]] && docker unpause "$name" >/dev/null 2>&1 || true
+      [[ "$existing_state" == "paused" ]] && dm_quiet docker unpause "$name" || true
       case "$existing_state" in
         running | restarting | paused)
-          run_with_activity "停止目标端旧容器：$name" docker stop "$name" >/dev/null || {
-            echo "[WARN] failed to stop existing container; it was left unchanged: $name" >&2
+          run_with_activity "停止已有容器 ${name}" dm_quiet docker stop "$name" || {
+            fail_with_output "无法停止已有容器 ${name}（它保持不变）" "$(log_tail_text 10)"
             exit 1
           }
           ;;
       esac
-      docker rename "$name" "$replacement_backup_name" >/dev/null 2>&1 || {
-        echo "[WARN] failed to preserve existing container; it was left unchanged: $name" >&2
+      dm_quiet docker rename "$name" "$replacement_backup_name" || {
+        fail_with_output "无法为已有容器 ${name} 建立回滚点（它保持不变）" "$(log_tail_text 10)"
         exit 1
       }
       replacement_active=1
       if ! disconnect_container_networks "$replacement_backup_name" "$replacement_networks_file"; then
-        echo "[WARN] failed to release previous container network endpoints: $name" >&2
+        fail_with_output "无法释放已有容器 ${name} 占用的网络地址" "$(log_tail_text 10)"
         exit 1
       fi
       ;;
     skip)
-      echo "[WARN] container exists; skipped by RESTORE_EXISTING=skip: $name"
+      warn_user "容器 ${name} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       exit 0
       ;;
     fail)
-      echo "[WARN] container exists; refusing to replace it (RESTORE_EXISTING=fail): $name" >&2
+      error_user "容器 ${name} 已存在（RESTORE_EXISTING=fail 不允许替换）" "删除这个容器，或改用 RESTORE_EXISTING=replace"
       exit 1
       ;;
     *)
-      echo "[WARN] invalid RESTORE_EXISTING value: ${RESTORE_EXISTING}; use replace, skip, or fail" >&2
+      error_user "RESTORE_EXISTING 的值无效：${RESTORE_EXISTING}" "可用的值是 replace、skip 或 fail"
       exit 1
       ;;
   esac
@@ -2021,7 +3118,7 @@ elif [[ "$hc_kind" == "CMD" || "$hc_kind" == "CMD-SHELL" ]]; then
     hc_test="$(jq -r '.[0].Config.Healthcheck.Test[1] // empty' "$META")"
   else
     hc_test="$(jq -r '.[0].Config.Healthcheck.Test[1:] | map(@sh) | join(" ")' "$META")"
-    echo "[WARN] docker run 只支持 shell 形式健康检查，已改写为：$hc_test（镜像需包含 /bin/sh）" >&2
+    warn_user "容器 ${name} 的健康检查改写为 shell 形式（镜像需要包含 /bin/sh）：${hc_test}"
   fi
   hc_interval="$(jq -r '.[0].Config.Healthcheck.Interval // 30000000000' "$META")"
   hc_timeout="$(jq -r '.[0].Config.Healthcheck.Timeout // 30000000000' "$META")"
@@ -2123,7 +3220,7 @@ for p in "${port_bindings[@]}"; do
   fi
   args+=(-p "$port_binding")
   published_ports+=("$port_binding")
-  echo "[INFO] restore port: ${host_ip:-0.0.0.0}:${host_port}->${cont_port}"
+  detail "端口映射：${host_ip:-0.0.0.0}:${host_port} -> ${cont_port}"
 done
 
 mapfile -t mounts < <(jq -r '.[0].Mounts[]? | @base64' "$META")
@@ -2196,26 +3293,17 @@ fi
 run_output=""
 run_log="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-run.XXXXXX")" || exit 1
 set +e
-run_with_activity "创建并启动容器：$name" dm_capture_command "$run_log" "${args[@]}"
+log_line "\$ ${args[*]}"
+run_with_activity "${name}" dm_capture_command "$run_log" "${args[@]}"
 run_rc=$?
 set -e
 run_output="$(cat "$run_log")"
 rm -f "$run_log"
 
 if [[ $run_rc -ne 0 ]]; then
-  echo "[ERR] 容器创建或启动失败：$name" >&2
-  [[ -z "$run_output" ]] || printf '%s\n' "$run_output" >&2
-  if grep -Eqi 'port is already allocated|address already in use|Bind for .* failed|failed to bind host port' \
-    <<<"$run_output"; then
-    echo "[ERR] 已确认宿主机端口绑定冲突。" >&2
-    if ((${#published_ports[@]})); then
-      echo "[INFO] 本次尝试绑定的端口：" >&2
-      for p in "${published_ports[@]}"; do
-        echo "[INFO]   - $p" >&2
-      done
-    fi
-    echo "[INFO] 可执行 sudo ss -lntp 检查占用端口的进程。" >&2
-  fi
+  log_line "容器 ${name} 创建失败（退出码 ${run_rc}）：${run_output}"
+  ((${#published_ports[@]} == 0)) || log_line "本次尝试绑定的端口：${published_ports[*]}"
+  fail_with_output "容器 ${name} 创建失败" "$run_output"
   exit "$run_rc"
 fi
 
@@ -2236,14 +3324,10 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
     if [[ -n "$aliases_raw" && "$aliases_raw" != "null" ]]; then
       for a in $aliases_raw; do conn_args+=(--alias "$a"); done
     fi
-    docker network connect "${conn_args[@]}" "$net_name" "$name" >/dev/null 2>&1 || {
+    dm_quiet docker network connect "${conn_args[@]}" "$net_name" "$name" || {
       network_restore_failed=1
-      echo "[WARN] 连接额外网络失败：$net_name，容器可能缺少网络" >&2
-      case "$net_name" in
-        macvlan* | ipvlan* | overlay*)
-          echo "[WARN] → 网络 $net_name 需管理员在目标服务器预创建（macvlan/ipvlan/overlay 不自动创建）" >&2
-          ;;
-      esac
+      fail_with_output "容器 ${name} 无法连接网络 ${net_name}" "$(log_tail_text 10)" \
+        "macvlan、ipvlan、overlay 网络需要先在新服务器手动创建"
     }
   done
 fi
@@ -2259,7 +3343,7 @@ if [[ "$original_running" == "true" &&
   ("$health_kind" == "CMD" || "$health_kind" == "CMD-SHELL") ]]; then
   health_timeout="${RESTORE_HEALTH_TIMEOUT:-60}"
   if ! [[ "$health_timeout" =~ ^[1-9][0-9]*$ ]] || ((health_timeout > 3600)); then
-    echo "[WARN] invalid RESTORE_HEALTH_TIMEOUT: $health_timeout (expected 1-3600 seconds)" >&2
+    error_user "RESTORE_HEALTH_TIMEOUT 的值无效：$health_timeout" "请设置为 1 到 3600 之间的秒数"
     exit 1
   fi
   health_deadline=$((SECONDS + health_timeout))
@@ -2271,29 +3355,31 @@ if [[ "$original_running" == "true" &&
     health_elapsed=$((SECONDS - health_started))
     case "$health_status" in
       healthy)
-        echo "[完成] 容器健康检查：$name · ${health_elapsed}秒" >&2
+        log_line "[完成] 容器健康检查：$name · ${health_elapsed}秒"
         break
         ;;
       unhealthy | exited | dead)
-        echo "[WARN] new container did not become healthy: $name ($health_status)" >&2
+        error_user "容器 ${name} 健康检查没有通过（${health_status}）" "执行 docker logs ${name} 查看应用日志"
         exit 1
         ;;
     esac
     if [[ "$health_status" != "$health_last_status" ]] || ((health_elapsed >= health_next_report)); then
-      echo "[进度] 容器健康检查：$name · ${health_status:-未知} · ${health_elapsed}/${health_timeout}秒" >&2
+      log_line "[进度] 容器健康检查：$name · ${health_status:-未知} · ${health_elapsed}/${health_timeout}秒"
       health_last_status="$health_status"
       health_next_report=$((health_elapsed + 5))
     fi
+    progress_note "${name} 健康检查 · ${health_status:-starting} · ${health_elapsed}/${health_timeout} 秒"
     sleep 1
   done
   if [[ "${health_status:-}" != "healthy" ]]; then
-    echo "[WARN] healthcheck timed out after ${health_timeout}s: $name" >&2
+    error_user "容器 ${name} 健康检查超时（${health_timeout} 秒）" \
+      "执行 docker logs ${name} 查看应用日志；启动较慢的服务可以调大 RESTORE_HEALTH_TIMEOUT"
     exit 1
   fi
 elif [[ "$original_running" == "true" ]]; then
   startup_grace="${RESTORE_STARTUP_GRACE:-3}"
   if ! [[ "$startup_grace" =~ ^[1-9][0-9]*$ ]] || ((startup_grace > 300)); then
-    echo "[WARN] invalid RESTORE_STARTUP_GRACE: $startup_grace (expected 1-300 seconds)" >&2
+    error_user "RESTORE_STARTUP_GRACE 的值无效：$startup_grace" "请设置为 1 到 300 之间的秒数"
     exit 1
   fi
   startup_deadline=$((SECONDS + startup_grace))
@@ -2304,29 +3390,29 @@ elif [[ "$original_running" == "true" ]]; then
     case "$startup_status" in
       running) ;;
       *)
-        echo "[WARN] new container did not remain running: $name (${startup_status:-missing})" >&2
+        error_user "容器 ${name} 启动后立即退出（${startup_status:-missing}）" "执行 docker logs ${name} 查看应用日志"
         exit 1
         ;;
     esac
     startup_elapsed=$((SECONDS - startup_started))
     if ((startup_elapsed >= startup_next_report)); then
-      echo "[进度] 容器启动验证：$name · running · ${startup_elapsed}/${startup_grace}秒" >&2
+      log_line "[进度] 容器启动验证：$name · running · ${startup_elapsed}/${startup_grace}秒"
       startup_next_report=$((startup_elapsed + 5))
     fi
     ((SECONDS >= startup_deadline)) && break
     sleep 1
   done
-  echo "[完成] 容器启动验证：$name · $((SECONDS - startup_started))秒" >&2
+  log_line "[完成] 容器启动验证：$name · $((SECONDS - startup_started))秒"
 fi
 
 snapshot_original="$(jq -r '.[0].DockerMigrate.original_image // empty' "$META")"
 if [[ -n "$snapshot_original" ]]; then
-  echo "[INFO] ${name} 使用迁移快照镜像 ${image} 以保留容器内改动；原镜像为 ${snapshot_original}，以后升级请用原镜像重建容器。"
+  warn_user "${name} 使用快照镜像保留了容器内的改动，以后升级请用原镜像 ${snapshot_original} 重建"
 fi
 
 if [[ "$original_paused" == "true" ]]; then
-  docker pause "$name" >/dev/null 2>&1 || {
-    echo "[WARN] failed to restore paused state: $name" >&2
+  dm_quiet docker pause "$name" || {
+    error_user "无法把容器 ${name} 恢复为暂停状态"
     exit 1
   }
 fi
@@ -2335,12 +3421,12 @@ if ((replacement_active == 1)); then
   if ((transaction_mode == 1)); then
     # 由全局事务在全部项目、数据和健康检查通过后统一删除回滚容器。
     replacement_active=0
-    echo "[INFO] replacement verified; rollback container retained until transaction commit: $replacement_backup_name"
-  elif docker rm -f "$replacement_backup_name" >/dev/null 2>&1; then
+    log_line "替换已验证，回滚容器 ${replacement_backup_name} 保留到事务提交"
+  elif dm_quiet docker rm -f "$replacement_backup_name"; then
     replacement_active=0
-    echo "[INFO] replacement verified; removed rollback container: $replacement_backup_name"
+    log_line "替换已验证，已删除回滚容器 ${replacement_backup_name}"
   else
-    echo "[WARN] new container is running, but rollback container could not be removed: $replacement_backup_name" >&2
+    warn_user "新容器已运行，但回滚容器 ${replacement_backup_name} 没能删除，可以手动执行 docker rm -f ${replacement_backup_name}"
   fi
 fi
 RUN_SH
@@ -2367,9 +3453,6 @@ umask 077
 
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$BUNDLE_DIR"
-
-say() { echo -e "\033[1;34m$*\033[0m"; }
-warn() { echo -e "\033[1;33m$*\033[0m"; }
 
 # 彩色输出：主脚本与生成的恢复脚本共用。
 BLUE() { echo -e "\033[1;34m$*\033[0m"; }
@@ -2404,7 +3487,403 @@ sha256_file() {
   fi
 }
 
+# 运行日志：主脚本与生成的恢复脚本共用。
+#
+# 屏幕只显示阶段、进度、警告和最终结果；每一步的细节、执行的命令及其完整
+# 输出都写进日志文件。成功后日志自动删除，失败时保留并在结果中给出路径，
+# 方便用户反馈。子脚本（restore.sh、单容器恢复脚本）通过环境变量沿用父进程
+# 的日志文件，由创建日志的进程负责收尾。
+#
+# DOCKER_MIGRATE_VERBOSE=1（或 --verbose）时，细节同时显示在屏幕上。
+# DOCKER_MIGRATE_LOG_DIR 可指定日志目录，默认 ~/docker_migrate_logs。
+
+# 写入日志前隐藏敏感信息：迁移链接中的密钥，以及 -e/--env 传入或形如
+# *PASSWORD=*、*TOKEN=* 的环境变量值（容器配置里常有数据库密码）。
+log_redact() {
+  sed -E \
+    -e 's/((secret|iv|mac)=)[0-9A-Fa-f]+/\1***/g' \
+    -e 's/((^|[[:space:]])(-e|--env)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=)[^[:space:]]*/\1***/g' \
+    -e 's/(--env=[A-Za-z_][A-Za-z0-9_]*=)[^[:space:]]*/\1***/g' \
+    -e 's/([A-Za-z0-9_]*(PASS|PASSWD|PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL|pass|password|secret|token)[A-Za-z0-9_]*=)[^[:space:]"&]*/\1***/g'
+}
+
+log_timestamp() {
+  date '+%H:%M:%S'
+}
+
+# 追加一行到日志（不显示在屏幕上）。
+log_line() {
+  [[ -n "${DM_LOG_FILE:-}" ]] || return 0
+  printf '[%s] %s\n' "$(log_timestamp)" "$*" | log_redact >>"$DM_LOG_FILE" 2>/dev/null || true
+}
+
+# 细节信息：总是写入日志，--verbose 时也显示在屏幕上。
+detail() {
+  log_line "$*"
+  if [[ "${DOCKER_MIGRATE_VERBOSE:-0}" == "1" ]]; then
+    screen_clear_line
+    printf '    %s\n' "$*" >&2
+  fi
+}
+
+# 运行命令，把标准输出与错误输出都记进日志而不是丢弃；没有日志时保持静默。
+# 命令失败时记录退出码，失败原因因此有据可查。
+dm_quiet() {
+  local rc=0
+  if [[ -z "${DM_LOG_FILE:-}" ]]; then
+    "$@" >/dev/null 2>&1 || rc=$?
+    return "$rc"
+  fi
+  log_line "\$ $*"
+  "$@" >>"$DM_LOG_FILE" 2>&1 || rc=$?
+  ((rc == 0)) || log_line "  → 退出码 ${rc}"
+  return "$rc"
+}
+
+# 只把错误输出记进日志，标准输出照常返回给调用方（用于需要捕获输出的命令）。
+dm_logged() {
+  local rc=0
+  if [[ -z "${DM_LOG_FILE:-}" ]]; then
+    "$@" 2>/dev/null || rc=$?
+    return "$rc"
+  fi
+  log_line "\$ $*"
+  "$@" 2>>"$DM_LOG_FILE" || rc=$?
+  ((rc == 0)) || log_line "  → 退出码 ${rc}"
+  return "$rc"
+}
+
+# 日志开头的环境信息：反馈问题时最常需要的版本与资源情况。
+log_environment() {
+  local kind="$1"
+  shift
+  printf '===== Docker Migrate %s · %s · %s =====\n' "${SCRIPT_VERSION:-unknown}" "$kind" "$(date '+%Y-%m-%d %H:%M:%S %z')"
+  printf '参数：%s\n' "$*"
+  printf '系统：%s\n' "$(uname -srm 2>/dev/null || echo unknown)"
+  if [[ -r /etc/os-release ]]; then
+    printf '发行版：%s\n' "$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-${NAME:-unknown}}")"
+  fi
+  printf 'bash：%s\n' "${BASH_VERSION:-unknown}"
+  printf '用户：uid=%s\n' "$(id -u 2>/dev/null || echo unknown)"
+  printf 'Docker：%s\n' "$(docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}' 2>&1 | head -n1)"
+  printf 'Docker 存储：%s\n' "$(docker info --format '{{.Driver}} · {{.DockerRootDir}} · cgroup {{.CgroupVersion}}' 2>&1 | head -n1)"
+  printf 'Compose：%s\n' "$({ docker compose version --short 2>/dev/null || docker-compose version --short 2>/dev/null || echo '未安装'; } | head -n1)"
+  printf '工具：jq %s · python3 %s · openssl %s\n' \
+    "$(jq --version 2>/dev/null || echo '未安装')" \
+    "$(python3 --version 2>/dev/null | awk '{print $2}' || true)" \
+    "$(openssl version 2>/dev/null | awk '{print $2}' || true)"
+  printf '磁盘：\n'
+  df -h "$PWD" "$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /)" 2>/dev/null | sed 's/^/  /' || true
+  printf '%s\n' '=================================================='
+}
+
+# 创建日志文件；子进程已从父进程继承日志时直接沿用。
+log_init() {
+  local kind="$1" dir
+  shift
+  if [[ -n "${DM_LOG_FILE:-}" && -f "${DM_LOG_FILE}" ]]; then
+    return 0
+  fi
+  dir="${DOCKER_MIGRATE_LOG_DIR:-${HOME:-/tmp}/docker_migrate_logs}"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    dir="${TMPDIR:-/tmp}"
+  fi
+  chmod 700 "$dir" 2>/dev/null || true
+  DM_LOG_FILE="${dir}/${kind}-$(date +%Y%m%d-%H%M%S)-$$.log"
+  if ! : >"$DM_LOG_FILE" 2>/dev/null; then
+    DM_LOG_FILE=""
+    return 0
+  fi
+  chmod 600 "$DM_LOG_FILE" 2>/dev/null || true
+  DM_LOG_OWNER="$$"
+  DM_REASON_FILE="${DM_LOG_FILE%.log}.reason"
+  DM_WARN_FILE="${DM_LOG_FILE%.log}.warnings"
+  DM_TIMING_FILE="${DM_LOG_FILE%.log}.timings"
+  : >"$DM_REASON_FILE" 2>/dev/null || true
+  : >"$DM_WARN_FILE" 2>/dev/null || true
+  : >"$DM_TIMING_FILE" 2>/dev/null || true
+  export DM_LOG_FILE DM_LOG_OWNER DM_REASON_FILE DM_WARN_FILE DM_TIMING_FILE
+  log_environment "$kind" "$@" 2>&1 | log_redact >>"$DM_LOG_FILE" 2>/dev/null || true
+}
+
+# 创建日志的进程在结束时调用：成功则删除日志及附属文件，失败则保留。
+log_finish() {
+  local success="$1"
+  [[ -n "${DM_LOG_FILE:-}" && "${DM_LOG_OWNER:-}" == "$$" ]] || return 0
+  # DOCKER_MIGRATE_KEEP_LOG=1 时成功也保留日志，便于排查或测试。
+  [[ "${DOCKER_MIGRATE_KEEP_LOG:-0}" != "1" ]] || success=0
+  if [[ "$success" == "1" ]]; then
+    rm -f "$DM_LOG_FILE" "${DM_REASON_FILE:-}" "${DM_WARN_FILE:-}" "${DM_TIMING_FILE:-}" 2>/dev/null || true
+    rmdir "$(dirname "$DM_LOG_FILE")" 2>/dev/null || true
+  else
+    rm -f "${DM_WARN_FILE:-}" "${DM_TIMING_FILE:-}" 2>/dev/null || true
+  fi
+}
+
+# 记录本次失败的原因与建议；只保留第一条，它通常就是根因。
+fail_reason() {
+  local reason="$1" hint="${2:-}"
+  log_line "失败原因：${reason}${hint:+（建议：${hint}）}"
+  [[ -n "${DM_REASON_FILE:-}" ]] || return 0
+  if [[ ! -s "$DM_REASON_FILE" ]]; then
+    printf '%s\t%s\n' "$reason" "$hint" >"$DM_REASON_FILE" 2>/dev/null || true
+  fi
+}
+
+# 读取已记录的失败原因，输出“原因<TAB>建议”。
+fail_reason_read() {
+  [[ -n "${DM_REASON_FILE:-}" && -s "$DM_REASON_FILE" ]] || return 1
+  head -n1 "$DM_REASON_FILE"
+}
+
+# 屏幕输出：分阶段显示整体进度。主脚本与生成的恢复脚本共用。
+#
+# 每个阶段在屏幕上只占一行：进行中时由进度显示原地刷新这一行，完成后
+# 替换为“✓ 结果 · 耗时”。警告单独占一行并汇总到最终结果；细节只写日志。
+# 阶段信息通过环境变量传给子脚本，让它们的进度行带上同一个阶段前缀。
+
+screen_is_tty() {
+  [[ -t 2 ]]
+}
+
+screen_clear_line() {
+  screen_is_tty || return 0
+  printf '\r\033[K' >&2
+}
+
+screen_color() {
+  local code="$1"
+  shift
+  if screen_is_tty; then
+    printf '\033[%sm%s\033[0m' "$code" "$*"
+  else
+    printf '%s' "$*"
+  fi
+}
+
+# 当前阶段的前缀，例如“[5/7] 保存镜像”；不在任何阶段内时为空。
+stage_prefix() {
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '[%s/%s] %s' "${DM_STAGE_NUM:-?}" "${DM_STAGE_TOTAL:-?}" "$DM_STAGE_TITLE"
+}
+
+# 进度行开头：阶段前缀加上正在处理的对象。
+stage_label() {
+  local label="${1:-}" prefix
+  prefix="$(stage_prefix)"
+  # 子步骤与阶段同名时不重复显示。
+  [[ "$label" != "${DM_STAGE_TITLE:-}" ]] || label=""
+  if [[ -n "$prefix" && -n "$label" ]]; then
+    printf '%s · %s' "$prefix" "$label"
+  else
+    printf '%s' "${prefix}${label}"
+  fi
+}
+
+stage_begin() {
+  DM_STAGE_NUM="$1"
+  DM_STAGE_TOTAL="$2"
+  DM_STAGE_TITLE="$3"
+  DM_STAGE_STARTED=$SECONDS
+  export DM_STAGE_NUM DM_STAGE_TOTAL DM_STAGE_TITLE
+  log_line "===== [${DM_STAGE_NUM}/${DM_STAGE_TOTAL}] ${DM_STAGE_TITLE} ====="
+  if screen_is_tty; then
+    printf '\r%s\033[K' "$(stage_prefix) …" >&2
+  else
+    printf '%s\n' "$(stage_prefix)" >&2
+  fi
+}
+
+# 阶段内需要提问或列出菜单时，先把阶段标题固定成一整行。
+stage_hold() {
+  screen_is_tty || return 0
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '\r%s\033[K\n' "$(stage_prefix)" >&2
+}
+
+stage_record_timing() {
+  local elapsed="$1"
+  [[ -n "${DM_TIMING_FILE:-}" && -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  printf '%s\t%s\n' "$DM_STAGE_TITLE" "$elapsed" >>"$DM_TIMING_FILE" 2>/dev/null || true
+}
+
+stage_end() {
+  local summary="${1:-}" elapsed
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
+  stage_record_timing "$elapsed"
+  log_line "完成：$(stage_prefix)${summary:+ · ${summary}} · $(format_elapsed "$elapsed")"
+  screen_clear_line
+  printf '%s %s %s%s\n' "$(stage_prefix)" "$(screen_color '1;32' '✓')" \
+    "${summary:+${summary} · }" "$(format_elapsed "$elapsed")" >&2
+  DM_STAGE_TITLE=""
+  export DM_STAGE_TITLE
+}
+
+stage_fail() {
+  local summary="${1:-}" elapsed
+  [[ -n "${DM_STAGE_TITLE:-}" ]] || return 0
+  elapsed=$((SECONDS - ${DM_STAGE_STARTED:-$SECONDS}))
+  stage_record_timing "$elapsed"
+  log_line "失败：$(stage_prefix)${summary:+ · ${summary}}"
+  screen_clear_line
+  printf '%s %s%s\n' "$(stage_prefix)" "$(screen_color '1;31' '✗')" "${summary:+ ${summary}}" >&2
+  DM_FAILED_STAGE="$(stage_prefix)"
+  export DM_FAILED_STAGE
+  DM_STAGE_TITLE=""
+  export DM_STAGE_TITLE
+}
+
+# 警告：屏幕上单独一行，写入日志，并在最终结果中汇总。
+warn_user() {
+  log_line "警告：$*"
+  screen_clear_line
+  printf '    %s %s\n' "$(screen_color '1;33' '!')" "$*" >&2
+  if [[ -n "${DM_WARN_FILE:-}" ]]; then
+    printf '%s\n' "$*" >>"$DM_WARN_FILE" 2>/dev/null || true
+  fi
+}
+
+# 错误：写入日志并记录为失败原因；屏幕上的完整说明由最终结果统一给出。
+error_user() {
+  local reason="$1" hint="${2:-}"
+  fail_reason "$reason" "$hint"
+  if [[ "${DM_SUMMARY_ARMED:-0}" != "1" ]]; then
+    screen_clear_line
+    printf '%s %s\n' "$(screen_color '1;31' '✗')" "$reason" >&2
+    [[ -z "$hint" ]] || printf '  建议：%s\n' "$hint" >&2
+  fi
+}
+
+# 最终结果中的“阶段耗时”与“警告”部分。
+print_stage_timings() {
+  local title seconds line=""
+  [[ -n "${DM_TIMING_FILE:-}" && -s "$DM_TIMING_FILE" ]] || return 0
+  while IFS=$'\t' read -r title seconds; do
+    [[ -n "$title" ]] || continue
+    line+="${line:+ · }${title} $(format_elapsed "$seconds")"
+  done <"$DM_TIMING_FILE"
+  [[ -z "$line" ]] || printf '阶段耗时：%s\n' "$line"
+}
+
+print_warning_summary() {
+  local warning count
+  [[ -n "${DM_WARN_FILE:-}" && -s "$DM_WARN_FILE" ]] || return 0
+  count="$(awk 'NF' "$DM_WARN_FILE" | wc -l | tr -d ' ')"
+  printf '警告：%s 条\n' "$count"
+  while IFS= read -r warning; do
+    [[ -n "$warning" ]] || continue
+    printf '  · %s\n' "$warning"
+  done < <(awk 'NF && !seen[$0]++' "$DM_WARN_FILE" | head -n 10)
+}
+
+# 失败时的说明：原因、建议、日志位置与最近的日志内容。
+print_failure_details() {
+  local reason hint row
+  if row="$(fail_reason_read)"; then
+    IFS=$'\t' read -r reason hint <<<"$row"
+    [[ -z "$reason" ]] || printf '原因：%s\n' "$reason"
+    [[ -z "$hint" ]] || printf '建议：%s\n' "$hint"
+  fi
+  if [[ -n "${DM_LOG_FILE:-}" && -f "$DM_LOG_FILE" ]]; then
+    printf '日志：%s\n' "$DM_LOG_FILE"
+    printf '      反馈问题时请附上这个文件（密钥与密码已自动隐藏），或运行 --diagnose 生成诊断包。\n'
+    printf '最近日志：\n'
+    tail -n 15 "$DM_LOG_FILE" | sed 's/^/  /'
+  fi
+}
+
+# 常见错误识别：把 Docker、curl 等工具的英文报错翻译成“原因 + 建议”。
+# 主脚本与生成的恢复脚本共用。
+
+# 根据错误文本输出“原因<TAB>建议”；无法识别时返回 1。
+explain_error() {
+  local text="$1" port
+  shopt -s nocasematch
+  case "$text" in
+    *"port is already allocated"* | *"address already in use"* | *"failed to bind host port"* | *"Bind for "*" failed"*)
+      port="$(grep -oE '(Bind for [^ ]*:|host port |0\.0\.0\.0:|\]:)[0-9]+' <<<"$text" | grep -oE '[0-9]+$' | head -n1 || true)"
+      printf '宿主机端口%s已被其他程序占用\t执行 ss -lntp%s 查看占用的进程，停止它或修改端口后重试\n' \
+        "${port:+ ${port} }" "${port:+ | grep \":${port} \"}"
+      ;;
+    *"no space left on device"*)
+      printf '磁盘空间不足\t执行 df -h 查看剩余空间，清理后重试（docker system prune 可以清理无用的镜像和容器）\n'
+      ;;
+    *"permission denied while trying to connect to the docker"*)
+      printf '当前用户没有访问 Docker 的权限\t请用 root 运行，或用 sudo 运行脚本\n'
+      ;;
+    *"cannot connect to the docker daemon"* | *"is the docker daemon running"*)
+      printf 'Docker 服务没有运行\t执行 systemctl start docker 启动 Docker 后重试\n'
+      ;;
+    *"exec format error"* | *"does not match the detected host platform"* | *"no matching manifest for"*)
+      printf '镜像的 CPU 架构与本机不一致\t请在相同 CPU 架构（如都是 x86_64 或都是 arm64）的服务器之间迁移\n'
+      ;;
+    *"pull access denied"* | *"repository does not exist"* | *"manifest unknown"* | *"not found: manifest"*)
+      printf '镜像仓库中找不到该镜像，或需要登录才能拉取\t检查镜像名；私有镜像请先执行 docker login\n'
+      ;;
+    *"tls handshake timeout"* | *"i/o timeout"* | *"client.timeout exceeded"* | *"request canceled while waiting"*)
+      printf '连接镜像仓库超时\t检查服务器网络，或为 Docker 配置可用的镜像加速地址后重试\n'
+      ;;
+    *"is already in use by container"*)
+      printf '容器名称已被其他容器占用\t删除或重命名同名容器，或设置 RESTORE_EXISTING=replace\n'
+      ;;
+    *"bind source path does not exist"* | *"invalid mount config"*)
+      printf '挂载的宿主机路径不存在\t确认该路径在本机存在后重试\n'
+      ;;
+    *"could not resolve host"*)
+      printf '无法解析链接中的主机名\t检查链接是否完整、DNS 是否可用\n'
+      ;;
+    *"failed to connect"* | *"connection refused"* | *"couldn't connect to server"*)
+      printf '无法连接旧服务器的下载服务\t确认旧服务器上的脚本仍在运行，并检查旧服务器防火墙和云厂商安全组是否放行了下载端口\n'
+      ;;
+    *"unhealthy"* | *"did not become healthy"* | *"healthcheck timed out"*)
+      printf '容器启动后健康检查没有通过\t执行 docker logs <容器名> 查看应用日志；启动较慢的服务可以调大 RESTORE_HEALTH_TIMEOUT\n'
+      ;;
+    *"timed out"* | *"connection reset"*)
+      printf '与旧服务器的连接超时或中断\t检查两台服务器之间的网络，以及旧服务器防火墙和安全组设置，然后重试\n'
+      ;;
+    *"returned error: 404"* | *"404 not found"*)
+      printf '下载地址不存在\t旧服务器可能已经结束传输，或链接没有完整复制；请在旧服务器重新运行备份\n'
+      ;;
+    *"did not remain running"*)
+      printf '容器启动后立即退出\t执行 docker logs <容器名> 查看应用日志\n'
+      ;;
+    *"operation not permitted"* | *"permission denied"*)
+      printf '权限不足\t请用 root 或 sudo 运行脚本\n'
+      ;;
+    *)
+      shopt -u nocasematch
+      return 1
+      ;;
+  esac
+  shopt -u nocasematch
+}
+
+# 记录失败原因：能识别的报错给出具体原因和建议，否则使用调用方给出的描述。
+fail_with_output() {
+  local fallback="$1" output="${2:-}" row reason hint
+  if [[ -n "$output" ]] && row="$(explain_error "$output")"; then
+    IFS=$'\t' read -r reason hint <<<"$row"
+    error_user "${fallback}：${reason}" "$hint"
+  else
+    error_user "$fallback" "${3:-查看下方日志中的最后几行了解详情}"
+  fi
+}
+
+# 日志末尾的报错文本，用于在命令失败后识别原因。
+log_tail_text() {
+  [[ -n "${DM_LOG_FILE:-}" && -f "$DM_LOG_FILE" ]] || return 0
+  tail -n "${1:-30}" "$DM_LOG_FILE" 2>/dev/null || true
+}
+
 # 进度显示与耗时格式化：主脚本与生成的恢复脚本共用。
+#
+# 耗时操作统一通过 run_with_progress 执行，后台 watcher 每秒（非终端每 10 秒）
+# 刷新一行：
+#   知道总量时：[5/7] 保存镜像 ██████░░░░ 58% · 1.2GB/2.1GB · 45MB/s · 剩余约 20 秒
+#   不知道总量：[4/7] 停机并打包数据 · 卷 mysql_data ⠹ 已处理 1.2GB · 45MB/s · 1 分 3 秒
+#   没有字节数：[7/8] 启动服务 · nginx ⠹ 1 分 3 秒
+# 长时间没有进展时追加说明（DM_PROGRESS_HINT），让用户知道程序仍在运行、在等什么。
 
 format_elapsed() {
   local seconds="${1:-0}"
@@ -2418,15 +3897,21 @@ format_elapsed() {
   fi
 }
 
+# 1536 → 1.5KB；整数部分达到两位后不再保留小数。
 human() {
   local b="${1:-0}"
-  local -a units=(B KB MB GB TB PB)
-  local i=0
-  while ((b >= 1024 && i < ${#units[@]} - 1)); do
-    b=$((b / 1024))
-    i=$((i + 1))
-  done
-  echo "${b}${units[$i]}"
+  [[ "$b" =~ ^[0-9]+$ ]] || b=0
+  awk -v b="$b" 'BEGIN {
+    split("B KB MB GB TB PB", u, " ")
+    i = 1
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    if (i == 1 || b >= 10) printf "%d%s\n", b, u[i]
+    else {
+      s = sprintf("%.1f", b)
+      sub(/\.0$/, "", s)
+      printf "%s%s\n", s, u[i]
+    }
+  }'
 }
 
 progress_file_size() {
@@ -2434,32 +3919,114 @@ progress_file_size() {
   stat -c %s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
 }
 
-# 只在确实知道总字节数时显示百分比；未知总量时仅报告已处理字节和耗时，
-# 避免用“假进度条”误导用户。该函数保持纯输出，便于单元测试。
+# 当前已处理字节数。spec 为空时没有字节数；"count:路径" 读取计数文件
+# （由 progress_meter 写入）；其他情况视为正在增长的输出文件。
+progress_current() {
+  local spec="${1:-}" value
+  case "$spec" in
+    "") echo 0 ;;
+    count:*)
+      value="$(cat "${spec#count:}" 2>/dev/null || true)"
+      [[ "$value" =~ ^[0-9]+$ ]] || value=0
+      echo "$value"
+      ;;
+    *) progress_file_size "$spec" ;;
+  esac
+}
+
+# 总字节数。可以是数字，也可以是 "header:路径"：从 curl -D 写出的响应头中
+# 读取 Content-Length（下载开始前未知，开始后才能确定）。
+progress_total() {
+  local spec="${1:-0}" value
+  case "$spec" in
+    header:*)
+      value="$(tr -d '\r' <"${spec#header:}" 2>/dev/null |
+        awk 'tolower($1) == "content-length:" { v = $2 } END { print v + 0 }')"
+      ;;
+    *) value="$spec" ;;
+  esac
+  [[ "$value" =~ ^[0-9]+$ ]] || value=0
+  echo "$value"
+}
+
+# 在管道中计数：原样转发标准输入到标准输出，并把累计字节数写入计数文件。
+# 没有 python3 时退化为 cat（只是不显示字节数）。
+progress_meter() {
+  local count_file="${1:-}"
+  if [[ -z "$count_file" || "$count_file" == /dev/null ]] || ! command -v python3 >/dev/null 2>&1; then
+    cat
+    return
+  fi
+  python3 -c '
+import os, sys, time
+path = sys.argv[1]
+src, dst = sys.stdin.buffer, sys.stdout.buffer
+total, last = 0, 0.0
+def flush():
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(total))
+    os.replace(tmp, path)
+while True:
+    chunk = src.read(1024 * 1024)
+    if not chunk:
+        break
+    dst.write(chunk)
+    total += len(chunk)
+    now = time.monotonic()
+    if now - last >= 0.5:
+        flush()
+        last = now
+dst.flush()
+flush()
+' "$count_file"
+}
+
+progress_bar() {
+  local percent="$1" width=20 filled bar empty
+  filled=$((percent * width / 100))
+  printf -v bar '%*s' "$filled" ''
+  printf -v empty '%*s' "$((width - filled))" ''
+  printf '%s%s' "${bar// /█}" "${empty// /░}"
+}
+
+# 生成一行进度文字（不含换行）。保持纯函数，便于单元测试。
+#   label current total elapsed [rate 字节/秒] [spinner] [hint]
+# 只在确实知道总量时显示百分比，避免用“假进度条”误导用户。
 progress_render() {
   local label="$1" current="${2:-0}" total="${3:-0}" elapsed="${4:-0}"
-  local percent filled empty bar
+  local rate="${5:-0}" spinner="${6:-}" hint="${7:-}"
+  local percent line remaining
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
   [[ "$elapsed" =~ ^[0-9]+$ ]] || elapsed=0
+  [[ "$rate" =~ ^[0-9]+$ ]] || rate=0
   if ((total > 0)); then
     ((current <= total)) || current=$total
     percent=$((current * 100 / total))
-    filled=$((percent * 24 / 100))
-    empty=$((24 - filled))
-    printf -v bar '%*s' "$filled" ''
-    bar=${bar// /#}
-    printf -v empty '%*s' "$empty" ''
-    empty=${empty// /-}
-    printf '[进度] %s [%s%s] %d%% · %s/%s · %s' \
-      "$label" "$bar" "$empty" "$percent" "$(human "$current")" \
-      "$(human "$total")" "$(format_elapsed "$elapsed")"
+    # 总量是估算值时，在命令真正结束前不显示 100%。
+    ((percent < 100)) || percent=99
+    line="${label} $(progress_bar "$percent") ${percent}% · $(human "$current")/$(human "$total")"
+    ((rate == 0)) || line+=" · $(human "$rate")/s"
+    if ((rate > 0 && total > current)); then
+      remaining=$(((total - current) / rate))
+      if ((remaining > 0)); then
+        line+=" · 剩余约 $(format_elapsed "$remaining")"
+      else
+        line+=" · 即将完成"
+      fi
+    else
+      line+=" · $(format_elapsed "$elapsed")"
+    fi
   elif ((current > 0)); then
-    printf '[进度] %s · %s · %s' \
-      "$label" "$(human "$current")" "$(format_elapsed "$elapsed")"
+    line="${label}${spinner:+ ${spinner}} 已处理 $(human "$current")"
+    ((rate == 0)) || line+=" · $(human "$rate")/s"
+    line+=" · $(format_elapsed "$elapsed")"
   else
-    printf '[进度] %s · %s' "$label" "$(format_elapsed "$elapsed")"
+    line="${label}${spinner:+ ${spinner}} $(format_elapsed "$elapsed")"
   fi
+  [[ -z "$hint" ]] || line+=" · ${hint}"
+  printf '%s' "$line"
 }
 
 progress_tty_draw() {
@@ -2472,31 +4039,44 @@ progress_tty_clear() {
   printf '\r\033[K' >&2
 }
 
+# 命令失败只记日志：失败原因由阶段结果与最终结果统一说明，避免屏幕上重复报错。
 progress_finish() {
   local label="$1" rc="$2" elapsed="$3" current="${4:-0}"
-  local suffix=""
   ((rc != 0)) || return 0
   [[ "$current" =~ ^[0-9]+$ ]] || current=0
-  ((current == 0)) || suffix=" · $(human "$current")"
-  printf '[失败] %s · %s%s\n' "$label" "$(format_elapsed "$elapsed")" "$suffix" >&2
+  log_line "失败：${label}（退出码 ${rc}，耗时 $(format_elapsed "$elapsed")$( ((current == 0)) || printf '，已处理 %s' "$(human "$current")")）"
 }
 
+# 逐个处理对象时（如扫描容器）在阶段行里显示“第几个/共几个”。
 progress_count() {
   local label="$1" current="$2" total="$3" item="${4:-}"
-  local suffix="" line
-  [[ -z "$item" ]] || suffix="（${item}）"
+  local line
+  printf -v line '%s %d/%d%s' "$label" "$current" "$total" "${item:+（${item}）}"
   if [[ -t 2 ]]; then
-    printf -v line '[进度] %s：%d/%d%s' "$label" "$current" "$total" "$suffix"
-    progress_tty_draw "$line"
-    ((current < total)) || printf '\n' >&2
-  elif ((current == 1 || current == total || current % 10 == 0)); then
-    printf '[进度] %s：%d/%d%s\n' "$label" "$current" "$total" "$suffix" >&2
+    progress_tty_draw "$(stage_label "$line")"
+  elif ((current == total || current % 20 == 0)); then
+    printf '[进度] %s\n' "$(stage_label "$line")" >&2
+  fi
+}
+
+# 不在 run_with_progress 中的等待循环（如健康检查）用它刷新阶段行。
+# 非终端时每 10 秒最多输出一行，避免刷屏。
+progress_note() {
+  local text="$1" now=$SECONDS
+  if [[ -t 2 ]]; then
+    progress_tty_draw "$(stage_label "$text")"
+  elif ((now - ${DM_LAST_NOTE_AT:--100} >= 10)); then
+    DM_LAST_NOTE_AT=$now
+    printf '[进度] %s\n' "$(stage_label "$text")" >&2
   fi
 }
 
 progress_watch() {
-  local label="$1" file="$2" total="$3" started="$4" owner_pid="$5"
-  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current elapsed line timer_pid=""
+  local label="$1" spec="$2" total_spec="$3" started="$4" owner_pid="$5"
+  local mode="${DOCKER_MIGRATE_PROGRESS_MODE:-auto}" interval current total elapsed line timer_pid=""
+  local last_bytes=0 last_time=$SECONDS rate=0 sample changed_at=$SECONDS hint="" tick=0
+  local stall="${DM_PROGRESS_STALL:-30}" spinner
+  local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   [[ "$mode" != "plain" && "$mode" != "off" ]] || return 0
   if [[ -n "${DOCKER_MIGRATE_PROGRESS_INTERVAL:-}" ]]; then
     interval="$DOCKER_MIGRATE_PROGRESS_INTERVAL"
@@ -2506,6 +4086,7 @@ progress_watch() {
     interval=10
   fi
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=10
+  [[ "$stall" =~ ^[1-9][0-9]*$ ]] || stall=30
   # watcher 被主流程终止时，也必须立即终止其 sleep 子进程。否则 sleep 会继续
   # 持有命令替换/进程替换的管道，使已经完成的步骤一直等到 interval 到期。
   trap '
@@ -2524,26 +4105,42 @@ progress_watch() {
     wait "$timer_pid" 2>/dev/null || true
     timer_pid=""
     kill -0 "$owner_pid" 2>/dev/null || break
-    current=0
-    [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+    current="$(progress_current "$spec")"
+    total="$(progress_total "$total_spec")"
     elapsed=$((SECONDS - started))
+    # 速度取指数平滑，避免网络抖动时数字跳得太厉害。
+    if ((SECONDS > last_time)); then
+      sample=$(((current - last_bytes) / (SECONDS - last_time)))
+      ((sample >= 0)) || sample=0
+      if ((rate == 0)); then rate=$sample; else rate=$(((rate * 7 + sample * 3) / 10)); fi
+    fi
+    ((current == last_bytes)) || changed_at=$SECONDS
+    last_bytes=$current
+    last_time=$SECONDS
+    hint=""
+    if ((SECONDS - changed_at >= stall)); then
+      hint="${DM_PROGRESS_HINT:-仍在进行，请耐心等待}"
+    fi
+    spinner="${frames[$((tick % 10))]}"
+    tick=$((tick + 1))
     if [[ -t 2 ]]; then
-      line="$(progress_render "$label" "$current" "$total" "$elapsed")"
+      line="$(progress_render "$(stage_label "$label")" "$current" "$total" "$elapsed" "$rate" "$spinner" "$hint")"
       progress_tty_draw "$line"
     else
-      progress_render "$label" "$current" "$total" "$elapsed" >&2
-      printf '\n' >&2
+      printf '[进度] %s\n' "$(progress_render "$(stage_label "$label")" "$current" "$total" "$elapsed" "$rate" "" "$hint")" >&2
     fi
   done
   trap - TERM INT HUP
 }
 
+# 运行命令并显示进度。spec/total 的含义见 progress_current / progress_total。
 run_with_progress() {
-  local label="$1" file="$2" total="$3"
+  local label="$1" spec="$2" total="$3"
   shift 3
   local started=$SECONDS watcher_pid rc current=0 restore_errexit=0
+  log_line "开始：${label}"
   case $- in *e*) restore_errexit=1 ;; esac
-  progress_watch "$label" "$file" "$total" "$started" "$$" &
+  progress_watch "$label" "$spec" "$total" "$started" "$$" &
   watcher_pid=$!
   set +e
   "$@"
@@ -2551,9 +4148,17 @@ run_with_progress() {
   ((restore_errexit == 0)) || set -e
   kill "$watcher_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  [[ ! -t 2 ]] || progress_tty_clear
-  [[ -z "$file" ]] || current="$(progress_file_size "$file")"
+  if [[ -t 2 ]]; then
+    # 回到阶段行，不留下已完成子步骤的进度文字。
+    if [[ -n "${DM_STAGE_TITLE:-}" ]]; then
+      progress_tty_draw "$(stage_prefix) …"
+    else
+      progress_tty_clear
+    fi
+  fi
+  current="$(progress_current "$spec")"
   progress_finish "$label" "$rc" "$((SECONDS - started))" "$current"
+  ((rc != 0)) || log_line "完成：${label} · $(format_elapsed "$((SECONDS - started))")$( ((current == 0)) || printf ' · %s' "$(human "$current")")"
   return "$rc"
 }
 
@@ -2809,7 +4414,7 @@ collect_restore_result_metrics() {
 rename_container_with_retry() {
   local old_name="$1" new_name="$2"
   for _ in {1..20}; do
-    if docker rename "$old_name" "$new_name" >/dev/null 2>&1; then
+    if dm_quiet docker rename "$old_name" "$new_name"; then
       return 0
     fi
     sleep 0.1
@@ -2831,7 +4436,7 @@ restore_container_networks() {
     fi
     connect_args=()
     if [[ "$network" == "bridge" ]]; then
-      docker network connect "$network" "$container" >/dev/null 2>&1 || return 1
+      dm_quiet docker network connect "$network" "$container" || return 1
       continue
     fi
     ip="$(jq -r '.value.IPAMConfig.IPv4Address // empty' <<<"$entry")"
@@ -2841,18 +4446,30 @@ restore_container_networks() {
     while IFS= read -r alias; do
       [[ -z "$alias" ]] || connect_args+=(--alias "$alias")
     done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
-    docker network connect "${connect_args[@]}" "$network" "$container" >/dev/null 2>&1 || return 1
+    dm_quiet docker network connect "${connect_args[@]}" "$network" "$container" || return 1
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
+# 细节写入日志（--verbose 时也显示）；回滚等需要用户看到的过程用 warn。
+say() { detail "$*"; }
+warn() {
+  log_line "$*"
+  screen_clear_line
+  printf '    %s\n' "$*" >&2
+}
+
+# 恢复脚本的阶段编号：由主脚本调用时接在下载、校验之后（共 8 步），
+# 在迁移包目录手动执行时从 1 开始（共 5 步）。
+restore_stage() {
+  stage_begin "$((${DM_STAGE_OFFSET:-0} + $1))" "${DM_STAGE_TOTAL:-5}" "$2"
+}
+
+log_init restore-manual
+export DM_SUMMARY_ARMED=1
+
 restore_load_images() {
-  local archive="$1" total
-  if command -v pv >/dev/null 2>&1; then
-    total="$(progress_file_size "$archive")"
-    pv -f -s "$total" "$archive" | docker load
-  else
-    docker load -i "$archive"
-  fi
+  local archive="$1" count_file="${2:-}"
+  progress_meter "$count_file" <"$archive" | dm_quiet docker load
 }
 # Failure tracking
 FAILED_VOLUMES=()
@@ -2910,6 +4527,8 @@ restore_print_final_result() {
       printf '结果：✅ 恢复成功\n%s\n%s\n' "$container_line" "$data_line"
       printf '验证：完整性校验、服务启动与健康检查均已通过\n'
       printf '清理：迁移包目录保持不变（手动恢复模式）\n'
+      print_stage_timings
+      print_warning_summary
       ;;
     FAILED_ROLLED_BACK)
       printf '结果：❌ 恢复失败，已安全回滚\n失败阶段：%s\n' "$RESTORE_STAGE"
@@ -2941,14 +4560,25 @@ restore_print_final_result() {
       printf '结果：❌ 恢复失败\n失败阶段：%s\n诊断目录：%s\n' "$RESTORE_STAGE" "$BUNDLE_DIR"
       ;;
   esac
-  printf '耗时：%s\n%s\n' "$elapsed" '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  printf '耗时：%s\n' "$elapsed"
+  if [[ "$status" != "SUCCESS" ]]; then
+    print_warning_summary
+    print_failure_details
+  fi
+  printf '%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 }
 
 restore_finish_result() {
   local status="$1" rollback_dir="${2:-}"
   restore_record_result "$status" "$rollback_dir" || true
+  [[ "$status" == "SUCCESS" ]] || stage_fail
   if [[ "${RESTORE_DEFER_FINAL_SUMMARY:-0}" != "1" ]]; then
     restore_print_final_result "$status" "$rollback_dir"
+  fi
+  if [[ "$status" == "SUCCESS" ]]; then
+    log_finish 1
+  else
+    log_finish 0
   fi
 }
 
@@ -2976,20 +4606,17 @@ restore_has_failures() {
   ${#FAILED_CONTAINERS[@]} > 0))
 }
 
+# 失败项写入日志；没有更具体的原因时，用失败项本身作为失败原因。
 print_failure_summary() {
+  local items=""
   restore_has_failures || return 0
-  warn "============================================"
-  warn "  部分内容恢复失败，请检查以下项目："
-  ((${#FAILED_VOLUMES[@]} == 0)) || warn "  · 命名卷失败: ${FAILED_VOLUMES[*]}"
-  ((${#FAILED_BINDS[@]} == 0)) || warn "  · 绑定目录失败: ${FAILED_BINDS[*]}"
-  ((${#FAILED_NETWORKS[@]} == 0)) || warn "  · 自定义网络失败: ${FAILED_NETWORKS[*]}"
-  ((${#FAILED_PROJECTS[@]} == 0)) || warn "  · Compose 项目失败: ${FAILED_PROJECTS[*]}"
-  if ((${#FAILED_CONTAINERS[@]} > 0)); then
-    warn "  · 独立容器失败: ${FAILED_CONTAINERS[*]}"
-    warn "  常见原因：端口冲突、镜像缺失、网络配置不兼容。"
-    warn "  可用命令排查端口：sudo ss -lntp"
-  fi
-  warn "============================================"
+  ((${#FAILED_VOLUMES[@]} == 0)) || items+="数据卷 ${FAILED_VOLUMES[*]}；"
+  ((${#FAILED_BINDS[@]} == 0)) || items+="挂载目录 ${FAILED_BINDS[*]}；"
+  ((${#FAILED_NETWORKS[@]} == 0)) || items+="网络 ${FAILED_NETWORKS[*]}；"
+  ((${#FAILED_PROJECTS[@]} == 0)) || items+="Compose 项目 ${FAILED_PROJECTS[*]}；"
+  ((${#FAILED_CONTAINERS[@]} == 0)) || items+="容器 ${FAILED_CONTAINERS[*]}；"
+  log_line "恢复失败的项目：${items%；}"
+  fail_reason "恢复失败：${items%；}" "查看下方日志中的最后几行了解详情"
 }
 compose_run() {
   if [[ "${COMPOSE_IMPL:-}" == "plugin" ]]; then
@@ -3004,7 +4631,7 @@ compose_rollback_image_cleanup() {
   [[ -f "${rollback_dir}/images.list" ]] || return 0
   while IFS= read -r image; do
     [[ -n "$image" ]] || continue
-    docker image rm "$image" >/dev/null 2>&1 || true
+    dm_quiet docker image rm "$image" || true
   done <"${rollback_dir}/images.list"
 }
 
@@ -3081,7 +4708,7 @@ compose_capture_rollback_images() {
     fi
     image="docker-migrate-rollback:${id:0:12}-$$"
     if ! run_with_activity "创建 Compose 回滚镜像：$service" \
-      docker commit "$id" "$image" >/dev/null; then
+      dm_quiet docker commit "$id" "$image"; then
       warn " · 目标端容器回滚镜像创建失败：$service"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
@@ -3108,14 +4735,14 @@ compose_restore_existing_states() {
     [[ "$restore_running" == "1" ]] || continue
     case "$state" in
       running | restarting)
-        docker start "$id" >/dev/null 2>&1 || rc=1
+        dm_quiet docker start "$id" || rc=1
         ;;
       paused)
-        docker start "$id" >/dev/null 2>&1 || {
+        dm_quiet docker start "$id" || {
           rc=1
           continue
         }
-        docker pause "$id" >/dev/null 2>&1 || rc=1
+        dm_quiet docker pause "$id" || rc=1
         ;;
     esac
   done <"${rollback_dir}/states.tsv"
@@ -3145,7 +4772,7 @@ compose_restore_rollback() {
       for service in "${pause_services[@]}"; do
         while IFS= read -r id; do
           [[ -n "$id" ]] || continue
-          docker pause "$id" >/dev/null
+          dm_quiet docker pause "$id"
         done < <(compose_run -p "$project" -f config.yml -f images.yml ps -q "$service")
       done
     fi
@@ -3205,7 +4832,7 @@ compose_wait_services() {
         case "$status" in
           healthy | running) ;;
           unhealthy | exited | dead)
-            warn "Compose 服务健康检查失败：$service（当前 $status）"
+            fail_reason "Compose 服务 ${service} 健康检查没有通过（当前 ${status}）" "执行 docker logs <容器名> 查看服务日志"
             return 1
             ;;
           *)
@@ -3224,11 +4851,11 @@ compose_wait_services() {
     if ((all_ready == 0)); then
       elapsed=$((SECONDS - started))
       if ((elapsed >= next_report)); then
-        echo "[进度] Compose 服务健康检查：${services[*]} · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒" >&2
+        log_line "[进度] Compose 服务健康检查：${services[*]} · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒"
         next_report=$((elapsed + 5))
       fi
     else
-      echo "[完成] Compose 服务健康检查：${services[*]} · $((SECONDS - started))秒" >&2
+      log_line "[完成] Compose 服务健康检查：${services[*]} · $((SECONDS - started))秒"
       return 0
     fi
     sleep 1
@@ -3254,7 +4881,7 @@ compose_wait_project_health() {
       case "$health" in
         healthy | none) ;;
         unhealthy)
-          warn "Compose 项目健康检查失败：$project（容器 $id 当前 unhealthy）"
+          fail_reason "Compose 项目 ${project} 的容器 ${id} 健康检查没有通过" "执行 docker logs ${id} 查看服务日志"
           return 1
           ;;
         *)
@@ -3273,11 +4900,11 @@ compose_wait_project_health() {
     if ((all_ready == 0)); then
       elapsed=$((SECONDS - started))
       if ((elapsed >= next_report)); then
-        echo "[进度] Compose 项目健康检查：$project · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒" >&2
+        log_line "[进度] Compose 项目健康检查：$project · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒"
         next_report=$((elapsed + 5))
       fi
     else
-      echo "[完成] Compose 项目健康检查：$project · $((SECONDS - started))秒" >&2
+      log_line "[完成] Compose 项目健康检查：$project · $((SECONDS - started))秒"
       return 0
     fi
     sleep 1
@@ -3474,7 +5101,7 @@ restore_volume_exact() {
     volume_clear_and_extract "$volume" "$rollback_dir" "$rollback_file" 0 || return 1
     rm -f "${rollback_dir}/${rollback_file}"
   else
-    docker volume rm "$volume" >/dev/null 2>&1 || true
+    dm_quiet docker volume rm "$volume" || true
   fi
   return 1
 }
@@ -3484,6 +5111,20 @@ restore_data_with_diagnostics() {
   # 撤销 local 再执行 EXIT trap，trap 将读不到日志路径。
   local label="$1" logfile rc
   shift
+  # 有运行日志时，数据操作的输出直接追加进去；失败原因由调用方统一说明。
+  if [[ -n "${DM_LOG_FILE:-}" ]]; then
+    log_line "开始：${label}"
+    RESTORE_ACTIVE_DATA_LOG="$DM_LOG_FILE"
+    if "$@" >>"$DM_LOG_FILE" 2>&1; then
+      RESTORE_ACTIVE_DATA_LOG=""
+      return 0
+    else
+      rc=$?
+    fi
+    RESTORE_ACTIVE_DATA_LOG=""
+    log_line "失败：${label}（退出码 ${rc}）"
+    return "$rc"
+  fi
   # 日志置于迁移包旁，不混入包内校验清单，也不随事务回滚点一起删除。
   # mktemp + umask 077 防止覆盖已有路径或泄露数据库文件信息。
   logfile="$(mktemp "${BUNDLE_DIR}/../docker-migrate-data.XXXXXX")" || {
@@ -3510,7 +5151,8 @@ restore_diagnostic_output() {
   # 输出，确保手动恢复模式下也能看见回滚进度和最终结果。
   if [[ -n "${RESTORE_ACTIVE_DATA_LOG:-}" ]]; then
     exec 1>&202 2>&203
-    printf '详细日志：%s\n' "$RESTORE_ACTIVE_DATA_LOG" >&2
+    [[ "$RESTORE_ACTIVE_DATA_LOG" == "${DM_LOG_FILE:-}" ]] ||
+      printf '详细日志：%s\n' "$RESTORE_ACTIVE_DATA_LOG" >&2
   fi
 }
 
@@ -3651,8 +5293,8 @@ compose_cleanup_conflicting_network() {
   # 仅当网络属于当前项目（有 project label 且匹配）时才允许删除
   # 空 proj_label 表示非 compose 网络（手动创建或外部共享），跳过删除
   if [[ -n "$proj_label" && -n "$net_label" && "$proj_label" == "$project" ]]; then
-    if docker network rm "$network_name" >/dev/null 2>&1; then
-      echo " · 已清理旧网络：$network_name"
+    if dm_quiet docker network rm "$network_name"; then
+      log_line "已清理旧网络：$network_name"
     else
       warn " · 无法清理网络：$network_name（可能仍被占用）"
     fi
@@ -3812,7 +5454,7 @@ create_network_from_record() {
   done < <(jq -c '.ipam.config[]?' <<<"$row")
   create_args+=("$name")
 
-  "${create_args[@]}" >/dev/null
+  dm_quiet "${create_args[@]}"
 }
 transaction_path_is_safe() {
   local path="$1"
@@ -4062,12 +5704,12 @@ transaction_restore_container_state() {
   local name="$1" state="$2"
   case "$state" in
     running | restarting)
-      run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
+      run_with_activity "启动目标端旧容器：$name" dm_quiet docker start "$name" || return 1
       [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]]
       ;;
     paused)
-      run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
-      docker pause "$name" >/dev/null 2>&1
+      run_with_activity "启动目标端旧容器：$name" dm_quiet docker start "$name" || return 1
+      dm_quiet docker pause "$name"
       ;;
   esac
 }
@@ -4080,7 +5722,7 @@ transaction_quiesce_containers() {
   for name in "$@"; do
     transaction_container_exists "$name" || return 1
     state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
-    [[ "$state" != "paused" ]] || docker unpause "$name" >/dev/null 2>&1 || return 1
+    [[ "$state" != "paused" ]] || dm_quiet docker unpause "$name" || return 1
     case "$state" in
       running | restarting | paused) stop_names+=("$name") ;;
     esac
@@ -4088,7 +5730,7 @@ transaction_quiesce_containers() {
   ((${#stop_names[@]} > 0)) || return 0
 
   run_with_activity "批量停止目标端容器（${#stop_names[@]} 个）" \
-    docker stop "${stop_names[@]}" >/dev/null || stop_rc=$?
+    dm_quiet docker stop "${stop_names[@]}" || stop_rc=$?
   for name in "${stop_names[@]}"; do
     if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" ||
       [[ "$running" != "false" ]]; then
@@ -4154,7 +5796,7 @@ transaction_remove_new_services() {
       if [[ -n "$backup" ]]; then
         if transaction_container_exists "$backup"; then
           if transaction_container_exists "$name"; then
-            docker rm -f "$name" >/dev/null 2>&1 || true
+            dm_quiet docker rm -f "$name" || true
             if transaction_container_exists "$name"; then
               warn " · 无法静默并删除本次新建的单容器：$name"
               rc=1
@@ -4168,7 +5810,7 @@ transaction_remove_new_services() {
           rc=1
         fi
       elif [[ "$had_old" == "0" ]]; then
-        docker rm -f "$name" >/dev/null 2>&1 || true
+        dm_quiet docker rm -f "$name" || true
         if transaction_container_exists "$name"; then
           warn " · 无法静默并删除本次新建的单容器：$name"
           rc=1
@@ -4183,7 +5825,7 @@ transaction_remove_new_services() {
       grep -Fxq "$project" "${RESTORE_TRANSACTION_DIR}/compose_replaced.list" || continue
       while IFS= read -r id; do
         [[ -n "$id" ]] || continue
-        docker rm -f "$id" >/dev/null 2>&1 || rc=1
+        dm_quiet docker rm -f "$id" || rc=1
       done < <(docker ps -a --filter "label=com.docker.compose.project=${project}" --format '{{.ID}}')
       if [[ -n "$(docker ps -a --filter "label=com.docker.compose.project=${project}" \
         --format '{{.ID}}')" ]]; then
@@ -4209,7 +5851,7 @@ transaction_restore_volumes() {
         warn " · 命名卷数据回滚失败：$volume"
         rc=1
       fi
-    elif ! docker volume rm "$volume" >/dev/null 2>&1; then
+    elif ! dm_quiet docker volume rm "$volume"; then
       warn " · 无法删除本次新建的命名卷：$volume"
       rc=1
     fi
@@ -4269,7 +5911,7 @@ transaction_restore_standalones() {
       backup="$(awk -F '\t' -v name="$name" '$1 == name { print $2; exit }' \
         "${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv")"
       if [[ -n "$backup" ]] && transaction_container_exists "$backup"; then
-        docker rm -f "$name" >/dev/null 2>&1 || true
+        dm_quiet docker rm -f "$name" || true
         if ! rename_container_with_retry "$backup" "$name"; then
           warn " · 无法恢复旧单容器名称：$name（回滚点：$backup）"
           rc=1
@@ -4338,7 +5980,7 @@ transaction_cleanup_artifacts() {
   if [[ -f "${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv" ]]; then
     while IFS=$'\t' read -r name backup state; do
       [[ -n "$backup" ]] || continue
-      if ! docker rm -f "$backup" >/dev/null 2>&1; then
+      if ! dm_quiet docker rm -f "$backup"; then
         if ! docker info >/dev/null 2>&1 || transaction_container_exists "$backup"; then
           warn " · 无法清理旧单容器回滚点：$backup"
           rc=1
@@ -4353,7 +5995,7 @@ transaction_cleanup_artifacts() {
       [[ -f "${rollback_dir}/images.list" ]] || continue
       while IFS= read -r image; do
         [[ -n "$image" ]] || continue
-        if ! docker image rm "$image" >/dev/null 2>&1; then
+        if ! dm_quiet docker image rm "$image"; then
           if ! docker info >/dev/null 2>&1 ||
             docker image inspect "$image" >/dev/null 2>&1; then
             warn " · 无法清理 Compose 回滚镜像：$image"
@@ -4605,7 +6247,7 @@ transaction_prepare() {
         continue
       fi
       rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
-      echo " · 保存目标端旧 Compose 配置与运行状态：$project"
+      say "保存目标端旧 Compose 配置与运行状态：$project"
       if ! compose_capture_rollback_metadata "$project" "$rollback_dir"; then
         warn " · 无法安全读取 Compose 回滚元数据，目标端尚未停止：$project"
         transaction_discard_prepared
@@ -4709,7 +6351,7 @@ transaction_prepare() {
   fi
   mapfile -t quiesce_names <"$quiesce_list_file"
   for name in "${quiesce_names[@]}"; do
-    echo " · 准备暂停目标端服务或共享写入者：$name"
+    say "准备暂停目标端服务或共享数据的容器：$name"
   done
   transaction_quiesce_containers "${quiesce_names[@]}" || return 1
 
@@ -4718,7 +6360,7 @@ transaction_prepare() {
   while IFS=$'\t' read -r project had_old; do
     [[ "$had_old" == "1" ]] || continue
     rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
-    echo " · 保存已静默的旧 Compose 容器镜像：$project"
+    say "保存已停止的旧 Compose 容器镜像：$project"
     compose_capture_rollback_images "$rollback_dir" || return 1
   done <"${RESTORE_TRANSACTION_DIR}/compose.tsv"
 }
@@ -4764,17 +6406,15 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 RESTORE_STAGE="迁移包校验"
-if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" == "1" ]]; then
-  :
-else
-  say "[0] 验证迁移包完整性"
-  if ! run_with_activity "校验迁移包内全部文件" verify_bundle_checksums "$BUNDLE_DIR"; then
-    warn "迁移包完整性校验失败，拒绝恢复。"
+restore_stage 1 "预检数据"
+if [[ "${RESTORE_CHECKSUM_VERIFIED:-0}" != "1" ]]; then
+  if ! run_with_activity "校验每个文件" verify_bundle_checksums "$BUNDLE_DIR"; then
+    error_user "迁移包文件校验失败，拒绝恢复" "请在旧服务器重新运行备份"
     exit 1
   fi
 fi
 if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
-  warn "迁移包 manifest 结构或路径不安全，拒绝恢复。"
+  error_user "迁移包的 manifest 结构或路径不安全，拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
   exit 1
 fi
 if ! transaction_internal_paths_are_safe; then
@@ -4784,20 +6424,19 @@ fi
 RESTORE_STAGE="预检数据归档"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! command -v python3 >/dev/null 2>&1; then
-  warn "缺少 python3，尚未停止服务或修改数据；请使用主脚本「下载备份并恢复」自动补齐依赖。"
+  error_user "缺少 python3（尚未停止服务或修改数据）" "安装 python3，或使用主脚本「下载备份并恢复」自动安装依赖"
   exit 1
 fi
-say "[0.1] 在停止目标服务前预检 volume 与 bind 归档"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r row; do
     vname="$(jq -r '.name' <<<"$row")"
     file="vol_${vname}.tgz"
     if [[ ! -f "volumes/$file" ]]; then
-      warn " 命名卷缺少备份文件：$vname（volumes/$file）"
+      error_user "迁移包缺少数据卷 ${vname} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_VOLUMES+=("$vname")
-    elif ! run_with_activity "预检命名卷归档：$vname" \
+    elif ! run_with_activity "检查卷 ${vname}" \
       archive_members_safe "volumes/$file"; then
-      warn " 命名卷归档结构异常：$vname"
+      error_user "数据卷 ${vname} 的备份文件结构异常" "请在旧服务器重新运行备份"
       FAILED_VOLUMES+=("$vname")
     fi
   done < <(jq -c '.volumes[]' manifest.json)
@@ -4808,13 +6447,13 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     file="$(jq -r '.file' <<<"$row")"
     bind_prefix="${host#/}"
     if bind_path_is_system "$host"; then
-      warn " 跳过宿主机系统路径，只重建挂载、不覆盖目标端：$host"
+      say "跳过宿主机系统路径，只重建挂载、不覆盖目标端：$host"
     elif [[ ! -f "binds/$file" ]]; then
-      warn " 绑定目录缺少备份文件：$host（binds/$file）"
+      error_user "迁移包缺少挂载目录 ${host} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_BINDS+=("$host")
-    elif ! run_with_activity "预检绑定目录归档：$host" \
+    elif ! run_with_activity "检查目录 ${host}" \
       archive_members_safe "binds/$file" "$bind_prefix"; then
-      warn " 绑定目录归档结构异常：$host"
+      error_user "挂载目录 ${host} 的备份文件结构异常" "请在旧服务器重新运行备份"
       FAILED_BINDS+=("$host")
     fi
   done < <(jq -c '.binds[]' manifest.json)
@@ -4823,40 +6462,50 @@ if ((${#FAILED_VOLUMES[@]} > 0 || ${#FAILED_BINDS[@]} > 0)); then
   print_failure_summary
   exit 1
 fi
+stage_end "$(jq -r '"\(.volumes | length) 个卷 · \(.binds | length) 个目录"' manifest.json)"
 
 RESTORE_STAGE="加载镜像"
-say "[A] 加载镜像（如 images.tar 存在）"
+restore_stage 2 "加载镜像"
 if [[ -f images.tar ]]; then
-  run_with_activity "加载镜像归档 images.tar" restore_load_images images.tar ||
-    warn "部分镜像加载失败，将尝试在线拉取"
+  images_count_file="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-load.XXXXXX")"
+  DM_PROGRESS_HINT="镜像较大时需要几分钟，请耐心等待" \
+    run_with_progress "加载镜像" "count:${images_count_file}" "$(progress_file_size images.tar)" \
+    restore_load_images images.tar "$images_count_file" ||
+    warn_user "部分镜像加载失败，创建容器时会尝试在线拉取"
+  rm -f "$images_count_file" "${images_count_file}.tmp"
+  stage_end "$(human "$(progress_file_size images.tar)")"
 else
-  warn "images.tar 不存在，将按需在线拉取镜像。"
+  warn_user "迁移包里没有镜像，创建容器时会在线拉取"
+  stage_end
 fi
 
 RESTORE_STAGE="建立统一回滚事务"
-say "[A.1] 建立目标端服务与数据统一回滚事务"
+restore_stage 3 "建立回滚点"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
-  run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 || {
-    warn "无法准备 alpine:3.20；为避免在无回滚能力时修改数据，恢复终止。"
+  DM_PROGRESS_HINT="正在从 Docker Hub 下载，网络较慢时可能需要几分钟" \
+    run_with_activity "拉取卷操作镜像 alpine:3.20" dm_quiet docker pull alpine:3.20 || {
+    fail_with_output "无法拉取卷操作镜像 alpine:3.20（尚未修改任何数据）" "$(log_tail_text 10)" \
+      "检查服务器能否访问 Docker Hub，或先手动执行 docker pull alpine:3.20"
     exit 1
   }
 fi
 transaction_prepare
+stage_end
 
 RESTORE_STAGE="回灌命名卷"
-say "[B] 回灌命名卷"
+restore_stage 4 "恢复数据"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p volumes
   while IFS= read -r row; do
     vname=$(jq -r '.name' <<<"$row")
     file="vol_${vname}.tgz"
     if [[ ! -f "volumes/$file" ]]; then
-      warn " 命名卷缺少备份文件：$vname（volumes/$file）"
+      error_user "迁移包缺少数据卷 ${vname} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_VOLUMES+=("$vname")
       break
     fi
-    echo " - ${vname}"
+    say "恢复数据卷：${vname}"
     # 使用备份时记录的 driver 和 options 创建卷；同名卷已存在时必须先
     # 核对后端，绝不能把 NFS/plugin 数据误写进碰巧同名的 local 卷。
     v_driver=$(jq -r '.driver // "local"' <<<"$row")
@@ -4868,7 +6517,8 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
       actual_volume_opts="$(docker volume inspect "$vname" | jq -cS '.[0].Options // {}')"
       if [[ "$actual_volume_driver" != "$v_driver" ||
         "$actual_volume_opts" != "$desired_volume_opts" ]]; then
-        warn " 已存在同名但 driver/options 不同的卷，拒绝覆盖：$vname"
+        error_user "已存在同名但驱动或参数不同的数据卷 ${vname}，拒绝覆盖" \
+          "确认新服务器上的这个卷可以删除后，执行 docker volume rm ${vname} 再重试"
         FAILED_VOLUMES+=("$vname")
         break
       fi
@@ -4879,17 +6529,18 @@ if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
         volume_create_args+=(--opt "$volume_opt")
       done
       volume_create_args+=("$vname")
-      if ! "${volume_create_args[@]}" >/dev/null; then
-        warn " 卷创建失败（driver=$v_driver）：$vname"
+      if ! dm_quiet "${volume_create_args[@]}"; then
+        fail_with_output "数据卷 ${vname} 创建失败（驱动 ${v_driver}）" "$(log_tail_text 10)" \
+          "非 local 驱动的卷需要先在新服务器安装对应的卷插件"
         FAILED_VOLUMES+=("$vname")
         break
       fi
     fi
-    if ! run_with_activity "回灌命名卷：$vname" \
+    if ! run_with_activity "卷 ${vname}" \
       restore_data_with_diagnostics "命名卷：$vname" \
       restore_volume_exact "$vname" "$PWD/volumes" "$file" \
       "${RESTORE_TRANSACTION_DIR}/volume_data" "$volume_existed" 1; then
-      warn " 恢复卷 ${vname} 失败，终止恢复"
+      fail_with_output "恢复数据卷 ${vname} 失败" "$(log_tail_text 20)"
       FAILED_VOLUMES+=("$vname")
       break
     fi
@@ -4903,7 +6554,6 @@ if ((${#FAILED_VOLUMES[@]} > 0)); then
 fi
 
 RESTORE_STAGE="回灌绑定目录"
-say "[C] 回灌绑定目录"
 if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
   mkdir -p binds
   while IFS= read -r row; do
@@ -4912,20 +6562,21 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     bind_link=$(jq -r '.link // empty' <<<"$row")
     bind_path_is_system "$host" && continue
     if [[ ! -f "binds/$file" ]]; then
-      warn " 绑定目录缺少备份文件：$host（binds/$file）"
+      error_user "迁移包缺少挂载目录 ${host} 的备份文件" "请在旧服务器重新运行备份"
       FAILED_BINDS+=("$host")
       break
     fi
-    echo " - ${host}"
-    if ! run_with_activity "回灌绑定目录：$host" \
+    say "恢复挂载目录：${host}"
+    if ! run_with_activity "目录 ${host}" \
       restore_data_with_diagnostics "绑定目录：$host" \
       restore_bind_exact "$host" "$PWD/binds/${file}" 1; then
-      warn " 恢复绑定目录失败，终止恢复：$host"
+      fail_with_output "恢复挂载目录 ${host} 失败" "$(log_tail_text 20)"
       FAILED_BINDS+=("$host")
       break
     fi
     if ! restore_bind_link "$bind_link" "$host"; then
-      warn " 无法在原路径重建软链接，终止恢复：$bind_link -> $host"
+      error_user "无法在原路径重建软链接：${bind_link} -> ${host}" \
+        "确认 ${bind_link} 在新服务器上没有被其他文件或目录占用"
       FAILED_BINDS+=("$bind_link")
       break
     fi
@@ -4937,9 +6588,55 @@ if ((${#FAILED_VOLUMES[@]} > 0 || ${#FAILED_BINDS[@]} > 0)); then
   print_failure_summary
   exit 1
 fi
+stage_end
+
+# 在 run_with_activity 中启动一个 Compose 项目：命令输出写入日志，屏幕只显示进度。
+compose_start_project() {
+  local compose_dir="$1" name="$2" compose_impl="$3"
+  local compose_log="${DM_LOG_FILE:-/dev/null}"
+  (
+    cd "$compose_dir"
+    COMPOSE_IMPL="$compose_impl"
+    compose_run "${COMPOSE_FILE_ARGS[@]}" config >/dev/null 2>>"$compose_log" || exit 1
+    compose_prepare_networks "$name" "${COMPOSE_FILE_ARGS[@]}" >>"$compose_log" 2>&1 || exit 1
+    declare -a source_state_records=() start_services=() pause_services=()
+    mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
+    say "Compose 项目 ${name}：读取到 ${#source_state_records[@]} 条源端服务状态"
+    if ((${#source_state_records[@]} == 0)); then
+      error_user "迁移包缺少 Compose 项目 ${name} 的服务状态记录" "请用最新版脚本在旧服务器重新运行备份"
+      exit 1
+    fi
+    log_line "\$ compose up --no-start（${name}）"
+    compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start >>"$compose_log" 2>&1 || exit 1
+    for state_record in "${source_state_records[@]}"; do
+      service="${state_record%%$'\t'*}"
+      state="${state_record#*$'\t'}"
+      case "$state" in
+        running) start_services+=("$service") ;;
+        paused)
+          start_services+=("$service")
+          pause_services+=("$service")
+          ;;
+      esac
+    done
+    if ((${#start_services[@]} > 0)); then
+      log_line "\$ compose start ${start_services[*]}（${name}）"
+      compose_run "${COMPOSE_FILE_ARGS[@]}" start "${start_services[@]}" >>"$compose_log" 2>&1 || exit 1
+      compose_wait_services "${RESTORE_HEALTH_TIMEOUT:-60}" \
+        "${COMPOSE_FILE_ARGS[@]}" -- "${start_services[@]}" || exit 1
+    fi
+    compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
+    for service in "${pause_services[@]}"; do
+      while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        dm_quiet docker pause "$id" || exit 1
+      done < <(compose_run "${COMPOSE_FILE_ARGS[@]}" ps -q "$service" 2>>"$compose_log")
+    done
+  )
+}
 
 RESTORE_STAGE="恢复 Compose 项目"
-say "[D] 恢复 Compose 项目"
+restore_stage 5 "启动服务"
 if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
   COMPOSE_RESTORE_ROOT="${RESTORE_TRANSACTION_DIR}/incoming_compose"
   mkdir -p "$COMPOSE_RESTORE_ROOT"
@@ -4947,11 +6644,11 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     USE_WDIR=0
     name=$(jq -r '.name' <<<"$row")
     wdir=$(jq -r '.working_dir // ""' <<<"$row")
-    echo " - project: $name"
+    say "恢复 Compose 项目：${name}"
     mkdir -p "${COMPOSE_RESTORE_ROOT}/${name}"
 
     if [[ -n "${SKIP_PROJECTS[$name]:-}" ]]; then
-      warn " · Compose 项目已存在，按 RESTORE_EXISTING=skip 保持不变：$name"
+      warn_user "Compose 项目 ${name} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       continue
     fi
 
@@ -4960,7 +6657,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     elif command -v docker-compose >/dev/null 2>&1; then
       compose_impl="legacy"
     else
-      warn " 新机未安装 docker compose/docker-compose，跳过该项目。"
+      error_user "新服务器没有安装 docker compose" "安装 docker-compose-plugin 后重试"
       FAILED_PROJECTS+=("$name")
       continue
     fi
@@ -4975,7 +6672,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
     printf '%s\n' "$name" >>"${RESTORE_TRANSACTION_DIR}/compose_replaced.list"
 
     if [[ -n "$wdir" ]]; then
-      echo " · 还原 compose 配置到原路径：$wdir"
+      say "还原 Compose 配置到原路径：$wdir"
       transaction_install_tree "compose/${name}" "$wdir"
       # 如果 wdir 存在且 compose 文件已还原到 wdir，则从 wdir 执行 compose up
       # 这确保 1Panel / 宝塔等使用相对路径 bind mount 的 compose 项目能正确解析路径
@@ -5011,47 +6708,13 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       compose_dir="${COMPOSE_RESTORE_ROOT}/${name}"
     fi
     compose_rc=0
-    (
-      cd "$compose_dir"
-      COMPOSE_IMPL="$compose_impl"
-      compose_run "${COMPOSE_FILE_ARGS[@]}" config >/dev/null || exit 1
-      compose_prepare_networks "$name" "${COMPOSE_FILE_ARGS[@]}" || exit 1
-      declare -a source_state_records=() start_services=() pause_services=()
-      mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
-      echo " · 已读取 ${#source_state_records[@]} 条源端服务状态"
-      if ((${#source_state_records[@]} == 0)); then
-        warn " · 迁移包缺少 Compose 服务的源端状态记录：$name"
-        exit 1
-      else
-        compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start 2>&1 || exit 1
-        for state_record in "${source_state_records[@]}"; do
-          service="${state_record%%$'\t'*}"
-          state="${state_record#*$'\t'}"
-          case "$state" in
-            running) start_services+=("$service") ;;
-            paused)
-              start_services+=("$service")
-              pause_services+=("$service")
-              ;;
-          esac
-        done
-        if ((${#start_services[@]} > 0)); then
-          compose_run "${COMPOSE_FILE_ARGS[@]}" start "${start_services[@]}" 2>&1 || exit 1
-          compose_wait_services "${RESTORE_HEALTH_TIMEOUT:-60}" \
-            "${COMPOSE_FILE_ARGS[@]}" -- "${start_services[@]}" || exit 1
-        fi
-        compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
-        for service in "${pause_services[@]}"; do
-          while IFS= read -r id; do
-            [[ -n "$id" ]] || continue
-            docker pause "$id" >/dev/null || exit 1
-          done < <(compose_run "${COMPOSE_FILE_ARGS[@]}" ps -q "$service")
-        done
-      fi
-    ) || compose_rc=$?
+    DM_PROGRESS_HINT="正在等待服务启动与健康检查（最长 ${RESTORE_HEALTH_TIMEOUT:-60} 秒）" \
+      run_with_activity "Compose 项目 ${name}" \
+      compose_start_project "$compose_dir" "$name" "$compose_impl" || compose_rc=$?
 
     if ((compose_rc != 0)); then
-      warn " · 新 Compose 项目启动失败：$name"
+      fail_with_output "Compose 项目 ${name} 启动失败" "$(log_tail_text 30)" \
+        "执行 docker compose -p ${name} logs 查看服务日志"
       FAILED_PROJECTS+=("$name")
       print_failure_summary
       exit 1
@@ -5060,7 +6723,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
 fi
 
 RESTORE_STAGE="创建独立容器网络"
-say "[E] 创建独立容器自定义网络（非 Compose）"
+say "创建自定义网络"
 declare -A COMPOSE_NETS=()
 while IFS= read -r n; do
   [[ -n "$n" ]] || continue
@@ -5075,6 +6738,8 @@ if jq -e '.networks|length>0' manifest.json >/dev/null 2>&1; then
       continue
     fi
     if ! create_network_from_record "$network_row"; then
+      [[ -n "$(fail_reason_read || true)" ]] ||
+        fail_with_output "网络 ${n} 创建失败" "$(log_tail_text 10)" "检查是否与新服务器已有网络的网段冲突"
       FAILED_NETWORKS+=("$n")
     fi
   done < <(jq -c '.networks[]' manifest.json)
@@ -5136,19 +6801,19 @@ restore_runs_in_dependency_order() {
 }
 
 RESTORE_STAGE="恢复独立容器"
-say "[F] 恢复单容器（非 Compose）"
 if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
     cname_from_script="${r#runs/}"
     cname_from_script="${cname_from_script%.sh}"
     if [[ -n "${SKIP_CONTAINERS[$cname_from_script]:-}" ]]; then
-      warn " 同名单容器按 RESTORE_EXISTING=skip 保持不变：$cname_from_script"
+      warn_user "容器 ${cname_from_script} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       continue
     fi
-    echo " - $r"
-    if ! RESTORE_TRANSACTION_DIR="$RESTORE_TRANSACTION_DIR" bash "$r" 2>&1; then
-      warn " 容器恢复脚本失败：$r"
+    say "恢复容器：${cname_from_script}"
+    if ! RESTORE_TRANSACTION_DIR="$RESTORE_TRANSACTION_DIR" bash "$r"; then
+      [[ -n "$(fail_reason_read || true)" ]] ||
+        error_user "容器 ${cname_from_script} 恢复失败" "查看下方日志中的最后几行了解详情"
       FAILED_CONTAINERS+=("$cname_from_script")
       print_failure_summary
       exit 1
@@ -5162,6 +6827,7 @@ if restore_has_failures; then
 fi
 
 transaction_commit
+stage_end "$(jq -r '"\(.runs | length) 个容器 · \(.projects | length) 个 Compose 项目"' manifest.json)"
 REST_SH
   chmod +x "$out"
 }
@@ -5190,7 +6856,7 @@ restore_client_remove_session() {
   local base="${RESTORE_CLIENT_SESSION_BASE:-}"
   local session="${RESTORE_CLIENT_SESSION_DIR:-}"
   if ! restore_client_session_path_is_safe "$base" "$session"; then
-    RED "[ERR] 拒绝清理不安全的恢复临时目录：${session:-<空>}"
+    log_line "拒绝清理不安全的恢复临时目录：${session:-<空>}"
     return 1
   fi
   [[ -e "$session" || -L "$session" ]] || return 0
@@ -5209,15 +6875,21 @@ restore_client_exit_handler() {
       if restore_client_remove_session; then
         if ((rc != 0)); then
           case "$rc" in
-            129 | 130 | 143) YEL "[INFO] 已清理中断产生的下载与临时文件。" ;;
-            *) YEL "[INFO] 已清理未完成的下载与临时文件。" ;;
+            129 | 130 | 143) printf '已清理中断产生的下载与临时文件。\n' >&2 ;;
+            *) printf '已清理未完成的下载与临时文件。\n' >&2 ;;
           esac
         fi
       else
-        RED "[ERR] 自动清理失败，请检查：${RESTORE_CLIENT_SESSION_DIR:-未知目录}"
+        printf '自动清理失败，请检查：%s\n' "${RESTORE_CLIENT_SESSION_DIR:-未知目录}" >&2
       fi
       ;;
   esac
+  if ((rc != 0)); then
+    stage_fail
+    [[ -z "${DM_LOG_FILE:-}" ]] || printf '日志：%s（反馈问题时请附上这个文件）\n' "$DM_LOG_FILE" >&2
+  else
+    log_finish 1
+  fi
   RESTORE_CLIENT_PHASE="finished"
   # 清理失败不能覆盖原始信号或错误退出码；诊断信息已在上面明确给出。
   exit "$rc"
@@ -5226,7 +6898,7 @@ restore_client_exit_handler() {
 restore_client_arm_session_cleanup() {
   local base="$1" session="$2"
   if ! restore_client_session_path_is_safe "$base" "$session"; then
-    RED "[ERR] 无法保护不安全的恢复临时目录：$session"
+    error_user "恢复工作目录不安全：$session" "设置 RESTORE_BASE 指向一个普通目录后重试"
     return 1
   fi
   RESTORE_CLIENT_SESSION_BASE="$base"
@@ -5270,7 +6942,7 @@ restore_prompt_url() {
     read -rp "请输入旧服务器的一键包下载链接： " restore_url
   fi
   if ! [[ "$restore_url" =~ ^https?://[^[:space:]]+\.tar\.gz\.enc($|[?#]) ]]; then
-    RED "[ERR] 链接必须是源服务器输出的 http/https .tar.gz.enc 加密迁移包链接。"
+    error_user "链接格式不正确" "请完整复制旧服务器输出的 http(s)://….tar.gz.enc#… 链接"
     exit 1
   fi
   echo "$restore_url"
@@ -5288,40 +6960,54 @@ restore_find_bundle_dir() {
 }
 
 restore_ensure_deps() {
-  local pm
-  pm="$(pm_detect)"
   local pair bin pkg
   local -a required_pairs=("curl curl" "tar tar" "find findutils" "jq jq" "docker docker"
     "python3 python3" "openssl openssl")
+  PKGMGR="$(pm_detect)"
   for pair in "${required_pairs[@]}"; do
     bin="${pair%% *}"
     pkg="${pair##* }"
-    if ! command -v "$bin" >/dev/null 2>&1; then
-      if [[ "$pm" == "none" ]]; then
-        RED "[ERR] 缺少命令：$bin，请在新服务器安装该命令后重试。"
-        exit 1
-      fi
-      if [[ "$bin" == "docker" ]]; then
-        YEL "[INFO] 安装依赖：$bin（以及 docker compose）"
-        case "$pm" in
-          apt) pm_install "$pm" docker.io ;;
-          dnf | yum | zypper | apk) pm_install "$pm" docker ;;
-          *) pm_install "$pm" docker || true ;;
+    command -v "$bin" >/dev/null 2>&1 && continue
+    if [[ "$PKGMGR" == "none" ]]; then
+      error_user "缺少命令 ${bin}，且没有可用的包管理器" "请手动安装 ${bin} 后重试"
+      exit 1
+    fi
+    if [[ "$bin" == "docker" ]]; then
+      case "$PKGMGR" in
+        apt) install_package docker docker.io || true ;;
+        *) install_package docker docker || true ;;
+      esac
+      if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+        case "$PKGMGR" in
+          apt) install_package "docker compose" docker-compose-plugin ||
+            install_package docker-compose docker-compose || true ;;
+          *) install_package docker-compose docker-compose || true ;;
         esac
-        if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
-          case "$pm" in
-            apt) pm_install "$pm" docker-compose-plugin || pm_install "$pm" docker-compose || true ;;
-            dnf | yum | zypper | apk) pm_install "$pm" docker-compose || true ;;
-            *) pm_install "$pm" docker-compose || true ;;
-          esac
-        fi
-      else
-        YEL "[INFO] 安装依赖：$bin"
-        pm_install "$pm" "$pkg"
       fi
+      command -v docker >/dev/null 2>&1 || {
+        error_user "Docker 自动安装失败" "请按 https://docs.docker.com/engine/install/ 手动安装后重试"
+        exit 1
+      }
+    else
+      need_bin "$bin" "$pkg"
     fi
   done
   ensure_docker_running
+}
+
+# 下载迁移包：响应头写入 header_file，供进度显示读取总大小；curl 的报错
+# 写入日志，失败时据此给出原因。
+restore_download() {
+  local url="$1" output="$2" header_file="$3"
+  curl -fL --globoff -sS --retry 5 --retry-delay 10 --retry-max-time 300 \
+    --connect-timeout 30 -D "$header_file" --output "$output" --url "$url" \
+    2>>"${DM_LOG_FILE:-/dev/null}"
+}
+
+# 解压迁移包，同时统计已读取的压缩数据量用于显示进度。
+restore_extract() {
+  local archive="$1" outdir="$2" count_file="$3"
+  progress_meter "$count_file" <"$archive" | tar -xzf - -C "$outdir"
 }
 
 restore_main() {
@@ -5329,6 +7015,8 @@ restore_main() {
   local ENCRYPTION_IV ENCRYPTION_MAC ENCRYPTION_KEY MAC_KEY tgz_bytes free_bytes
   local restore_started=$SECONDS
   URL="$(restore_prompt_url "${1:-}")"
+  log_init restore
+  stage_begin 1 8 "检查环境"
   DOWNLOAD_URL="$(bundle_download_url "$URL")"
   EXPECTED_SHA256="$(bundle_expected_sha256 "$URL")"
   ENCRYPTION_SCHEME="$(bundle_encryption_scheme "$URL")"
@@ -5342,26 +7030,27 @@ restore_main() {
     ! valid_hex_length "$ENCRYPTION_SECRET" 128 ||
     ! valid_hex_length "$ENCRYPTION_IV" 32 ||
     ! valid_hex_length "$ENCRYPTION_MAC" 64; then
-    RED "[ERR] 链接缺少有效的 sha256/enc/secret/iv/mac 参数，请完整复制源服务器输出的链接。"
-    RED "[ERR] 如果源服务器运行的是旧版脚本，请用最新版重新生成迁移包。"
+    error_user "链接缺少有效的 sha256/enc/secret/iv/mac 参数" \
+      "请完整复制旧服务器输出的链接；如果旧服务器运行的是旧版脚本，请用最新版重新生成"
     exit 1
   fi
   restore_ensure_deps
   local BASE="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
   mkdir -p "$BASE"
   BASE="$(cd "$BASE" && pwd -P)" || {
-    RED "[ERR] 无法访问恢复目录：$BASE"
+    error_user "无法访问恢复目录：$BASE" "设置 RESTORE_BASE 指向一个可写的目录后重试"
     exit 1
   }
   local SESSION_DIR
   SESSION_DIR="$(mktemp -d "${BASE}/restore.XXXXXX")" || {
-    RED "[ERR] 无法创建独立恢复工作目录：$BASE"
+    error_user "无法创建恢复工作目录：$BASE" "执行 df -h 检查磁盘空间，或设置 RESTORE_BASE 指向其他目录"
     exit 1
   }
   if ! restore_client_arm_session_cleanup "$BASE" "$SESSION_DIR"; then
     rmdir "$SESSION_DIR" 2>/dev/null || true
     exit 1
   fi
+  stage_end "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
   local RID
   RID="$(basename "$DOWNLOAD_URL" | sed 's/\.tar\.gz.*$//' | tr -dc 'A-Za-z0-9_-')"
   [[ -n "$RID" ]] || RID="$(date +%s)"
@@ -5369,47 +7058,51 @@ restore_main() {
   local ENCRYPTED_BUNDLE="${SESSION_DIR}/bundle.tar.gz.enc"
   local DOWNLOAD_FILE="$ENCRYPTED_BUNDLE"
   local DOWNLOAD_PARTIAL="${DOWNLOAD_FILE}.partial"
+  local HEADER_FILE="${SESSION_DIR}/download.headers"
   local OUTDIR="${SESSION_DIR}/unpacked"
 
-  BLUE "[INFO] 下载：$DOWNLOAD_URL"
-  if ! curl -fL --globoff --progress-bar --retry 5 --retry-delay 10 --retry-max-time 300 \
-    --connect-timeout 30 --output "$DOWNLOAD_PARTIAL" --url "$DOWNLOAD_URL"; then
-    RED "[ERR] 下载失败：$DOWNLOAD_URL"
+  stage_begin 2 8 "下载迁移包"
+  log_line "下载地址：${DOWNLOAD_URL}"
+  if ! DM_PROGRESS_HINT="长时间没有进展时，请检查旧服务器的防火墙和云厂商安全组" \
+    run_with_progress "下载" "$DOWNLOAD_PARTIAL" "header:${HEADER_FILE}" \
+    restore_download "$DOWNLOAD_URL" "$DOWNLOAD_PARTIAL" "$HEADER_FILE"; then
+    fail_with_output "下载迁移包失败" "$(log_tail_text 10)" \
+      "确认旧服务器上的脚本仍在运行，并检查防火墙和安全组是否放行了下载端口"
     exit 1
   fi
   if ! mv "$DOWNLOAD_PARTIAL" "$DOWNLOAD_FILE"; then
-    RED "[ERR] 无法保存已下载的迁移包，请检查磁盘空间：$DOWNLOAD_FILE"
+    error_user "无法保存下载的迁移包" "执行 df -h 检查磁盘空间后重试"
     exit 1
   fi
-  OK "[OK] 保存路径：$DOWNLOAD_FILE"
-  BLUE "[INFO] 文件大小：$(du -h "$DOWNLOAD_FILE" | awk '{print $1}')"
+  stage_end "$(human "$(progress_file_size "$DOWNLOAD_FILE")")"
+
+  stage_begin 3 8 "校验并解密"
   ENCRYPTION_KEY="$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")"
   MAC_KEY="$(bundle_secret_mac_key "$ENCRYPTION_SECRET")"
-  if ! run_with_activity "验证加密迁移包完整性" verify_bundle_digests \
+  if ! run_with_activity "校验摘要与签名" verify_bundle_digests \
     "$ENCRYPTED_BUNDLE" "$MAC_KEY" "$ENCRYPTION_IV" \
     "$EXPECTED_SHA256" "$ENCRYPTION_MAC"; then
-    RED "[ERR] 加密迁移包摘要或认证失败，文件可能被篡改或链接密钥不正确。"
+    error_user "迁移包摘要或签名校验失败，文件可能被篡改或链接不完整" \
+      "确认链接完整复制后重新恢复；仍失败时请在旧服务器重新运行备份"
     exit 1
   fi
-  OK "[OK] 加密迁移包来源摘要与认证均通过"
   if ! ensure_free_space "$SESSION_DIR" "$(progress_file_size "$ENCRYPTED_BUNDLE")" "解密迁移包"; then
     exit 1
   fi
-  if ! run_with_file_progress "解密迁移包" "${TGZ}.partial.$$" \
+  if ! run_with_progress "解密" "${TGZ}.partial.$$" \
     "$(progress_file_size "$ENCRYPTED_BUNDLE")" bundle_decrypt_file \
     "$ENCRYPTED_BUNDLE" "$TGZ" "$ENCRYPTION_KEY" "$ENCRYPTION_IV"; then
     rm -f "$TGZ"
-    RED "[ERR] 迁移包解密失败。"
+    fail_with_output "解密迁移包失败" "$(log_tail_text 10)" "执行 df -h 检查磁盘空间后重试"
     exit 1
   fi
   ENCRYPTION_SECRET=""
   ENCRYPTION_KEY=""
   MAC_KEY=""
-  OK "[OK] 迁移包解密完成"
   # 密文已通过认证并解密，后续只用明文包；尽早释放一份完整包的空间。
   [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$ENCRYPTED_BUNDLE"
-  if ! run_with_activity "扫描迁移包目录结构" archive_layout_is_safe "$TGZ"; then
-    RED "[ERR] 迁移包结构不安全或已损坏，拒绝解压。"
+  if ! run_with_activity "检查归档结构" archive_layout_is_safe "$TGZ"; then
+    error_user "迁移包结构不安全或已损坏，拒绝解压" "请在旧服务器重新运行备份"
     exit 1
   fi
   mkdir -p "$OUTDIR"
@@ -5417,30 +7110,33 @@ restore_main() {
   tgz_bytes="$(progress_file_size "$TGZ")"
   free_bytes="$(free_disk_bytes "$SESSION_DIR")"
   if [[ "$free_bytes" =~ ^[0-9]+$ ]] && ((free_bytes < tgz_bytes * 3 / 2)); then
-    YEL "[WARN] 磁盘剩余空间可能不足以解压迁移包（约需 $(human "$((tgz_bytes * 3 / 2))")），解压失败时请先清理磁盘。"
+    warn_user "磁盘剩余空间可能不足以解压迁移包（约需 $(human "$((tgz_bytes * 3 / 2))")）"
   fi
-  if ! run_with_activity "解压迁移包" tar -xzf "$TGZ" -C "$OUTDIR"; then
-    RED "[ERR] 解压失败，请检查磁盘空间或确认文件是否完整。"
+  if ! run_with_progress "解压" "count:${TGZ}.count" "$tgz_bytes" \
+    restore_extract "$TGZ" "$OUTDIR" "${TGZ}.count"; then
+    rm -f "${TGZ}.count"
+    fail_with_output "解压迁移包失败" "$(log_tail_text 10)" "执行 df -h 检查磁盘空间后重试"
     exit 1
   fi
+  rm -f "${TGZ}.count"
   [[ "${RESTORE_KEEP:-0}" == "1" ]] || rm -f "$TGZ"
 
   local BUNDLE_DIR
   BUNDLE_DIR="$(restore_find_bundle_dir "$OUTDIR" "$RID" || true)"
   if [[ -z "$BUNDLE_DIR" || ! -f "${BUNDLE_DIR}/restore.sh" ]]; then
-    RED "[ERR] 未找到 restore.sh，解压内容异常：$OUTDIR"
+    error_user "迁移包内容不完整：找不到 restore.sh" "请在旧服务器重新运行备份"
     exit 1
   fi
-  if ! run_with_activity "校验迁移包内全部文件" \
+  if ! run_with_activity "校验每个文件" \
     verify_bundle_checksums "$BUNDLE_DIR"; then
-    RED "[ERR] 完整性校验未通过，拒绝恢复。"
+    error_user "迁移包文件校验失败，拒绝恢复" "请在旧服务器重新运行备份"
     exit 1
   fi
-  OK "[OK] 迁移包完整性校验通过"
   if ! bundle_manifest_is_safe "$BUNDLE_DIR"; then
-    RED "[ERR] manifest.json 结构或路径不安全，拒绝恢复。"
+    error_user "迁移包的 manifest 结构或路径不安全，拒绝恢复" "请用最新版脚本在旧服务器重新运行备份"
     exit 1
   fi
+  stage_end "$(human "$tgz_bytes")"
 
   # 使用当前脚本内置的修复版 restore.sh 覆盖包内旧 restore.sh。
   write_bundle_restore_script "${BUNDLE_DIR}/restore.sh"
@@ -5450,8 +7146,10 @@ restore_main() {
   local container_line="" data_line="" cleanup_line="" diagnostic_dir="" elapsed
   restore_client_begin_restore
   set +e
+  DM_SUMMARY_ARMED=1
   RESTORE_CHECKSUM_VERIFIED=1 RESTORE_SESSION_DIR="$SESSION_DIR" \
     RESTORE_RESULT_FILE="$result_file" RESTORE_DEFER_FINAL_SUMMARY=1 \
+    DM_STAGE_OFFSET=3 DM_STAGE_TOTAL=8 DM_SUMMARY_ARMED=1 \
     bash "${BUNDLE_DIR}/restore.sh"
   rc=$?
   set -e
@@ -5525,7 +7223,72 @@ restore_main() {
   print_restore_result_summary "$result_status" "$result_stage" "$container_line" "$data_line" \
     "$cleanup_line" "$diagnostic_dir" "$rollback_dir" "$elapsed"
   restore_client_finish_session
+  if [[ "$result_status" == "SUCCESS" ]]; then
+    log_finish 1
+  else
+    log_finish 0
+  fi
   exit "$rc"
+}
+
+# --diagnose：收集排查问题所需的信息，生成一个可以直接附到 issue 里的文件。
+# 只读取信息，不改动任何容器或数据；写入前统一隐藏密钥与密码。
+
+diagnose_section() {
+  printf '\n===== %s =====\n' "$1"
+}
+
+run_diagnose() {
+  local out log_dir restore_dir file
+  out="${PWD}/docker_migrate_diagnose-$(date +%Y%m%d-%H%M%S).txt"
+  log_dir="${DOCKER_MIGRATE_LOG_DIR:-${HOME:-/tmp}/docker_migrate_logs}"
+  restore_dir="${RESTORE_BASE:-${HOME:-/tmp}/docker_migrate_restore}"
+  printf '正在收集诊断信息……\n' >&2
+  {
+    # 收集过程中个别命令失败（目录不存在、工具未安装）是正常的，不能中断整份报告。
+    set +e +o pipefail
+    log_environment diagnose
+    diagnose_section "Docker 信息"
+    docker info 2>&1 | head -n 80
+    diagnose_section "容器"
+    docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>&1
+    diagnose_section "网络"
+    docker network ls 2>&1
+    diagnose_section "数据卷"
+    docker volume ls 2>&1
+    diagnose_section "磁盘"
+    df -h 2>&1
+    diagnose_section "监听端口"
+    { ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null || echo "ss / netstat 均不可用"; } | head -n 60
+    diagnose_section "防火墙"
+    if command -v ufw >/dev/null 2>&1; then ufw status 2>&1; fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --state 2>&1
+      firewall-cmd --list-ports 2>&1
+    fi
+    diagnose_section "最近的运行日志（最多 3 份，每份最后 300 行）"
+    if [[ -d "$log_dir" ]]; then
+      while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        printf -- '--- %s\n' "$file"
+        tail -n 300 "$file" 2>&1
+      done < <(ls -1t "$log_dir"/*.log 2>/dev/null | head -n 3)
+    else
+      echo "没有找到日志目录：$log_dir"
+    fi
+    diagnose_section "恢复工作目录"
+    ls -la "$restore_dir" 2>&1 | head -n 30
+    while IFS= read -r file; do
+      [[ -n "$file" ]] || continue
+      printf -- '--- %s\n' "$file"
+      cat "$file" 2>&1
+    done < <(find "$restore_dir" -maxdepth 2 -name 'restore-result.json' 2>/dev/null | head -n 5)
+    diagnose_section "回滚资料目录"
+    ls -la "${RESTORE_ROLLBACK_BASE:-${HOME:-/tmp}/.docker_migrate_rollback}" 2>&1 | head -n 30
+  } 2>&1 | log_redact >"$out"
+  chmod 600 "$out" 2>/dev/null || true
+  printf '诊断文件已生成：%s\n' "$out" >&2
+  printf '提交 issue 时请附上这个文件。密钥与密码已自动隐藏，上传前也建议自己再检查一遍。\n' >&2
 }
 
 if [[ "${DOCKER_MIGRATE_LIB_ONLY:-0}" == "1" ]]; then
@@ -5545,6 +7308,8 @@ for ((arg_i = 0; arg_i < ${#ORIGINAL_ARGS[@]}; arg_i++)); do
       exit 0
       ;;
     --backup) REQUESTED_MODE=1 ;;
+    --diagnose) REQUESTED_MODE=diagnose ;;
+    --verbose | -v) DOCKER_MIGRATE_VERBOSE=1 ;;
     --restore=*)
       REQUESTED_MODE=2
       RESTORE_URL="${ORIGINAL_ARGS[$arg_i]#*=}"
@@ -5558,6 +7323,8 @@ for ((arg_i = 0; arg_i < ${#ORIGINAL_ARGS[@]}; arg_i++)); do
       ;;
   esac
 done
+
+export DOCKER_MIGRATE_VERBOSE="${DOCKER_MIGRATE_VERBOSE:-0}"
 
 if [[ -n "$REQUESTED_MODE" ]]; then
   MODE_PICK="$REQUESTED_MODE"
@@ -5574,6 +7341,10 @@ fi
 
 case "$MODE_PICK" in
   1) : ;;
+  diagnose)
+    run_diagnose
+    exit 0
+    ;;
   2)
     restore_main "$RESTORE_URL"
     exit 0
@@ -5587,6 +7358,23 @@ esac
 #####################################
 # 依赖检测 / 安装
 #####################################
+log_init backup "${ORIGINAL_ARGS[@]}"
+
+# 锁与清理流程就绪前的退出：失败时保留日志并告诉用户位置。
+backup_early_exit() {
+  local rc="$1"
+  trap - EXIT
+  if ((rc == 0)); then
+    log_finish 1
+  else
+    stage_fail
+    [[ -z "${DM_LOG_FILE:-}" ]] || printf '日志：%s\n' "$DM_LOG_FILE" >&2
+  fi
+  exit "$rc"
+}
+trap 'backup_early_exit $?' EXIT
+
+stage_begin 1 7 "检查环境"
 PKGMGR="$(pm_detect)"
 
 case "$PKGMGR" in
@@ -5639,7 +7427,7 @@ case "$PKGMGR" in
   none)
     for required_bin in curl jq tar find gzip openssl docker; do
       if ! command -v "$required_bin" >/dev/null 2>&1; then
-        RED "[ERR] 缺少命令：$required_bin，且未检测到受支持的包管理器，请手动安装。"
+        error_user "缺少命令 ${required_bin}，且没有可用的包管理器" "请手动安装 ${required_bin} 后重试"
         exit 1
       fi
     done
@@ -5655,6 +7443,7 @@ INCLUDE_LIST=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backup) shift ;;
+    --verbose | -v) shift ;;
     --no-stop)
       NO_STOP=1
       shift
@@ -5673,7 +7462,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      RED "[ERR] 未知参数：$1"
+      error_user "未知参数：$1" "运行 --help 查看可用参数"
       exit 1
       ;;
   esac
@@ -5690,7 +7479,7 @@ RID="$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 10)"
 BUNDLE_ROOT="${WORKDIR}/bundle"
 BUNDLE="${BUNDLE_ROOT}/${RID}"
 mkdir -p "${BUNDLE}"/{runs,volumes,binds,compose,meta,networks}
-BLUE "[INFO] Bundle 目录：${BUNDLE}"
+detail "迁移包工作目录：${BUNDLE}"
 
 #####################################
 # 并发锁：防止同机同时运行两个实例互相干扰
@@ -5705,12 +7494,11 @@ if command -v flock >/dev/null 2>&1; then
   LOCK_METHOD="flock"
   exec 200>"$LOCKFILE"
   if ! flock -n 200 2>/dev/null; then
-    RED "[ERR] 检测到另一个 docker_migrate 实例正在运行。"
+    error_user "本机已有另一个迁移任务正在运行" "等待它结束后重试"
     exit 1
   fi
 elif ! mkdir "$LOCKDIR" 2>/dev/null; then
-  RED "[ERR] 检测到另一个 docker_migrate 实例正在运行。"
-  RED "[ERR] 若确认没有实例运行，可删除：$LOCKDIR"
+  error_user "本机已有另一个迁移任务正在运行" "确认没有其他任务后，删除 ${LOCKDIR} 再重试"
   exit 1
 fi
 
@@ -5782,12 +7570,12 @@ restart_source_containers() {
   if ((observed_total > SOURCE_RESTORE_EXPECTED)); then
     SOURCE_RESTORE_EXPECTED=$observed_total
   fi
-  BLUE "[INFO] 恢复源服务器容器原始运行状态（共 ${#STOPPED_ON_BACKUP[@]} 个）..."
+  detail "恢复源服务器容器原始运行状态（共 ${#STOPPED_ON_BACKUP[@]} 个）"
   local ok=0 fail=0 record n original_state current_state restore_ok
   local -a remaining=()
   for record in "${STOPPED_ON_BACKUP[@]}"; do
     IFS=$'\t' read -r n original_state <<<"$record"
-    printf " [恢复源状态] %s (%s)\n" "$n" "$original_state"
+    detail "恢复源容器状态：${n}（${original_state}）"
     current_state="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo missing)"
     restore_ok=1
     case "$original_state" in
@@ -5797,28 +7585,28 @@ restart_source_containers() {
             running | restarting) ;;
             *)
               run_with_activity "启动源容器：$n" \
-                run_with_timeout 60 docker start "$n" >/dev/null || restore_ok=0
+                dm_quiet run_with_timeout 60 docker start "$n" || restore_ok=0
               ;;
           esac
-          ((restore_ok == 0)) || docker pause "$n" >/dev/null 2>&1 || restore_ok=0
+          ((restore_ok == 0)) || dm_quiet docker pause "$n" || restore_ok=0
         fi
         ;;
       *)
         case "$current_state" in
           running | restarting) ;;
-          paused) docker unpause "$n" >/dev/null 2>&1 || restore_ok=0 ;;
+          paused) dm_quiet docker unpause "$n" || restore_ok=0 ;;
           *)
             run_with_activity "启动源容器：$n" \
-              run_with_timeout 60 docker start "$n" >/dev/null || restore_ok=0
+              dm_quiet run_with_timeout 60 docker start "$n" || restore_ok=0
             ;;
         esac
         ;;
     esac
     if ((restore_ok == 1)); then
-      printf " [恢复源状态] %s：ok\n" "$n"
+      detail "源容器已恢复：${n}"
       ok=$((ok + 1))
     else
-      printf " [恢复源状态] %s：fail\n" "$n"
+      detail "源容器恢复失败：${n}"
       fail=$((fail + 1))
       remaining+=("$record")
     fi
@@ -5826,10 +7614,11 @@ restart_source_containers() {
   STOPPED_ON_BACKUP=("${remaining[@]}")
   SOURCE_RESTORED_COUNT=$((SOURCE_RESTORE_EXPECTED - ${#STOPPED_ON_BACKUP[@]}))
   if ((fail > 0)); then
-    RED "[ERR] 有 ${fail} 个源容器未能重启，请立即人工检查。"
+    error_user "有 ${fail} 个源容器未能恢复原来的运行状态" \
+      "立即执行 docker ps -a 检查，并用 docker start <容器名> 手动启动"
     return 1
   fi
-  OK "[OK] 源容器已恢复：${ok}/${attempted}"
+  detail "源容器已恢复：${ok}/${attempted}"
 }
 
 graceful_exit() {
@@ -5887,8 +7676,14 @@ graceful_exit() {
     status="FAILED"
   fi
   elapsed="$(format_elapsed "$((SECONDS - SOURCE_TASK_STARTED_AT))")"
+  ((rc == 0)) || stage_fail
   print_source_result_summary "$status" "$package_line" "$HTTP_CLEANUP_STATUS" \
     "$source_line" "$CLEANUP_STATUS" "$elapsed"
+  if [[ "$status" == "SUCCESS" ]]; then
+    log_finish 1
+  else
+    log_finish 0
+  fi
   exit "$final_rc"
 }
 
@@ -5897,10 +7692,13 @@ trap 'graceful_exit $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+DM_SUMMARY_ARMED=1
+stage_end "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
 
 #####################################
 # 容器选择（支持 compose 分组）
 #####################################
+stage_begin 2 7 "选择容器"
 if [[ -n "$INCLUDE_LIST" ]]; then
   declare -A INCLUDE_ID_BY_NAME=()
   include_container_count=0
@@ -5910,7 +7708,7 @@ if [[ -n "$INCLUDE_LIST" ]]; then
     include_container_count=$((include_container_count + 1))
   done < <(docker ps -a --format '{{.ID}}\t{{.Names}}')
   ((include_container_count > 0)) || {
-    RED "[ERR] 没有任何容器（运行中或已停止）"
+    error_user "本机没有任何容器（运行中或已停止）"
     exit 1
   }
   IFS=',' read -r -a NAMES <<<"$INCLUDE_LIST"
@@ -5922,17 +7720,17 @@ if [[ -n "$INCLUDE_LIST" ]]; then
     if [[ -n "$id" ]]; then
       IDS+=("$id")
     else
-      YEL "[WARN] 未找到容器：$n"
+      warn_user "未找到容器：$n"
     fi
   done
   ((${#IDS[@]})) || {
-    RED "[ERR] --include 未匹配到任何容器"
+    error_user "--include 没有匹配到任何容器" "执行 docker ps -a 确认容器名称"
     exit 1
   }
 else
   mapfile -t PS_LINES < <(docker ps -a --format '{{.ID}} {{.Names}}')
   ((${#PS_LINES[@]})) || {
-    RED "[ERR] 没有任何容器（运行中或已停止）"
+    error_user "本机没有任何容器（运行中或已停止）"
     exit 1
   }
 
@@ -5948,13 +7746,13 @@ else
 
   scan_total=${#PS_LINES[@]}
   scan_index=0
-  BLUE "[INFO] 正在识别容器与 Compose 分组（共 ${scan_total} 个）..."
+  detail "识别容器与 Compose 分组（共 ${scan_total} 个）"
   for line in "${PS_LINES[@]}"; do
     scan_index=$((scan_index + 1))
     id="${line%% *}"
     cname="${line#* }"
     [[ -z "$cname" || "$cname" == "$id" ]] && cname="$id"
-    progress_count "识别容器分组" "$scan_index" "$scan_total" "$cname"
+    progress_count "识别容器" "$scan_index" "$scan_total" "$cname"
     NAME_OF_ID["$id"]="$cname"
 
     j="$(docker inspect "$id")"
@@ -6036,6 +7834,7 @@ else
   declare -a MENU_KIND=()
   declare -a MENU_VAL=()
   idx=0
+  stage_hold
   if ((${#STANDALONE_IDS[@]})); then
     BLUE "独立 docker 容器："
     for i in "${!STANDALONE_IDS[@]}"; do
@@ -6070,12 +7869,12 @@ else
   fi
 
   if ((idx == 0)); then
-    RED "[ERR] 没有可迁移的容器"
+    error_user "没有可迁移的容器"
     exit 1
   fi
 
   if [[ ! -t 0 ]]; then
-    RED "[ERR] 非交互模式无法选择容器，请用 --include=容器名1,容器名2 指定要迁移的容器。"
+    error_user "非交互模式无法选择容器" "用 --include=容器名1,容器名2 指定要迁移的容器"
     exit 1
   fi
   read -rp "请输入要迁移的序号 [回车=全部 / 逗号分隔，如 1,3]： " PICK
@@ -6091,12 +7890,12 @@ else
       t="$(echo "$t" | xargs)"
       [[ -z "$t" ]] && continue
       if ! [[ "$t" =~ ^[0-9]+$ ]]; then
-        YEL "[WARN] 非法序号：$t"
+        warn_user "忽略无效的序号：$t"
         continue
       fi
       num="$t"
       if ((num < 1 || num > idx)); then
-        YEL "[WARN] 序号越界：$t"
+        warn_user "忽略超出范围的序号：$t"
         continue
       fi
       kind="${MENU_KIND[$num]}"
@@ -6117,7 +7916,7 @@ else
       fi
     done
     ((${#IDS[@]})) || {
-      RED "[ERR] 未选择任何容器"
+      error_user "没有选择任何容器"
       exit 1
     }
   fi
@@ -6145,7 +7944,7 @@ while ((dependency_added == 1)); do
       done
       ((dep_selected == 0)) || continue
       dep_name="$(docker inspect -f '{{.Name}}' "$dep_id" 2>/dev/null | sed 's#^/##')"
-      YEL "[INFO] 自动加入被依附的容器：${dep_name:-${dep_id:0:12}}（其他所选容器共享它的命名空间）"
+      warn_user "自动加入被依附的容器 ${dep_name:-${dep_id:0:12}}（其他所选容器共享它的网络或进程命名空间）"
       IDS+=("${dep_id:0:12}")
       dependency_added=1
     done < <(docker inspect -f '{{.HostConfig.NetworkMode}}
@@ -6155,10 +7954,13 @@ while ((dependency_added == 1)); do
   done
 done
 
+# shellcheck disable=SC2154
+stage_end "${#IDS[@]} 个容器"
+
 #####################################
 # 元数据采集
 #####################################
-BLUE "[INFO] 采集容器元数据 ..."
+stage_begin 3 7 "读取配置"
 declare -A IMGSET=()
 declare -A NETWORKS=()
 declare -A CONTAINER_NAME=()
@@ -6174,7 +7976,7 @@ metadata_total=${#IDS[@]}
 metadata_index=0
 for id in "${IDS[@]}"; do
   metadata_index=$((metadata_index + 1))
-  progress_count "分析所选容器" "$metadata_index" "$metadata_total" "$id"
+  progress_count "分析容器" "$metadata_index" "$metadata_total" "$id"
   jtmp="$(docker inspect "$id")"
   SELECTED_INSPECT_JSON["$id"]="$jtmp"
   projtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$jtmp")
@@ -6204,7 +8006,7 @@ for id in "${IDS[@]}"; do
   metadata_index=$((metadata_index + 1))
   j="${SELECTED_INSPECT_JSON[$id]}"
   name=$(jq -r '.[0].Name | ltrimstr("/")' <<<"$j")
-  progress_count "采集容器元数据" "$metadata_index" "$metadata_total" "$name"
+  progress_count "读取容器配置" "$metadata_index" "$metadata_total" "$name"
   img=$(jq -r '.[0].Config.Image' <<<"$j")
   CONTAINER_NAME["$id"]="$name"
   IMGSET["$img"]=1
@@ -6280,7 +8082,7 @@ done
 # 打包 Compose 配置（绝对/相对路径）
 #####################################
 if ((${#COMPOSE_GROUP[@]})); then
-  BLUE "[INFO] 打包 docker compose 项目配置 ..."
+  detail "打包 Docker Compose 项目配置"
   compose_total=${#COMPOSE_GROUP[@]}
   compose_index=0
   for key in "${!COMPOSE_GROUP[@]}"; do
@@ -6324,17 +8126,18 @@ if ((${#COMPOSE_GROUP[@]})); then
     # 使用全部 -f 文件生成规范配置，合并覆盖文件并解析 env_file。
     if ((${#CFG_SOURCE_ARGS[@]} > 0)); then
       resolved_tmp="${dest}/.resolved_config.yml.tmp"
-      BLUE "[INFO] 解析 Compose 配置：$proj"
+      detail "解析 Compose 配置：$proj"
+      compose_log="${DM_LOG_FILE:-/dev/null}"
       if docker compose version >/dev/null 2>&1 &&
-        { docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>/dev/null ||
-          docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>/dev/null; }; then
+        { docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>>"$compose_log" ||
+          docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>>"$compose_log"; }; then
         mv "$resolved_tmp" "${dest}/_resolved_config.yml"
       elif command -v docker-compose >/dev/null 2>&1 &&
-        (cd "$wdir" && docker-compose "${CFG_SOURCE_ARGS[@]}" config) >"$resolved_tmp" 2>/dev/null; then
+        (cd "$wdir" && docker-compose "${CFG_SOURCE_ARGS[@]}" config) >"$resolved_tmp" 2>>"$compose_log"; then
         mv "$resolved_tmp" "${dest}/_resolved_config.yml"
       else
         rm -f "$resolved_tmp"
-        YEL "[WARN] 无法生成解析后的 Compose 配置，将使用原始配置文件。"
+        warn_user "Compose 项目 ${proj} 无法生成解析后的配置，将使用原始配置文件"
       fi
     fi
 
@@ -6365,12 +8168,12 @@ fi
 #####################################
 # 预拉取卷操作镜像，避免把下载时间计入后面的停机快照窗口
 #####################################
-BLUE "[INFO] 预拉取 alpine:3.20 镜像（用于卷操作）..."
 if docker image inspect alpine:3.20 >/dev/null 2>&1; then
-  OK "[OK] 已存在 alpine:3.20，跳过联网检查"
+  detail "卷操作镜像 alpine:3.20 已存在"
 else
-  run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 ||
-    YEL "[WARN] 无法拉取 alpine:3.20，卷操作可能失败"
+  DM_PROGRESS_HINT="正在从 Docker Hub 下载，网络较慢时可能需要几分钟" \
+    run_with_activity "拉取卷操作镜像 alpine:3.20" dm_quiet docker pull alpine:3.20 ||
+    warn_user "无法拉取 alpine:3.20，打包数据卷时可能失败"
 fi
 
 #####################################
@@ -6378,33 +8181,33 @@ fi
 #####################################
 declare -a SHARED_MOUNT_ROWS=()
 mapfile -t SHARED_MOUNT_ROWS < <(
-  run_with_activity "检查未选中容器的共享挂载写入" \
+  run_with_activity "检查与其他容器共享的数据" \
     collect_shared_running_containers "${IDS[@]}"
 )
 if ((${#SHARED_MOUNT_ROWS[@]} > 0)); then
-  YEL "[WARN] 检测到未选中的运行容器正在使用相同 volume 或重叠 bind 路径："
+  stage_hold
   for shared_row in "${SHARED_MOUNT_ROWS[@]}"; do
     IFS=$'\t' read -r _ shared_name shared_reason <<<"$shared_row"
-    YEL " - ${shared_name} (${shared_reason})"
+    warn_user "未选中的容器 ${shared_name} 正在使用相同的数据（${shared_reason}）"
   done
 
   if ((NO_STOP == 1)); then
-    RED "[ERR] --no-stop 无法保证共享挂载一致性，已取消备份。"
-    RED "[INFO] 请停止这些容器，或去掉 --no-stop 让脚本临时暂停并自动恢复。"
+    error_user "--no-stop 无法保证共享数据的一致性，已取消备份" \
+      "停止这些容器，或去掉 --no-stop 让脚本临时停止并自动恢复它们"
     exit 1
   fi
 
   stop_shared=0
   if [[ -t 0 ]]; then
-    read -rp "是否临时停止这些共享挂载容器？备份结束会自动重启。[Y/n] " STOP_SHARED
+    read -rp "是否临时停止这些容器？备份完成后会自动恢复。[Y/n] " STOP_SHARED
     STOP_SHARED=${STOP_SHARED:-Y}
     [[ "$STOP_SHARED" =~ ^[Yy]$ ]] && stop_shared=1
   elif [[ "${STOP_SHARED_MOUNTS:-0}" == "1" ]]; then
     stop_shared=1
   fi
   if ((stop_shared == 0)); then
-    RED "[ERR] 未获得停止共享挂载容器的许可，已取消备份以避免不一致数据。"
-    RED "[INFO] 非交互模式可显式设置 STOP_SHARED_MOUNTS=1。"
+    error_user "未允许停止共享数据的容器，为避免备份出不一致的数据已取消" \
+      "非交互模式可设置 STOP_SHARED_MOUNTS=1 允许临时停止它们"
     exit 1
   fi
 
@@ -6412,32 +8215,35 @@ if ((${#SHARED_MOUNT_ROWS[@]} > 0)); then
   for shared_row in "${SHARED_MOUNT_ROWS[@]}"; do
     IFS=$'\t' read -r _ shared_name _ <<<"$shared_row"
     shared_state="$(docker inspect -f '{{.State.Status}}' "$shared_name" 2>/dev/null || echo running)"
-    printf "[停机-共享挂载] %s\n" "$shared_name"
+    detail "临时停止共享数据的容器：${shared_name}"
     # Write-ahead：在 unpause/stop 前登记原状态；信号可在任意指令后安全恢复。
     STOPPED_ON_BACKUP+=("${shared_name}"$'\t'"${shared_state}")
-    [[ "$shared_state" != "paused" ]] || docker unpause "$shared_name" >/dev/null 2>&1 || true
+    [[ "$shared_state" != "paused" ]] || dm_quiet docker unpause "$shared_name" || true
     SHARED_STOP_NAMES+=("$shared_name")
   done
   if ! docker_stop_batch_verified \
-    "批量停止共享挂载容器（${#SHARED_STOP_NAMES[@]} 个）" "${SHARED_STOP_NAMES[@]}"; then
-    BACKUP_FAILURES+=("共享挂载容器未能全部停止")
-  fi
-  if ((${#BACKUP_FAILURES[@]} > 0)); then
-    RED "[ERR] 共享挂载容器未全部停止，已取消备份。"
+    "停止共享数据的容器（${#SHARED_STOP_NAMES[@]} 个）" "${SHARED_STOP_NAMES[@]}"; then
+    error_user "共享数据的容器没有全部停止，已取消备份" "执行 docker ps 检查这些容器的状态"
     exit 1
   fi
 fi
+stage_end "${#IDS[@]} 个容器"
 
 #####################################
 # 停机窗口（可选）
 #####################################
+stage_begin 4 7 "停机并打包数据"
+DOWNTIME_STARTED=$SECONDS
 if ((NO_STOP == 1)); then
-  YEL "[WARN] 使用 --no-stop：不停机备份，数据可能不一致（尤其数据库类容器）。"
+  warn_user "使用 --no-stop 不停机备份，数据库等有状态服务的数据可能不一致"
 else
   # 非交互运行（定时任务、nohup、管道）时 stdin 可能已关闭；read 读到 EOF
   # 不能触发 set -e 中止，按默认的一致性停机备份继续。
   STOPNOW=""
-  read -rp "是否现在停机以确保一致性备份？[Y/n] " STOPNOW || true
+  if [[ -t 0 ]]; then
+    stage_hold
+    read -rp "是否临时停止所选容器以保证数据一致？完成打包后会立即恢复。[Y/n] " STOPNOW || true
+  fi
   STOPNOW=${STOPNOW:-Y}
   if [[ "$STOPNOW" =~ ^[Yy]$ ]]; then
     total_count=${#IDS[@]}
@@ -6450,40 +8256,37 @@ else
         "$id" 2>/dev/null || echo 'false missing')"
       read -r was_running source_state <<<"$source_state_row"
       if [[ "$was_running" != "true" ]]; then
-        printf "[停机] (%d/%d) %s ... already stopped\n" "$idx" "$total_count" "$n"
+        detail "停机 ${idx}/${total_count}：${n} 原本就已停止"
         continue
       fi
-      printf "[停机] (%d/%d) %s\n" "$idx" "$total_count" "$n"
+      detail "停机 ${idx}/${total_count}：${n}"
       # Write-ahead：先登记再改变源容器状态，避免 TERM 落在 stop 与数组追加之间。
       STOPPED_ON_BACKUP+=("${n}"$'\t'"${source_state}")
-      [[ "$source_state" != "paused" ]] || docker unpause "$n" >/dev/null 2>&1 || true
+      [[ "$source_state" != "paused" ]] || dm_quiet docker unpause "$n" || true
       SOURCE_STOP_NAMES+=("$n")
     done
+    DOWNTIME_STARTED=$SECONDS
     if ! docker_stop_batch_verified \
-      "批量停止源容器（${#SOURCE_STOP_NAMES[@]} 个）" "${SOURCE_STOP_NAMES[@]}"; then
-      BACKUP_FAILURES+=("源容器未能全部停止")
-    fi
-    if ((${#BACKUP_FAILURES[@]} > 0)); then
-      RED "[ERR] 停机阶段失败，已取消备份以避免不一致数据。"
+      "停止所选容器（${#SOURCE_STOP_NAMES[@]} 个）" "${SOURCE_STOP_NAMES[@]}"; then
+      error_user "所选容器没有全部停止，为避免备份出不一致的数据已取消" "执行 docker ps 检查容器状态"
       exit 1
     fi
   else
-    YEL "[WARN] 你选择了不停机备份。"
+    warn_user "选择了不停机备份，数据库等有状态服务的数据可能不一致"
   fi
 fi
 
 #####################################
 # 捕获容器 writable layer
 #####################################
-BLUE "[INFO] 捕获容器可写层快照 ..."
+detail "检查容器可写层"
 for service_key in "${!COMPOSE_SERVICE_COUNT[@]}"; do
   if ((${COMPOSE_SERVICE_COUNT[$service_key]} > 1)); then
     BACKUP_FAILURES+=("Compose 服务存在多个副本，无法逐容器保留可写层：${service_key##*|}")
   fi
 done
 if ((${#BACKUP_FAILURES[@]} > 0)); then
-  RED "[ERR] 可写层快照预检查失败："
-  for failure in "${BACKUP_FAILURES[@]}"; do RED " - $failure"; done
+  error_user "${BACKUP_FAILURES[0]}" "请只迁移单副本的 Compose 服务，或先把副本数缩减为 1"
   exit 1
 fi
 
@@ -6498,13 +8301,12 @@ for id in "${IDS[@]}"; do
   snapshot_reason="$(container_snapshot_reason "$id" "${BUNDLE}/meta/${n}.inspect.json")"
   if [[ -z "$snapshot_reason" ]]; then
     original_image="$(jq -r '.[0].Config.Image' "${BUNDLE}/meta/${n}.inspect.json")"
-    printf " [IMAGE] (%d/%d) %s：可写层无改动，沿用原镜像 %s\n" \
-      "$snapshot_index" "$snapshot_total" "$n" "$original_image"
+    detail "可写层 ${snapshot_index}/${snapshot_total}：${n} 没有改动，沿用原镜像 ${original_image}"
     IMGSET["$original_image"]=1
     continue
   fi
-  printf " [SNAPSHOT] (%d/%d) %s（%s）\n" "$snapshot_index" "$snapshot_total" "$n" "$snapshot_reason"
-  if ! run_with_activity "创建容器可写层快照：$n" \
+  detail "可写层 ${snapshot_index}/${snapshot_total}：${n} 创建快照（${snapshot_reason}）"
+  if ! run_with_activity "快照 ${n}" \
     snapshot_container_image "$id" "${BUNDLE}/meta/${n}.inspect.json" "$snapshot_image"; then
     BACKUP_FAILURES+=("容器可写层快照失败：$n")
     continue
@@ -6517,21 +8319,20 @@ for id in "${IDS[@]}"; do
     compose_service="$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // empty' <<<"$j")"
     if ! write_compose_snapshot_override \
       "${BUNDLE}/compose/${proj}/_migration_images.yml" "$compose_service" "$snapshot_image"; then
-      YEL " [WARN] Compose 快照覆盖配置生成失败：$n"
       BACKUP_FAILURES+=("Compose 快照覆盖配置生成失败：$n")
       continue
     fi
   fi
 done
 if ((${#BACKUP_FAILURES[@]} > 0)); then
-  RED "[ERR] 可写层快照不完整，已取消备份。"
+  fail_with_output "${BACKUP_FAILURES[0]}" "$(log_tail_text)"
   exit 1
 fi
 
 #####################################
 # 备份卷与绑定目录
 #####################################
-BLUE "[INFO] 备份卷与绑定目录 ..."
+detail "打包数据卷与挂载目录"
 declare -a MAN_VOL=()
 declare -a MAN_BIND=()
 declare -A BACKED_VOLUMES=()
@@ -6570,15 +8371,17 @@ for id in "${IDS[@]}"; do
           v_driver="local"
           v_opts_json='{}'
         fi
-        printf " [VOL] (%d/%d) %s :: %s -> %s\n" "$v_idx" "$vol_count" "$n" "$vname" "$dest"
+        detail "数据卷 ${v_idx}/${vol_count}：${n} 的 ${vname} -> ${dest}"
         mkdir -p "${BUNDLE}/volumes"
         out="${BUNDLE}/volumes/vol_${vname}.tgz"
-        if ! run_with_file_progress "打包命名卷：$vname" "$out" 0 \
-          archive_volume_to_gzip "$vname" "$out"; then
-          YEL " [WARN] 打包卷失败：$vname"
-          BACKUP_FAILURES+=("命名卷备份失败：$vname")
+        if ! run_with_progress "卷 ${vname}" "count:${out}.count" "$(volume_size_bytes "$vname")" \
+          archive_volume_to_gzip "$vname" "$out" "${out}.count"; then
+          rm -f "${out}.count"
+          BACKUP_FAILURES+=("数据卷 ${vname} 打包失败")
           continue
         fi
+        PACKED_BYTES=$((${PACKED_BYTES:-0} + $(progress_current "count:${out}.count")))
+        rm -f "${out}.count"
         MAN_VOL+=("$(jq -cn --arg name "$vname" --arg dest "$dest" --arg driver "$v_driver" --argjson opts "$v_opts_json" '{name:$name,dest:$dest,driver:$driver,opts:$opts}')")
         ;;
       bind)
@@ -6586,13 +8389,13 @@ for id in "${IDS[@]}"; do
         # 过滤 Docker socket 等 Unix socket 文件，防止恢复时覆盖目标服务器 daemon
         case "$src" in
           */docker.sock | */podman.sock | */containerd.sock)
-            YEL " [SKIP] 跳过 Docker socket bind mount：$src"
+            detail "跳过 Docker socket 挂载：$src（新服务器会挂载自己的 Docker）"
             continue
             ;;
         esac
         b_idx=$((b_idx + 1))
         if bind_path_is_system "$src"; then
-          YEL " [SKIP] 宿主机系统路径只在新服务器重建挂载、不迁移内容：$src"
+          detail "宿主机系统路径只在新服务器重建挂载、不迁移内容：$src"
           continue
         fi
         # 软链接 bind 必须备份链接指向的真实数据；只打包链接本身会丢数据，
@@ -6601,42 +8404,41 @@ for id in "${IDS[@]}"; do
         real_src="$(bind_resolve_source "$src")"
         if [[ "$real_src" != "$src" ]]; then
           if bind_path_is_system "$real_src"; then
-            YEL " [SKIP] 软链接指向宿主机系统路径，只重建挂载：$src -> $real_src"
+            detail "软链接指向宿主机系统路径，只在新服务器重建挂载：$src -> $real_src"
             continue
           fi
           bind_link="$src"
           src="$real_src"
-          YEL " [INFO] bind 源是软链接，备份真实目录：${bind_link} -> ${src}"
+          detail "挂载路径是软链接，备份它指向的真实目录：${bind_link} -> ${src}"
         fi
         [[ -z "${BACKED_BINDS[$src]:-}" ]] || continue
         BACKED_BINDS["$src"]=1
         esc="$(basename "$src" | tr -c 'A-Za-z0-9_.-' '_')"
         src_id="$(printf '%s' "$src" | cksum | awk '{print $1}')"
         out="${BUNDLE}/binds/bind_${esc}_${src_id}.tgz"
-        printf " [BIND] (%d/%d) %s :: %s -> %s\n" "$b_idx" "$bind_count" "$n" "$src" "$dest"
+        detail "挂载目录 ${b_idx}/${bind_count}：${n} 的 ${src} -> ${dest}"
         mkdir -p "${BUNDLE}/binds"
-        if ! run_with_file_progress "打包绑定目录：$src" "$out" 0 \
-          archive_bind_to_gzip "$src" "$out"; then
-          YEL " [WARN] 跳过不可读路径：$src"
-          BACKUP_FAILURES+=("绑定目录备份失败：$src")
+        if ! run_with_progress "目录 ${src}" "count:${out}.count" "$(path_size_bytes "$src")" \
+          archive_bind_to_gzip "$src" "$out" "${out}.count"; then
+          rm -f "${out}.count"
+          BACKUP_FAILURES+=("挂载目录 ${src} 打包失败")
           continue
         fi
+        PACKED_BYTES=$((${PACKED_BYTES:-0} + $(progress_current "count:${out}.count")))
+        rm -f "${out}.count"
         MAN_BIND+=("$(jq -cn --arg host "$src" --arg link "$bind_link" --arg dest "$dest" \
           --arg file "$(basename "$out")" \
           '{host:$host,dest:$dest,file:$file} + (if $link == "" then {} else {link:$link} end)')")
         ;;
       *)
-        YEL " [SKIP] 未处理的 mount 类型：$t (dest=$dest)"
+        detail "跳过不需要迁移的挂载类型：$t（$dest）"
         ;;
     esac
   done < <(jq -c '.[0].Mounts[]?' <<<"$j")
 done
 
 if ((${#BACKUP_FAILURES[@]} > 0)); then
-  RED "[ERR] 数据备份不完整，已取消生成迁移包："
-  for failure in "${BACKUP_FAILURES[@]}"; do
-    RED " - $failure"
-  done
+  fail_with_output "${BACKUP_FAILURES[0]}" "$(log_tail_text)"
   exit 1
 fi
 
@@ -6644,18 +8446,23 @@ fi
 # 镜像保存、压缩、加密和下载不再需要业务保持停止，立即恢复源端状态。
 SOURCE_RESTORE_EXPECTED=${#STOPPED_ON_BACKUP[@]}
 if ((SOURCE_RESTORE_EXPECTED > 0)); then
-  BLUE "[INFO] 数据快照已完成，立即恢复源服务器容器状态 ..."
-  if ! restart_source_containers; then
-    RED "[ERR] 源容器未能全部恢复，已停止后续打包，请立即人工检查。"
+  detail "数据快照已完成，立即恢复源服务器容器状态"
+  if ! run_with_activity "恢复源容器运行" restart_source_containers; then
     exit 1
   fi
 fi
+packed_summary="${#MAN_VOL[@]} 个卷 · ${#MAN_BIND[@]} 个目录 · $(human "${PACKED_BYTES:-0}")"
+if ((SOURCE_RESTORE_EXPECTED > 0)); then
+  packed_summary+=" · 停机 $(format_elapsed "$((SECONDS - DOWNTIME_STARTED))")"
+fi
+stage_end "$packed_summary"
 
 #####################################
 # 生成独立容器 run 脚本
 #####################################
+stage_begin 5 7 "保存镜像"
 if ((${#IDS[@]})); then
-  BLUE "[INFO] 生成独立容器 run 脚本 ..."
+  detail "生成单容器恢复脚本"
   for id in "${IDS[@]}"; do
     if [[ "${CONTAINER_IS_COMPOSE[$id]}" == "1" ]]; then
       continue
@@ -6673,24 +8480,21 @@ fi
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | awk 'NF' | sort -u)
 if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
-  if progress_docker_save "${OUT_IMG}" docker image save "${IMAGES[@]}"; then
-    OK "[OK] images.tar 已生成，大小：$(du -h "${OUT_IMG}" | awk '{print $1}')"
+  if progress_docker_save "${OUT_IMG}" "$(images_total_bytes "${IMAGES[@]}")" \
+    docker image save "${IMAGES[@]}"; then
+    detail "images.tar 已生成：$(human "$(progress_file_size "$OUT_IMG")")"
     if ! cleanup_snapshot_images; then
-      YEL "[WARN] 部分临时 snapshot image 暂未删除，退出清理时会自动重试。"
+      detail "部分临时快照镜像暂未删除，退出清理时会自动重试"
     fi
   else
-    RED "[ERR] docker image save 失败，请检查磁盘空间或 Docker 状态。"
     rm -f "${OUT_IMG}" 2>/dev/null || true
-    BACKUP_FAILURES+=("镜像归档失败")
+    fail_with_output "保存镜像失败" "$(log_tail_text)" "执行 df -h 检查磁盘空间，并确认 Docker 运行正常"
+    exit 1
   fi
 else
-  YEL "[WARN] 未收集到镜像名（可能是只用了本地 none 镜像）。"
+  warn_user "没有找到需要保存的镜像，新服务器将尝试在线拉取"
 fi
-
-if ((${#BACKUP_FAILURES[@]} > 0)); then
-  RED "[ERR] 备份未完成，不会生成可误用的迁移包。"
-  exit 1
-fi
+stage_end "${#IMAGES[@]} 个镜像 · $(human "$(progress_file_size "${OUT_IMG:-/dev/null}")")"
 
 #####################################
 # 生成 manifest.json 与 restore.sh
@@ -6787,8 +8591,9 @@ Docker 迁移包
 README
 }
 
+stage_begin 6 7 "加密打包"
 generate_manifest_and_restore
-run_with_activity "计算迁移包内文件校验值" generate_bundle_checksums "$BUNDLE"
+run_with_activity "计算文件校验值" generate_bundle_checksums "$BUNDLE"
 
 #####################################
 # 流式压缩并加密成单文件
@@ -6796,15 +8601,15 @@ run_with_activity "计算迁移包内文件校验值" generate_bundle_checksums 
 BUNDLE_BASENAME="docker_migrate_${STAMP}_${RID}"
 SINGLE_TAR_PATH="${BUNDLE_ROOT}/${BUNDLE_BASENAME}.tar.gz"
 BUNDLE_SECRET="$(openssl rand -hex 64)" || {
-  RED "[ERR] 无法生成迁移包加密密钥。"
+  error_user "无法生成迁移包加密密钥" "确认 openssl 可以正常运行"
   exit 1
 }
 BUNDLE_IV="$(openssl rand -hex 16)" || {
-  RED "[ERR] 无法生成迁移包加密 IV。"
+  error_user "无法生成迁移包加密 IV" "确认 openssl 可以正常运行"
   exit 1
 }
 valid_hex_length "$BUNDLE_SECRET" 128 && valid_hex_length "$BUNDLE_IV" 32 || {
-  RED "[ERR] OpenSSL 返回了无效的随机密钥材料。"
+  error_user "OpenSSL 返回了无效的随机密钥" "确认 openssl 可以正常运行"
   exit 1
 }
 BUNDLE_ENCRYPTION_KEY="$(bundle_secret_encryption_key "$BUNDLE_SECRET")"
@@ -6816,49 +8621,54 @@ bundle_plain_bytes="$(du -sk "$BUNDLE" 2>/dev/null | awk '{ printf "%.0f\n", $1 
 if ! ensure_free_space "$BUNDLE_ROOT" "${bundle_plain_bytes:-0}" "生成加密迁移包"; then
   exit 1
 fi
-if ! BUNDLE_DIGESTS="$(run_with_file_progress "压缩并加密迁移包" \
-  "$ENCRYPTED_PARTIAL_PATH" 0 bundle_pack_encrypt_directory \
+PACK_COUNT_FILE="${ENCRYPTED_PARTIAL_PATH}.count"
+if ! BUNDLE_DIGESTS="$(DM_PROGRESS_HINT="正在压缩，数据量大时需要几分钟" \
+  run_with_progress "压缩并加密" "count:${PACK_COUNT_FILE}" "${bundle_plain_bytes:-0}" \
+  bundle_pack_encrypt_directory \
   "$BUNDLE_ROOT" "$RID" "$ENCRYPTED_PARTIAL_PATH" \
-  "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_MAC_KEY" "$BUNDLE_IV")"; then
-  RED "[ERR] 迁移包压缩或加密失败，拒绝启动下载服务。"
+  "$BUNDLE_ENCRYPTION_KEY" "$BUNDLE_MAC_KEY" "$BUNDLE_IV" "$PACK_COUNT_FILE")"; then
+  rm -f "$PACK_COUNT_FILE"
+  fail_with_output "压缩或加密迁移包失败" "$(log_tail_text)" "执行 df -h 检查磁盘空间后重试"
   exit 1
 fi
+rm -f "$PACK_COUNT_FILE"
 IFS=$'\t' read -r BUNDLE_SHA256 BUNDLE_HMAC BUNDLE_DIGEST_EXTRA <<<"$BUNDLE_DIGESTS"
 if [[ -n "$BUNDLE_DIGEST_EXTRA" ]] || ! valid_sha256 "$BUNDLE_SHA256" ||
   ! valid_sha256 "$BUNDLE_HMAC"; then
-  RED "[ERR] 无法生成加密迁移包摘要。"
+  error_user "无法生成加密迁移包的摘要"
   exit 1
 fi
 if ! mv "$ENCRYPTED_PARTIAL_PATH" "$ENCRYPTED_TAR_PATH"; then
-  RED "[ERR] 无法提交已完成的加密迁移包。"
+  error_user "无法保存加密迁移包" "执行 df -h 检查磁盘空间后重试"
   exit 1
 fi
 # 明文目录已全部进入加密包：立即删除，释放磁盘并减少明文数据停留时间。
-rm -rf "$BUNDLE" 2>/dev/null || YEL "[WARN] 明文迁移目录暂未删除，退出时会再次清理：$BUNDLE"
+rm -rf "$BUNDLE" 2>/dev/null || detail "明文迁移目录暂未删除，退出时会再次清理：$BUNDLE"
 TRANSFER_NAME="${BUNDLE_BASENAME}.tar.gz.enc"
 TRANSFER_PATH="$ENCRYPTED_TAR_PATH"
 TRANSFER_FRAGMENT="#sha256=${BUNDLE_SHA256}&enc=${BUNDLE_ENCRYPTION_SCHEME}&secret=${BUNDLE_SECRET}&iv=${BUNDLE_IV}&mac=${BUNDLE_HMAC}"
 BUNDLE_ENCRYPTION_KEY=""
 BUNDLE_MAC_KEY=""
 BUNDLE_SECRET=""
-OK "[OK] 加密迁移包已生成，大小：$(du -h "$TRANSFER_PATH" | awk '{print $1}')"
 SOURCE_PACKAGE_READY=1
+stage_end "$(human "$(progress_file_size "$TRANSFER_PATH")")"
 
 #####################################
 # HTTP 下载服务
 #####################################
+stage_begin 7 7 "启动下载服务"
 if [[ -t 0 ]]; then
-  echo ""
-  read -rp "HTTP 下载端口 [回车=${PORT}]： " IN_PORT || true
+  stage_hold
+  read -rp "下载服务端口 [回车=${PORT}]： " IN_PORT || true
   if [[ -n "${IN_PORT:-}" ]]; then
     if [[ "$IN_PORT" =~ ^[0-9]+$ ]] && ((IN_PORT >= 1 && IN_PORT <= 65535)); then
       NEW_PORT="$(pick_free_port "$IN_PORT")"
       if [[ "$NEW_PORT" != "$IN_PORT" ]]; then
-        YEL "[WARN] 端口 ${IN_PORT} 已占用，改用临近可用端口：${NEW_PORT}"
+        warn_user "端口 ${IN_PORT} 已被占用，改用 ${NEW_PORT}"
       fi
       PORT="$NEW_PORT"
     else
-      YEL "[WARN] 输入端口无效，继续使用默认端口：${PORT}"
+      warn_user "输入的端口无效，继续使用 ${PORT}"
     fi
   fi
 fi
@@ -6871,6 +8681,7 @@ SHPID=""
 
 HTTP_LOG="${BUNDLE_ROOT}/http_server_${RID}.log"
 : >"$HTTP_LOG"
+log_line "下载服务日志：${HTTP_LOG}"
 cd "${BUNDLE_ROOT}" || exit 1
 
 # start_http_server: multi-fallback — python3 > busybox httpd > netcat
@@ -6993,7 +8804,7 @@ NCEOF
   FINAL_URL="${BASE_URL}/${TRANSFER_NAME}${TRANSFER_FRAGMENT}"
 
 else
-  RED "[ERR] 未找到可用的 HTTP 服务方式（python3 / busybox httpd / nc），请手动安装其一后重试。"
+  error_user "找不到可用的下载服务程序（python3、busybox httpd 或 nc）" "安装 python3 后重试"
   exit 1
 fi
 HTTP_WAS_STARTED=1
@@ -7003,11 +8814,12 @@ sleep 1
 
 if ! kill -0 "$SHPID" 2>/dev/null; then
   HTTP_EXIT_UNEXPECTED=1
-  RED "[ERR] HTTP 服务启动失败，请检查端口 ${PORT} 或防火墙设置。"
+  error_user "下载服务启动失败（端口 ${PORT}）" "换一个端口重试，或查看下方的下载服务日志"
   print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 fi
 SOURCE_TRANSFER_PUBLISHED=1
+stage_end "端口 ${PORT}"
 
 if [[ -t 0 ]]; then
   print_transfer_instructions "$FINAL_URL" interactive
@@ -7020,7 +8832,7 @@ if [[ -t 0 ]]; then
   wait "$SHPID" || http_wait_rc=$?
   HTTP_EXIT_UNEXPECTED=1
   SHPID=""
-  RED "[ERR] HTTP 服务在用户确认退出前意外停止（rc=${http_wait_rc}）。"
+  error_user "下载服务意外停止（退出码 ${http_wait_rc}）" "查看下方的下载服务日志，然后重新运行备份"
   print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 else
@@ -7029,7 +8841,7 @@ else
   wait "$SHPID" || http_wait_rc=$?
   HTTP_EXIT_UNEXPECTED=1
   SHPID=""
-  RED "[ERR] HTTP 服务在收到停止指令前意外退出（rc=${http_wait_rc}）。"
+  error_user "下载服务意外停止（退出码 ${http_wait_rc}）" "查看下方的下载服务日志，然后重新运行备份"
   print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 fi

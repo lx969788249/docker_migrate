@@ -5,6 +5,12 @@ umask 077
 BUNDLE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 META="${BUNDLE_DIR}/meta/__NAME__.inspect.json"
 
+# @include lib/log.sh
+
+# @include lib/screen.sh
+
+# @include lib/errors.sh
+
 # @include lib/progress.sh
 
 # @include lib/containers.sh
@@ -16,11 +22,11 @@ dm_capture_command() {
 }
 
 if [[ ! -f "$META" ]]; then
-  echo "[WARN] missing metadata: $META" >&2
+  error_user "迁移包缺少容器 __NAME__ 的配置文件" "请在旧服务器重新运行备份"
   exit 1
 fi
 if ! command -v jq >/dev/null 2>&1; then
-  echo "[WARN] jq is required to restore container: __NAME__" >&2
+  error_user "恢复容器 __NAME__ 需要 jq" "安装 jq 后重试"
   exit 1
 fi
 
@@ -45,7 +51,8 @@ resolve_container_mode() {
       return 0
     fi
   done
-  echo "[WARN] 依附的容器 ${ref:0:12} 不在迁移包中，请在源服务器把它一起迁移" >&2
+  log_line "依附的容器 ${ref:0:12} 不在迁移包中"
+  fail_reason "依附的容器 ${ref:0:12} 不在迁移包中" "请在旧服务器把它和依附它的容器一起迁移"
   printf '%s\n' "$mode"
 }
 
@@ -60,7 +67,7 @@ decode_base64() {
 name="$(jq -r '.[0].Name | ltrimstr("/")' "$META")"
 image="$(jq -r '.[0].Config.Image' "$META")"
 if [[ -z "$name" || -z "$image" || "$image" == "null" ]]; then
-  echo "[WARN] invalid container metadata for __NAME__" >&2
+  error_user "容器 __NAME__ 的配置文件无效" "请在旧服务器重新运行备份"
   exit 1
 fi
 
@@ -77,38 +84,38 @@ disconnect_container_networks() {
   local container="$1" metadata_file="$2" network
   while IFS= read -r network; do
     case "$network" in "" | host | none) continue ;; esac
-    docker network disconnect -f "$network" "$container" >/dev/null 2>&1 || return 1
+    dm_quiet docker network disconnect -f "$network" "$container" || return 1
   done < <(jq -r 'keys[]?' "$metadata_file")
 }
 
 restore_previous_container() {
   ((replacement_active == 1)) || return 0
-  echo "[WARN] new container failed; preserving previous container for rollback: $name" >&2
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  log_line "新容器 ${name} 未能通过验证，删除它并还原旧容器"
+  dm_quiet docker rm -f "$name" || true
   if ((transaction_mode == 1)); then
     # 数据必须先由主恢复脚本回滚；旧容器在那之后才会改回原名并恢复状态。
     replacement_active=0
     return 0
   fi
   if ! rename_container_with_retry "$replacement_backup_name" "$name"; then
-    echo "[WARN] automatic rollback failed; previous container remains as: $replacement_backup_name" >&2
+    warn_user "旧容器自动还原失败，它目前的名称是 ${replacement_backup_name}"
     return 1
   fi
   if ! restore_container_networks "$name" "$replacement_networks_file"; then
-    echo "[WARN] previous container name was restored, but its networks could not be fully reconnected: $name" >&2
+    warn_user "旧容器 ${name} 已改回原名，但网络没有完全重新连接"
     return 1
   fi
   case "$replacement_original_state" in
     running | restarting)
-      docker start "$name" >/dev/null 2>&1 || return 1
+      dm_quiet docker start "$name" || return 1
       ;;
     paused)
-      docker start "$name" >/dev/null 2>&1 || return 1
-      docker pause "$name" >/dev/null 2>&1 || return 1
+      dm_quiet docker start "$name" || return 1
+      dm_quiet docker pause "$name" || return 1
       ;;
   esac
   replacement_active=0
-  echo "[INFO] previous container restored: $name" >&2
+  log_line "旧容器已还原：${name}"
 }
 
 replacement_exit_handler() {
@@ -125,9 +132,10 @@ replacement_exit_handler() {
 trap replacement_exit_handler EXIT
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then
-  echo "[INFO] image is not loaded; pull before changing any existing container: $image"
-  run_with_activity "拉取容器镜像：$image" docker pull "$image" || {
-    echo "[WARN] image is unavailable; existing container was left unchanged: $image" >&2
+  detail "镜像 ${image} 不在本机，先在线拉取（此时还没有改动已有容器）"
+  DM_PROGRESS_HINT="正在从镜像仓库下载，网络较慢时可能需要几分钟" \
+    run_with_activity "拉取镜像 ${image}" dm_quiet docker pull "$image" || {
+    fail_with_output "容器 ${name} 的镜像 ${image} 拉取失败（已有容器保持不变）" "$(log_tail_text 10)"
     exit 1
   }
 fi
@@ -141,11 +149,11 @@ if docker container inspect "$name" >/dev/null 2>&1; then
   fi
   case "${RESTORE_EXISTING:-replace}" in
     replace)
-      echo "[WARN] container exists; replace it to restore the complete configuration: $name"
+      detail "新服务器已有同名容器 ${name}，替换它以恢复完整配置（失败时会还原）"
       replacement_original_state="$existing_state"
       replacement_backup_name="${name}.docker-migrate-backup-$$"
       if docker container inspect "$replacement_backup_name" >/dev/null 2>&1; then
-        echo "[WARN] rollback container name already exists: $replacement_backup_name" >&2
+        error_user "回滚用的容器名 ${replacement_backup_name} 已被占用" "删除或重命名这个容器后重试"
         exit 1
       fi
       if ((transaction_mode == 1)); then
@@ -156,7 +164,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
       fi
       if ! docker inspect "$name" | jq '.[0].NetworkSettings.Networks // {}' \
         >"$replacement_networks_file"; then
-        echo "[WARN] failed to preserve existing container networks: $name" >&2
+        error_user "无法记录已有容器 ${name} 的网络配置（已有容器保持不变）"
         exit 1
       fi
       if ((transaction_mode == 1)); then
@@ -164,35 +172,35 @@ if docker container inspect "$name" >/dev/null 2>&1; then
         printf '%s\t%s\t%s\n' "$name" "$replacement_backup_name" "$replacement_original_state" \
           >>"${RESTORE_TRANSACTION_DIR}/standalone_backups.tsv" || exit 1
       fi
-      [[ "$existing_state" == "paused" ]] && docker unpause "$name" >/dev/null 2>&1 || true
+      [[ "$existing_state" == "paused" ]] && dm_quiet docker unpause "$name" || true
       case "$existing_state" in
         running | restarting | paused)
-          run_with_activity "停止目标端旧容器：$name" docker stop "$name" >/dev/null || {
-            echo "[WARN] failed to stop existing container; it was left unchanged: $name" >&2
+          run_with_activity "停止已有容器 ${name}" dm_quiet docker stop "$name" || {
+            fail_with_output "无法停止已有容器 ${name}（它保持不变）" "$(log_tail_text 10)"
             exit 1
           }
           ;;
       esac
-      docker rename "$name" "$replacement_backup_name" >/dev/null 2>&1 || {
-        echo "[WARN] failed to preserve existing container; it was left unchanged: $name" >&2
+      dm_quiet docker rename "$name" "$replacement_backup_name" || {
+        fail_with_output "无法为已有容器 ${name} 建立回滚点（它保持不变）" "$(log_tail_text 10)"
         exit 1
       }
       replacement_active=1
       if ! disconnect_container_networks "$replacement_backup_name" "$replacement_networks_file"; then
-        echo "[WARN] failed to release previous container network endpoints: $name" >&2
+        fail_with_output "无法释放已有容器 ${name} 占用的网络地址" "$(log_tail_text 10)"
         exit 1
       fi
       ;;
     skip)
-      echo "[WARN] container exists; skipped by RESTORE_EXISTING=skip: $name"
+      warn_user "容器 ${name} 已存在，按 RESTORE_EXISTING=skip 保持不变"
       exit 0
       ;;
     fail)
-      echo "[WARN] container exists; refusing to replace it (RESTORE_EXISTING=fail): $name" >&2
+      error_user "容器 ${name} 已存在（RESTORE_EXISTING=fail 不允许替换）" "删除这个容器，或改用 RESTORE_EXISTING=replace"
       exit 1
       ;;
     *)
-      echo "[WARN] invalid RESTORE_EXISTING value: ${RESTORE_EXISTING}; use replace, skip, or fail" >&2
+      error_user "RESTORE_EXISTING 的值无效：${RESTORE_EXISTING}" "可用的值是 replace、skip 或 fail"
       exit 1
       ;;
   esac
@@ -340,7 +348,7 @@ elif [[ "$hc_kind" == "CMD" || "$hc_kind" == "CMD-SHELL" ]]; then
     hc_test="$(jq -r '.[0].Config.Healthcheck.Test[1] // empty' "$META")"
   else
     hc_test="$(jq -r '.[0].Config.Healthcheck.Test[1:] | map(@sh) | join(" ")' "$META")"
-    echo "[WARN] docker run 只支持 shell 形式健康检查，已改写为：$hc_test（镜像需包含 /bin/sh）" >&2
+    warn_user "容器 ${name} 的健康检查改写为 shell 形式（镜像需要包含 /bin/sh）：${hc_test}"
   fi
   hc_interval="$(jq -r '.[0].Config.Healthcheck.Interval // 30000000000' "$META")"
   hc_timeout="$(jq -r '.[0].Config.Healthcheck.Timeout // 30000000000' "$META")"
@@ -442,7 +450,7 @@ for p in "${port_bindings[@]}"; do
   fi
   args+=(-p "$port_binding")
   published_ports+=("$port_binding")
-  echo "[INFO] restore port: ${host_ip:-0.0.0.0}:${host_port}->${cont_port}"
+  detail "端口映射：${host_ip:-0.0.0.0}:${host_port} -> ${cont_port}"
 done
 
 mapfile -t mounts < <(jq -r '.[0].Mounts[]? | @base64' "$META")
@@ -515,26 +523,17 @@ fi
 run_output=""
 run_log="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-run.XXXXXX")" || exit 1
 set +e
-run_with_activity "创建并启动容器：$name" dm_capture_command "$run_log" "${args[@]}"
+log_line "\$ ${args[*]}"
+run_with_activity "${name}" dm_capture_command "$run_log" "${args[@]}"
 run_rc=$?
 set -e
 run_output="$(cat "$run_log")"
 rm -f "$run_log"
 
 if [[ $run_rc -ne 0 ]]; then
-  echo "[ERR] 容器创建或启动失败：$name" >&2
-  [[ -z "$run_output" ]] || printf '%s\n' "$run_output" >&2
-  if grep -Eqi 'port is already allocated|address already in use|Bind for .* failed|failed to bind host port' \
-    <<<"$run_output"; then
-    echo "[ERR] 已确认宿主机端口绑定冲突。" >&2
-    if ((${#published_ports[@]})); then
-      echo "[INFO] 本次尝试绑定的端口：" >&2
-      for p in "${published_ports[@]}"; do
-        echo "[INFO]   - $p" >&2
-      done
-    fi
-    echo "[INFO] 可执行 sudo ss -lntp 检查占用端口的进程。" >&2
-  fi
+  log_line "容器 ${name} 创建失败（退出码 ${run_rc}）：${run_output}"
+  ((${#published_ports[@]} == 0)) || log_line "本次尝试绑定的端口：${published_ports[*]}"
+  fail_with_output "容器 ${name} 创建失败" "$run_output"
   exit "$run_rc"
 fi
 
@@ -555,14 +554,10 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
     if [[ -n "$aliases_raw" && "$aliases_raw" != "null" ]]; then
       for a in $aliases_raw; do conn_args+=(--alias "$a"); done
     fi
-    docker network connect "${conn_args[@]}" "$net_name" "$name" >/dev/null 2>&1 || {
+    dm_quiet docker network connect "${conn_args[@]}" "$net_name" "$name" || {
       network_restore_failed=1
-      echo "[WARN] 连接额外网络失败：$net_name，容器可能缺少网络" >&2
-      case "$net_name" in
-        macvlan* | ipvlan* | overlay*)
-          echo "[WARN] → 网络 $net_name 需管理员在目标服务器预创建（macvlan/ipvlan/overlay 不自动创建）" >&2
-          ;;
-      esac
+      fail_with_output "容器 ${name} 无法连接网络 ${net_name}" "$(log_tail_text 10)" \
+        "macvlan、ipvlan、overlay 网络需要先在新服务器手动创建"
     }
   done
 fi
@@ -578,7 +573,7 @@ if [[ "$original_running" == "true" &&
   ("$health_kind" == "CMD" || "$health_kind" == "CMD-SHELL") ]]; then
   health_timeout="${RESTORE_HEALTH_TIMEOUT:-60}"
   if ! [[ "$health_timeout" =~ ^[1-9][0-9]*$ ]] || ((health_timeout > 3600)); then
-    echo "[WARN] invalid RESTORE_HEALTH_TIMEOUT: $health_timeout (expected 1-3600 seconds)" >&2
+    error_user "RESTORE_HEALTH_TIMEOUT 的值无效：$health_timeout" "请设置为 1 到 3600 之间的秒数"
     exit 1
   fi
   health_deadline=$((SECONDS + health_timeout))
@@ -590,29 +585,31 @@ if [[ "$original_running" == "true" &&
     health_elapsed=$((SECONDS - health_started))
     case "$health_status" in
       healthy)
-        echo "[完成] 容器健康检查：$name · ${health_elapsed}秒" >&2
+        log_line "[完成] 容器健康检查：$name · ${health_elapsed}秒"
         break
         ;;
       unhealthy | exited | dead)
-        echo "[WARN] new container did not become healthy: $name ($health_status)" >&2
+        error_user "容器 ${name} 健康检查没有通过（${health_status}）" "执行 docker logs ${name} 查看应用日志"
         exit 1
         ;;
     esac
     if [[ "$health_status" != "$health_last_status" ]] || ((health_elapsed >= health_next_report)); then
-      echo "[进度] 容器健康检查：$name · ${health_status:-未知} · ${health_elapsed}/${health_timeout}秒" >&2
+      log_line "[进度] 容器健康检查：$name · ${health_status:-未知} · ${health_elapsed}/${health_timeout}秒"
       health_last_status="$health_status"
       health_next_report=$((health_elapsed + 5))
     fi
+    progress_note "${name} 健康检查 · ${health_status:-starting} · ${health_elapsed}/${health_timeout} 秒"
     sleep 1
   done
   if [[ "${health_status:-}" != "healthy" ]]; then
-    echo "[WARN] healthcheck timed out after ${health_timeout}s: $name" >&2
+    error_user "容器 ${name} 健康检查超时（${health_timeout} 秒）" \
+      "执行 docker logs ${name} 查看应用日志；启动较慢的服务可以调大 RESTORE_HEALTH_TIMEOUT"
     exit 1
   fi
 elif [[ "$original_running" == "true" ]]; then
   startup_grace="${RESTORE_STARTUP_GRACE:-3}"
   if ! [[ "$startup_grace" =~ ^[1-9][0-9]*$ ]] || ((startup_grace > 300)); then
-    echo "[WARN] invalid RESTORE_STARTUP_GRACE: $startup_grace (expected 1-300 seconds)" >&2
+    error_user "RESTORE_STARTUP_GRACE 的值无效：$startup_grace" "请设置为 1 到 300 之间的秒数"
     exit 1
   fi
   startup_deadline=$((SECONDS + startup_grace))
@@ -623,29 +620,29 @@ elif [[ "$original_running" == "true" ]]; then
     case "$startup_status" in
       running) ;;
       *)
-        echo "[WARN] new container did not remain running: $name (${startup_status:-missing})" >&2
+        error_user "容器 ${name} 启动后立即退出（${startup_status:-missing}）" "执行 docker logs ${name} 查看应用日志"
         exit 1
         ;;
     esac
     startup_elapsed=$((SECONDS - startup_started))
     if ((startup_elapsed >= startup_next_report)); then
-      echo "[进度] 容器启动验证：$name · running · ${startup_elapsed}/${startup_grace}秒" >&2
+      log_line "[进度] 容器启动验证：$name · running · ${startup_elapsed}/${startup_grace}秒"
       startup_next_report=$((startup_elapsed + 5))
     fi
     ((SECONDS >= startup_deadline)) && break
     sleep 1
   done
-  echo "[完成] 容器启动验证：$name · $((SECONDS - startup_started))秒" >&2
+  log_line "[完成] 容器启动验证：$name · $((SECONDS - startup_started))秒"
 fi
 
 snapshot_original="$(jq -r '.[0].DockerMigrate.original_image // empty' "$META")"
 if [[ -n "$snapshot_original" ]]; then
-  echo "[INFO] ${name} 使用迁移快照镜像 ${image} 以保留容器内改动；原镜像为 ${snapshot_original}，以后升级请用原镜像重建容器。"
+  warn_user "${name} 使用快照镜像保留了容器内的改动，以后升级请用原镜像 ${snapshot_original} 重建"
 fi
 
 if [[ "$original_paused" == "true" ]]; then
-  docker pause "$name" >/dev/null 2>&1 || {
-    echo "[WARN] failed to restore paused state: $name" >&2
+  dm_quiet docker pause "$name" || {
+    error_user "无法把容器 ${name} 恢复为暂停状态"
     exit 1
   }
 fi
@@ -654,11 +651,11 @@ if ((replacement_active == 1)); then
   if ((transaction_mode == 1)); then
     # 由全局事务在全部项目、数据和健康检查通过后统一删除回滚容器。
     replacement_active=0
-    echo "[INFO] replacement verified; rollback container retained until transaction commit: $replacement_backup_name"
-  elif docker rm -f "$replacement_backup_name" >/dev/null 2>&1; then
+    log_line "替换已验证，回滚容器 ${replacement_backup_name} 保留到事务提交"
+  elif dm_quiet docker rm -f "$replacement_backup_name"; then
     replacement_active=0
-    echo "[INFO] replacement verified; removed rollback container: $replacement_backup_name"
+    log_line "替换已验证，已删除回滚容器 ${replacement_backup_name}"
   else
-    echo "[WARN] new container is running, but rollback container could not be removed: $replacement_backup_name" >&2
+    warn_user "新容器已运行，但回滚容器 ${replacement_backup_name} 没能删除，可以手动执行 docker rm -f ${replacement_backup_name}"
   fi
 fi

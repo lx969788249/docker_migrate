@@ -54,6 +54,8 @@ restore_print_final_result() {
       printf '结果：✅ 恢复成功\n%s\n%s\n' "$container_line" "$data_line"
       printf '验证：完整性校验、服务启动与健康检查均已通过\n'
       printf '清理：迁移包目录保持不变（手动恢复模式）\n'
+      print_stage_timings
+      print_warning_summary
       ;;
     FAILED_ROLLED_BACK)
       printf '结果：❌ 恢复失败，已安全回滚\n失败阶段：%s\n' "$RESTORE_STAGE"
@@ -85,14 +87,25 @@ restore_print_final_result() {
       printf '结果：❌ 恢复失败\n失败阶段：%s\n诊断目录：%s\n' "$RESTORE_STAGE" "$BUNDLE_DIR"
       ;;
   esac
-  printf '耗时：%s\n%s\n' "$elapsed" '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  printf '耗时：%s\n' "$elapsed"
+  if [[ "$status" != "SUCCESS" ]]; then
+    print_warning_summary
+    print_failure_details
+  fi
+  printf '%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 }
 
 restore_finish_result() {
   local status="$1" rollback_dir="${2:-}"
   restore_record_result "$status" "$rollback_dir" || true
+  [[ "$status" == "SUCCESS" ]] || stage_fail
   if [[ "${RESTORE_DEFER_FINAL_SUMMARY:-0}" != "1" ]]; then
     restore_print_final_result "$status" "$rollback_dir"
+  fi
+  if [[ "$status" == "SUCCESS" ]]; then
+    log_finish 1
+  else
+    log_finish 0
   fi
 }
 
@@ -120,18 +133,15 @@ restore_has_failures() {
   ${#FAILED_CONTAINERS[@]} > 0))
 }
 
+# 失败项写入日志；没有更具体的原因时，用失败项本身作为失败原因。
 print_failure_summary() {
+  local items=""
   restore_has_failures || return 0
-  warn "============================================"
-  warn "  部分内容恢复失败，请检查以下项目："
-  ((${#FAILED_VOLUMES[@]} == 0)) || warn "  · 命名卷失败: ${FAILED_VOLUMES[*]}"
-  ((${#FAILED_BINDS[@]} == 0)) || warn "  · 绑定目录失败: ${FAILED_BINDS[*]}"
-  ((${#FAILED_NETWORKS[@]} == 0)) || warn "  · 自定义网络失败: ${FAILED_NETWORKS[*]}"
-  ((${#FAILED_PROJECTS[@]} == 0)) || warn "  · Compose 项目失败: ${FAILED_PROJECTS[*]}"
-  if ((${#FAILED_CONTAINERS[@]} > 0)); then
-    warn "  · 独立容器失败: ${FAILED_CONTAINERS[*]}"
-    warn "  常见原因：端口冲突、镜像缺失、网络配置不兼容。"
-    warn "  可用命令排查端口：sudo ss -lntp"
-  fi
-  warn "============================================"
+  ((${#FAILED_VOLUMES[@]} == 0)) || items+="数据卷 ${FAILED_VOLUMES[*]}；"
+  ((${#FAILED_BINDS[@]} == 0)) || items+="挂载目录 ${FAILED_BINDS[*]}；"
+  ((${#FAILED_NETWORKS[@]} == 0)) || items+="网络 ${FAILED_NETWORKS[*]}；"
+  ((${#FAILED_PROJECTS[@]} == 0)) || items+="Compose 项目 ${FAILED_PROJECTS[*]}；"
+  ((${#FAILED_CONTAINERS[@]} == 0)) || items+="容器 ${FAILED_CONTAINERS[*]}；"
+  log_line "恢复失败的项目：${items%；}"
+  fail_reason "恢复失败：${items%；}" "查看下方日志中的最后几行了解详情"
 }

@@ -11,7 +11,7 @@ compose_rollback_image_cleanup() {
   [[ -f "${rollback_dir}/images.list" ]] || return 0
   while IFS= read -r image; do
     [[ -n "$image" ]] || continue
-    docker image rm "$image" >/dev/null 2>&1 || true
+    dm_quiet docker image rm "$image" || true
   done <"${rollback_dir}/images.list"
 }
 
@@ -88,7 +88,7 @@ compose_capture_rollback_images() {
     fi
     image="docker-migrate-rollback:${id:0:12}-$$"
     if ! run_with_activity "创建 Compose 回滚镜像：$service" \
-      docker commit "$id" "$image" >/dev/null; then
+      dm_quiet docker commit "$id" "$image"; then
       warn " · 目标端容器回滚镜像创建失败：$service"
       compose_rollback_image_cleanup "$rollback_dir"
       return 1
@@ -115,14 +115,14 @@ compose_restore_existing_states() {
     [[ "$restore_running" == "1" ]] || continue
     case "$state" in
       running | restarting)
-        docker start "$id" >/dev/null 2>&1 || rc=1
+        dm_quiet docker start "$id" || rc=1
         ;;
       paused)
-        docker start "$id" >/dev/null 2>&1 || {
+        dm_quiet docker start "$id" || {
           rc=1
           continue
         }
-        docker pause "$id" >/dev/null 2>&1 || rc=1
+        dm_quiet docker pause "$id" || rc=1
         ;;
     esac
   done <"${rollback_dir}/states.tsv"
@@ -152,7 +152,7 @@ compose_restore_rollback() {
       for service in "${pause_services[@]}"; do
         while IFS= read -r id; do
           [[ -n "$id" ]] || continue
-          docker pause "$id" >/dev/null
+          dm_quiet docker pause "$id"
         done < <(compose_run -p "$project" -f config.yml -f images.yml ps -q "$service")
       done
     fi
@@ -212,7 +212,7 @@ compose_wait_services() {
         case "$status" in
           healthy | running) ;;
           unhealthy | exited | dead)
-            warn "Compose 服务健康检查失败：$service（当前 $status）"
+            fail_reason "Compose 服务 ${service} 健康检查没有通过（当前 ${status}）" "执行 docker logs <容器名> 查看服务日志"
             return 1
             ;;
           *)
@@ -231,11 +231,11 @@ compose_wait_services() {
     if ((all_ready == 0)); then
       elapsed=$((SECONDS - started))
       if ((elapsed >= next_report)); then
-        echo "[进度] Compose 服务健康检查：${services[*]} · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒" >&2
+        log_line "[进度] Compose 服务健康检查：${services[*]} · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒"
         next_report=$((elapsed + 5))
       fi
     else
-      echo "[完成] Compose 服务健康检查：${services[*]} · $((SECONDS - started))秒" >&2
+      log_line "[完成] Compose 服务健康检查：${services[*]} · $((SECONDS - started))秒"
       return 0
     fi
     sleep 1
@@ -261,7 +261,7 @@ compose_wait_project_health() {
       case "$health" in
         healthy | none) ;;
         unhealthy)
-          warn "Compose 项目健康检查失败：$project（容器 $id 当前 unhealthy）"
+          fail_reason "Compose 项目 ${project} 的容器 ${id} 健康检查没有通过" "执行 docker logs ${id} 查看服务日志"
           return 1
           ;;
         *)
@@ -280,11 +280,11 @@ compose_wait_project_health() {
     if ((all_ready == 0)); then
       elapsed=$((SECONDS - started))
       if ((elapsed >= next_report)); then
-        echo "[进度] Compose 项目健康检查：$project · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒" >&2
+        log_line "[进度] Compose 项目健康检查：$project · 待就绪 ${pending} 个 · ${first_pending:-未知} · ${elapsed}/${timeout}秒"
         next_report=$((elapsed + 5))
       fi
     else
-      echo "[完成] Compose 项目健康检查：$project · $((SECONDS - started))秒" >&2
+      log_line "[完成] Compose 项目健康检查：$project · $((SECONDS - started))秒"
       return 0
     fi
     sleep 1

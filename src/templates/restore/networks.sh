@@ -37,8 +37,8 @@ compose_cleanup_conflicting_network() {
   # 仅当网络属于当前项目（有 project label 且匹配）时才允许删除
   # 空 proj_label 表示非 compose 网络（手动创建或外部共享），跳过删除
   if [[ -n "$proj_label" && -n "$net_label" && "$proj_label" == "$project" ]]; then
-    if docker network rm "$network_name" >/dev/null 2>&1; then
-      echo " · 已清理旧网络：$network_name"
+    if dm_quiet docker network rm "$network_name"; then
+      log_line "已清理旧网络：$network_name"
     else
       warn " · 无法清理网络：$network_name（可能仍被占用）"
     fi
@@ -198,5 +198,5 @@ create_network_from_record() {
   done < <(jq -c '.ipam.config[]?' <<<"$row")
   create_args+=("$name")
 
-  "${create_args[@]}" >/dev/null
+  dm_quiet "${create_args[@]}"
 }

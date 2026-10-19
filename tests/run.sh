@@ -32,41 +32,59 @@ test_progress_propagates_failure() {
   local tmp rc output
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
+  : >"${tmp}/run.log"
   set +e
-  output="$(progress_docker_save "${tmp}/images.tar" bash -c 'printf partial; exit 7' 2>&1)"
+  output="$(DM_LOG_FILE="${tmp}/run.log" \
+    progress_docker_save "${tmp}/images.tar" 100 bash -c 'printf partial; exit 7' 2>&1)"
   rc=$?
   set -e
   [[ "$rc" -eq 7 ]]
-  [[ "$(grep -Fc '[失败] 保存镜像 images.tar' <<<"$output")" -eq 1 ]]
-  ! grep -Fq '完成' <<<"$output"
+  # 失败只写入日志，由阶段结果统一说明，屏幕上不重复报错。
+  [[ "$(grep -Fc '失败：保存镜像' "${tmp}/run.log")" -eq 1 ]]
+  ! grep -Fq '完成：保存镜像' "${tmp}/run.log"
+  ! grep -Fq '失败' <<<"$output"
 }
 
 test_activity_progress_plain_failure_contract() {
-  local output rc label='测试失败传播'
+  local output rc label='测试失败传播' tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  : >"${tmp}/run.log"
   set +e
-  output="$(DOCKER_MIGRATE_PROGRESS_MODE=plain \
+  output="$(DM_LOG_FILE="${tmp}/run.log" DOCKER_MIGRATE_PROGRESS_MODE=plain \
     run_with_activity "$label" bash -c 'exit 7' 2>&1)"
   rc=$?
   set -e
 
   [[ "$rc" -eq 7 ]]
-  [[ "$(grep -Fc "[失败] ${label}" <<<"$output")" -eq 1 ]]
-  ! grep -Fq '开始' <<<"$output"
-  ! grep -Fq '完成' <<<"$output"
+  [[ -z "$output" ]]
+  [[ "$(grep -Fc "失败：${label}（退出码 7" "${tmp}/run.log")" -eq 1 ]]
+  ! grep -Fq "完成：${label}" "${tmp}/run.log"
 }
 
 test_progress_render_reports_only_real_percentages() {
-  local known unknown clamped
+  local known unknown clamped rated
   known="$(progress_render '已知总量' 50 100 0)"
   grep -Fq '50%' <<<"$known"
+  grep -Fq '50B/100B' <<<"$known"
 
   unknown="$(progress_render '未知总量' 2048 0 0)"
-  grep -Fq '· 2KB ·' <<<"$unknown"
+  grep -Fq '已处理 2KB ·' <<<"$unknown"
   [[ "$unknown" != *%* ]]
 
+  # 总量是估算值时，命令结束前不显示 100%。
   clamped="$(progress_render '超出总量' 150 100 0)"
-  grep -Fq '100%' <<<"$clamped"
+  grep -Fq '99%' <<<"$clamped"
   grep -Fq '100B/100B' <<<"$clamped"
+
+  # 有速度时显示速度与剩余时间，长时间无进展时追加说明。
+  rated="$(progress_render '下载' 1048576 3145728 5 1048576 '' '仍在进行')"
+  grep -Fq '33%' <<<"$rated"
+  grep -Fq '1MB/s' <<<"$rated"
+  grep -Fq '剩余约 2 秒' <<<"$rated"
+  grep -Fq '· 仍在进行' <<<"$rated"
+  [[ "$(human 1536)" == "1.5KB" ]]
+  [[ "$(human 10485760)" == "10MB" ]]
 }
 
 test_tty_progress_redraw_has_no_blank_frame() {
@@ -98,7 +116,7 @@ test_activity_progress_emits_heartbeat() {
   local output label='测试运行心跳'
   output="$(DOCKER_MIGRATE_PROGRESS_INTERVAL=1 \
     run_with_activity "$label" bash -c 'sleep 2' 2>&1)"
-  grep -Eq "^\[进度\] ${label} · [12] 秒$" <<<"$output"
+  grep -Eq "^\[进度\] ${label} [12] 秒$" <<<"$output"
   ! grep -Fq '开始' <<<"$output"
   ! grep -Fq '无需按键' <<<"$output"
   ! grep -Fq '完成' <<<"$output"
@@ -1135,6 +1153,132 @@ test_generated_run_script_respects_shared_network_namespace() {
   grep -Fq 'if [[ "$meta_hc" == "$image_hc" ]]; then' "$script"
 }
 
+test_log_redacts_secrets() {
+  local out
+  out="$(printf '%s\n' \
+    'GET /t/b.tar.gz.enc#sha256=abc&enc=x&secret=0123abcd&iv=ff00&mac=9999' \
+    '$ docker run -e MYSQL_ROOT_PASSWORD=hunter2 --env API_TOKEN=tok img' \
+    'DB_PASSWORD=abc db_password=zz NORMAL=1' | log_redact)"
+  ! grep -Fq hunter2 <<<"$out"
+  ! grep -Fq 0123abcd <<<"$out"
+  ! grep -Fq 'tok ' <<<"$out"
+  grep -Fq 'secret=***' <<<"$out"
+  grep -Fq 'MYSQL_ROOT_PASSWORD=***' <<<"$out"
+  grep -Fq 'DB_PASSWORD=*** db_password=*** NORMAL=1' <<<"$out"
+  grep -Fq 'sha256=abc' <<<"$out"
+}
+
+test_errors_are_explained_in_chinese() {
+  local row
+  row="$(explain_error 'docker: Error response from daemon: Bind for 0.0.0.0:8080 failed: port is already allocated.')"
+  [[ "$row" == *"宿主机端口 8080 已被其他程序占用"* ]]
+  [[ "$row" == *'ss -lntp | grep ":8080 "'* ]]
+  row="$(explain_error 'write /var/lib/docker/tmp: no space left on device')"
+  [[ "$row" == 磁盘空间不足* ]]
+  row="$(explain_error 'curl: (7) Failed to connect to 203.0.113.9 port 8080: Connection refused')"
+  [[ "$row" == 无法连接旧服务器的下载服务* ]]
+  row="$(explain_error 'exec /app: exec format error')"
+  [[ "$row" == *"CPU 架构"* ]]
+  row="$(explain_error 'healthcheck timed out after 60s')"
+  [[ "$row" == *"健康检查"* ]]
+  ! explain_error 'something completely different' >/dev/null
+}
+
+test_log_kept_on_failure_and_removed_on_success() {
+  local tmp kept
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  (
+    unset DM_LOG_FILE
+    DOCKER_MIGRATE_LOG_DIR="${tmp}/logs" log_init unit-ok
+    log_line 'hello secret=abcdef'
+    [[ -f "$DM_LOG_FILE" ]]
+    grep -Fq 'Docker Migrate' "$DM_LOG_FILE"
+    grep -Fq 'secret=***' "$DM_LOG_FILE"
+    log_finish 1
+    [[ ! -e "$DM_LOG_FILE" ]]
+  )
+  [[ ! -d "${tmp}/logs" ]]
+  kept="$(
+    unset DM_LOG_FILE
+    DOCKER_MIGRATE_LOG_DIR="${tmp}/logs" log_init unit-fail
+    fail_reason '测试原因' '测试建议'
+    fail_reason '后续原因' '不应覆盖第一条'
+    # 沿用同一份日志的子进程不是日志的创建者，不能删除它。
+    (DM_LOG_OWNER=other log_finish 1)
+    [[ -f "$DM_LOG_FILE" ]]
+    log_finish 0
+    printf '%s' "$DM_LOG_FILE"
+  )"
+  [[ -f "$kept" ]]
+  [[ "$(DM_REASON_FILE="${kept%.log}.reason" fail_reason_read)" == $'测试原因\t测试建议' ]]
+}
+
+test_stage_lines_and_summary_details() {
+  local tmp output
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  output="$(
+    unset DM_LOG_FILE
+    DOCKER_MIGRATE_LOG_DIR="${tmp}/logs" log_init unit-stage
+    {
+      stage_begin 2 7 "选择容器"
+      warn_user "未找到容器：ghost"
+      stage_end "3 个容器"
+      stage_begin 3 7 "读取配置"
+      error_user "端口冲突" "换一个端口"
+      stage_fail
+      print_stage_timings
+      print_warning_summary
+      DM_SUMMARY_ARMED=1 print_failure_details
+    } 2>&1
+  )"
+  grep -Fq '[2/7] 选择容器' <<<"$output"
+  grep -Eq '\[2/7\] 选择容器 ✓ 3 个容器 · [0-9]+ 秒' <<<"$output"
+  grep -Fq '! 未找到容器：ghost' <<<"$output"
+  grep -Fq '[3/7] 读取配置 ✗' <<<"$output"
+  grep -Fq '阶段耗时：选择容器' <<<"$output"
+  grep -Fq '警告：1 条' <<<"$output"
+  grep -Fq '原因：端口冲突' <<<"$output"
+  grep -Fq '建议：换一个端口' <<<"$output"
+  grep -Fq "日志：${tmp}/logs/unit-stage-" <<<"$output"
+}
+
+test_progress_meter_counts_bytes() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  command -v python3 >/dev/null 2>&1 || return 0
+  head -c 300000 /dev/zero | progress_meter "${tmp}/count" >"${tmp}/out"
+  [[ "$(progress_file_size "${tmp}/out")" -eq 300000 ]]
+  [[ "$(progress_current "count:${tmp}/count")" -eq 300000 ]]
+  printf 'HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n' >"${tmp}/headers"
+  [[ "$(progress_total "header:${tmp}/headers")" -eq 4096 ]]
+  [[ "$(progress_total 123)" -eq 123 ]]
+  # 计数文件为 /dev/null 时只做转发，不能尝试写入 /dev/null.tmp。
+  [[ "$(printf abc | progress_meter /dev/null)" == abc ]]
+}
+
+test_diagnose_collects_redacted_report() {
+  local tmp report
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/logs"
+  printf 'download http://h/t.tar.gz.enc#secret=deadbeef\nMYSQL_PASSWORD=hunter2\n' >"${tmp}/logs/restore-x.log"
+  (
+    cd "$tmp"
+    DOCKER_MIGRATE_LOG_DIR="${tmp}/logs" RESTORE_BASE="${tmp}/restore" \
+      RESTORE_ROLLBACK_BASE="${tmp}/rollback" run_diagnose >/dev/null 2>&1
+  )
+  report="$(ls "${tmp}"/docker_migrate_diagnose-*.txt)"
+  [[ -f "$report" ]]
+  grep -Fq '===== 容器 =====' "$report"
+  grep -Fq 'restore-x.log' "$report"
+  grep -Fq 'secret=***' "$report"
+  ! grep -Fq deadbeef "$report"
+  ! grep -Fq hunter2 "$report"
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
@@ -1178,6 +1322,12 @@ run_test "writable layer detection ignores runtime-only changes" test_writable_l
 run_test "snapshots are created only when needed" test_snapshot_only_when_needed
 run_test "restore orders container namespace dependencies" test_restore_orders_namespace_dependencies
 run_test "run script respects shared network namespaces and image healthchecks" test_generated_run_script_respects_shared_network_namespace
+run_test "logs hide keys and passwords" test_log_redacts_secrets
+run_test "common Docker and network errors are explained" test_errors_are_explained_in_chinese
+run_test "logs are removed on success and kept on failure" test_log_kept_on_failure_and_removed_on_success
+run_test "stage lines and failure summary are clear" test_stage_lines_and_summary_details
+run_test "byte meter and download totals feed the progress bar" test_progress_meter_counts_bytes
+run_test "--diagnose collects a redacted report" test_diagnose_collects_redacted_report
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

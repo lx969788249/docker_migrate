@@ -45,17 +45,32 @@ pm_install() {
     zypper) asudo zypper --non-interactive install -y "$@" ;;
     apk) asudo apk add --no-cache "$@" ;;
     *)
-      RED "[ERR] 不支持的包管理器：$pm，请手动安装：$*"
-      exit 1
+      return 1
       ;;
   esac
 }
 
+# 安装软件包：输出写入日志、屏幕只显示进度。需要输入 sudo 密码时改为
+# 前台运行，保证密码提示可见。
+install_package() {
+  local bin="$1" pkg="$2"
+  if [[ ${EUID:-$(id -u)} -eq 0 ]] || sudo -n true 2>/dev/null; then
+    DM_PROGRESS_HINT="正在通过系统包管理器安装，网络较慢时可能需要几分钟" \
+      run_with_activity "安装 ${bin}" dm_quiet pm_install "$PKGMGR" "$pkg"
+  else
+    stage_hold
+    printf '    需要安装 %s，请按提示输入 sudo 密码：\n' "$bin" >&2
+    pm_install "$PKGMGR" "$pkg"
+  fi
+}
+
 need_bin() {
   local bin="$1" pkg="$2"
-  if ! command -v "$bin" >/dev/null 2>&1; then
-    echo "[INFO] 安装依赖：$bin（可能耗时；如出现 sudo 密码提示，请按提示输入）"
-    pm_install "$PKGMGR" "$pkg"
+  command -v "$bin" >/dev/null 2>&1 && return 0
+  if [[ "${PKGMGR:-none}" == "none" ]] || ! install_package "$bin" "$pkg" ||
+    ! command -v "$bin" >/dev/null 2>&1; then
+    error_user "缺少命令 ${bin}，自动安装失败" "请手动安装 ${pkg} 后重试"
+    exit 1
   fi
 }
 
@@ -63,38 +78,41 @@ try_optional_bin() {
   local bin="$1" pkg="$2"
   command -v "$bin" >/dev/null 2>&1 && return 0
   [[ "${PKGMGR:-none}" != "none" ]] || return 0
-  echo "[INFO] 安装可选依赖：$bin（可能耗时；如出现 sudo 密码提示，请按提示输入）"
-  pm_install "$PKGMGR" "$pkg" || true
+  install_package "$bin" "$pkg" || detail "可选依赖 ${bin} 安装失败，继续运行"
 }
 
 ensure_docker_running() {
+  local info_error
   if ! command -v docker >/dev/null 2>&1; then
-    RED "[ERR] 未检测到 docker，请先安装 Docker 再运行本脚本。"
+    error_user "未检测到 Docker" "请先安装 Docker（https://docs.docker.com/engine/install/）再运行本脚本"
     exit 1
   fi
 
-  if docker info >/dev/null 2>&1; then
+  if info_error="$(docker info 2>&1 >/dev/null)"; then
     return 0
   fi
+  log_line "docker info 失败：${info_error}"
+  if [[ "$info_error" == *"permission denied"* ]]; then
+    error_user "当前用户没有访问 Docker 的权限" "请用 root 运行，或用 sudo 运行脚本"
+    exit 1
+  fi
 
-  YEL "[INFO] 尝试启动 Docker 服务..."
+  detail "Docker 未运行，尝试启动 Docker 服务"
   if command -v systemctl >/dev/null 2>&1; then
-    YEL "[INFO] 正在通过 systemctl 启动 Docker；如出现 sudo 密码提示，请按提示输入。"
-    asudo systemctl enable --now docker || true
+    run_with_activity "启动 Docker 服务" dm_quiet asudo systemctl enable --now docker || true
   fi
   if ! docker info >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
-    YEL "[INFO] 正在通过 service 启动 Docker；如出现 sudo 密码提示，请按提示输入。"
-    asudo service docker start || true
+    run_with_activity "启动 Docker 服务" dm_quiet asudo service docker start || true
   fi
   if ! docker info >/dev/null 2>&1; then
-    YEL "[WARN] 尝试后台直接启动 dockerd ..."
+    detail "尝试后台直接启动 dockerd"
     if command -v dockerd >/dev/null 2>&1; then
       asudo nohup dockerd >/var/log/dockerd.migrate.log 2>&1 &
       sleep 3
     fi
   fi
   if ! docker info >/dev/null 2>&1; then
-    RED "[ERR] Docker 仍未正常启动，请手动检查后重试。"
+    error_user "Docker 服务无法启动" "执行 systemctl status docker 与 journalctl -u docker 查看原因"
     exit 1
   fi
 }
@@ -110,6 +128,7 @@ ensure_free_space() {
   free="$(free_disk_bytes "$dir")"
   [[ "$free" =~ ^[0-9]+$ && "$need" =~ ^[0-9]+$ ]] || return 0
   ((free >= need)) && return 0
-  RED "[ERR] ${label}需要约 $(human "$need") 可用空间，${dir} 所在磁盘只剩 $(human "$free")。"
+  error_user "磁盘空间不足：${label}需要约 $(human "$need")，${dir} 所在磁盘只剩 $(human "$free")" \
+    "执行 df -h 查看并清理磁盘后重试"
   return 1
 }

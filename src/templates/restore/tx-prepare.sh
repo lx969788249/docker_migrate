@@ -97,7 +97,7 @@ transaction_prepare() {
         continue
       fi
       rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
-      echo " · 保存目标端旧 Compose 配置与运行状态：$project"
+      say "保存目标端旧 Compose 配置与运行状态：$project"
       if ! compose_capture_rollback_metadata "$project" "$rollback_dir"; then
         warn " · 无法安全读取 Compose 回滚元数据，目标端尚未停止：$project"
         transaction_discard_prepared
@@ -201,7 +201,7 @@ transaction_prepare() {
   fi
   mapfile -t quiesce_names <"$quiesce_list_file"
   for name in "${quiesce_names[@]}"; do
-    echo " · 准备暂停目标端服务或共享写入者：$name"
+    say "准备暂停目标端服务或共享数据的容器：$name"
   done
   transaction_quiesce_containers "${quiesce_names[@]}" || return 1
 
@@ -210,7 +210,7 @@ transaction_prepare() {
   while IFS=$'\t' read -r project had_old; do
     [[ "$had_old" == "1" ]] || continue
     rollback_dir="${RESTORE_TRANSACTION_DIR}/compose/${project}"
-    echo " · 保存已静默的旧 Compose 容器镜像：$project"
+    say "保存已停止的旧 Compose 容器镜像：$project"
     compose_capture_rollback_images "$rollback_dir" || return 1
   done <"${RESTORE_TRANSACTION_DIR}/compose.tsv"
 }

@@ -1,18 +1,19 @@
 #####################################
 # HTTP 下载服务
 #####################################
+stage_begin 7 7 "启动下载服务"
 if [[ -t 0 ]]; then
-  echo ""
-  read -rp "HTTP 下载端口 [回车=${PORT}]： " IN_PORT || true
+  stage_hold
+  read -rp "下载服务端口 [回车=${PORT}]： " IN_PORT || true
   if [[ -n "${IN_PORT:-}" ]]; then
     if [[ "$IN_PORT" =~ ^[0-9]+$ ]] && ((IN_PORT >= 1 && IN_PORT <= 65535)); then
       NEW_PORT="$(pick_free_port "$IN_PORT")"
       if [[ "$NEW_PORT" != "$IN_PORT" ]]; then
-        YEL "[WARN] 端口 ${IN_PORT} 已占用，改用临近可用端口：${NEW_PORT}"
+        warn_user "端口 ${IN_PORT} 已被占用，改用 ${NEW_PORT}"
       fi
       PORT="$NEW_PORT"
     else
-      YEL "[WARN] 输入端口无效，继续使用默认端口：${PORT}"
+      warn_user "输入的端口无效，继续使用 ${PORT}"
     fi
   fi
 fi
@@ -25,6 +26,7 @@ SHPID=""
 
 HTTP_LOG="${BUNDLE_ROOT}/http_server_${RID}.log"
 : >"$HTTP_LOG"
+log_line "下载服务日志：${HTTP_LOG}"
 cd "${BUNDLE_ROOT}" || exit 1
 
 # start_http_server: multi-fallback — python3 > busybox httpd > netcat
@@ -147,7 +149,7 @@ NCEOF
   FINAL_URL="${BASE_URL}/${TRANSFER_NAME}${TRANSFER_FRAGMENT}"
 
 else
-  RED "[ERR] 未找到可用的 HTTP 服务方式（python3 / busybox httpd / nc），请手动安装其一后重试。"
+  error_user "找不到可用的下载服务程序（python3、busybox httpd 或 nc）" "安装 python3 后重试"
   exit 1
 fi
 HTTP_WAS_STARTED=1
@@ -157,11 +159,12 @@ sleep 1
 
 if ! kill -0 "$SHPID" 2>/dev/null; then
   HTTP_EXIT_UNEXPECTED=1
-  RED "[ERR] HTTP 服务启动失败，请检查端口 ${PORT} 或防火墙设置。"
+  error_user "下载服务启动失败（端口 ${PORT}）" "换一个端口重试，或查看下方的下载服务日志"
   print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 fi
 SOURCE_TRANSFER_PUBLISHED=1
+stage_end "端口 ${PORT}"
 
 if [[ -t 0 ]]; then
   print_transfer_instructions "$FINAL_URL" interactive
@@ -174,7 +177,7 @@ if [[ -t 0 ]]; then
   wait "$SHPID" || http_wait_rc=$?
   HTTP_EXIT_UNEXPECTED=1
   SHPID=""
-  RED "[ERR] HTTP 服务在用户确认退出前意外停止（rc=${http_wait_rc}）。"
+  error_user "下载服务意外停止（退出码 ${http_wait_rc}）" "查看下方的下载服务日志，然后重新运行备份"
   print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 else
@@ -183,7 +186,7 @@ else
   wait "$SHPID" || http_wait_rc=$?
   HTTP_EXIT_UNEXPECTED=1
   SHPID=""
-  RED "[ERR] HTTP 服务在收到停止指令前意外退出（rc=${http_wait_rc}）。"
+  error_user "下载服务意外停止（退出码 ${http_wait_rc}）" "查看下方的下载服务日志，然后重新运行备份"
   print_http_diagnostics_once "$HTTP_LOG"
   graceful_exit 1
 fi

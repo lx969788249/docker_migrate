@@ -6,12 +6,12 @@ transaction_restore_container_state() {
   local name="$1" state="$2"
   case "$state" in
     running | restarting)
-      run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
+      run_with_activity "启动目标端旧容器：$name" dm_quiet docker start "$name" || return 1
       [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]]
       ;;
     paused)
-      run_with_activity "启动目标端旧容器：$name" docker start "$name" >/dev/null || return 1
-      docker pause "$name" >/dev/null 2>&1
+      run_with_activity "启动目标端旧容器：$name" dm_quiet docker start "$name" || return 1
+      dm_quiet docker pause "$name"
       ;;
   esac
 }
@@ -24,7 +24,7 @@ transaction_quiesce_containers() {
   for name in "$@"; do
     transaction_container_exists "$name" || return 1
     state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
-    [[ "$state" != "paused" ]] || docker unpause "$name" >/dev/null 2>&1 || return 1
+    [[ "$state" != "paused" ]] || dm_quiet docker unpause "$name" || return 1
     case "$state" in
       running | restarting | paused) stop_names+=("$name") ;;
     esac
@@ -32,7 +32,7 @@ transaction_quiesce_containers() {
   ((${#stop_names[@]} > 0)) || return 0
 
   run_with_activity "批量停止目标端容器（${#stop_names[@]} 个）" \
-    docker stop "${stop_names[@]}" >/dev/null || stop_rc=$?
+    dm_quiet docker stop "${stop_names[@]}" || stop_rc=$?
   for name in "${stop_names[@]}"; do
     if ! running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" ||
       [[ "$running" != "false" ]]; then
