@@ -17,6 +17,7 @@
 - Docker command errors that were previously discarded are now recorded.
 - Failures end with the failing step, a plain-language cause, a suggested fix, the log path and the last log lines; common Docker, network and disk errors are recognized.
 - Add `--verbose` to show step details on screen and `--diagnose` to collect a redacted report for issues.
+- Fix error output disappearing after the restore lock was released, which hid the final step result and any later error messages.
 
 ## 2.3.0
 

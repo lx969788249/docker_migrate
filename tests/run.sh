@@ -1279,6 +1279,28 @@ test_diagnose_collects_redacted_report() {
   ! grep -Fq hunter2 "$report"
 }
 
+test_releasing_restore_lock_keeps_stderr() {
+  local tmp output
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bundle"
+  write_bundle_restore_script "${tmp}/bundle/restore.sh"
+  # 释放锁时关闭 fd 201 的 exec 曾把整个脚本之后的错误输出永久重定向到
+  # /dev/null，导致最后一个阶段结果和后续报错都不显示。
+  output="$(
+    (
+      # shellcheck disable=SC1090
+      source <(sed -n '/^transaction_acquire_lock() {/,/^}/p; /^transaction_release_lock() {/,/^}/p' \
+        "${tmp}/bundle/restore.sh")
+      warn() { :; }
+      transaction_acquire_lock "$tmp"
+      transaction_release_lock
+      echo still-visible >&2
+    ) 2>&1
+  )"
+  [[ "$output" == *still-visible* ]]
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
@@ -1328,6 +1350,7 @@ run_test "logs are removed on success and kept on failure" test_log_kept_on_fail
 run_test "stage lines and failure summary are clear" test_stage_lines_and_summary_details
 run_test "byte meter and download totals feed the progress bar" test_progress_meter_counts_bytes
 run_test "--diagnose collects a redacted report" test_diagnose_collects_redacted_report
+run_test "releasing the restore lock keeps error output visible" test_releasing_restore_lock_keeps_stderr
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

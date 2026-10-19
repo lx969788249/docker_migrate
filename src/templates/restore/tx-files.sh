@@ -48,7 +48,7 @@ transaction_release_lock() {
   case "${RESTORE_LOCK_METHOD:-}" in
     flock)
       flock -u 201 2>/dev/null || true
-      exec 201>&- 2>/dev/null || true
+      { exec 201>&-; } 2>/dev/null || true
       ;;
     mkdir)
       rm -f "${RESTORE_LOCK_DIR}/owner" 2>/dev/null || true
