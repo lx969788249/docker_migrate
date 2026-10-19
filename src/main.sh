@@ -36,7 +36,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.5.1"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()

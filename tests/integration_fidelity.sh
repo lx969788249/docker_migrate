@@ -59,6 +59,10 @@ cleanup() {
     wait "$backup_pid" 2>/dev/null || true
   fi
   docker rm -f "${all_names[@]}" "${suffix}_port_blocker" >/dev/null 2>&1 || true
+  docker ps -aq --filter "label=com.docker.compose.project=${suffix}_proj" | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker ps -aq --filter label=com.docker.compose.project=compose-dir | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker volume ls -q --filter "label=com.docker.compose.project=${suffix}_proj" | xargs -r docker volume rm >/dev/null 2>&1 || true
+  docker network ls -q --filter "label=com.docker.compose.project=${suffix}_proj" | xargs -r docker network rm >/dev/null 2>&1 || true
   docker network rm "$net_a" "$net_b" >/dev/null 2>&1 || true
   docker volume rm "$volume_name" >/dev/null 2>&1 || true
   docker image rm "$health_image" >/dev/null 2>&1 || true
@@ -176,9 +180,29 @@ done
 provider_id_before="$(docker inspect -f '{{.Id}}' "$provider_name")"
 [[ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$sidecar_name")" == "container:${provider_id_before}" ]]
 
+# Compose 项目：用 -p 指定与目录名不同的项目名（很多用户和面板都这样做）。
+# 恢复时必须沿用原项目名，不能按目录名建出另一个项目。
+compose_dir="${tmp}/compose-dir"
+compose_proj="${suffix}_proj"
+mkdir -p "$compose_dir"
+cat >"${compose_dir}/compose.yml" <<'YML'
+services:
+  app:
+    image: alpine:3.20
+    command: sleep 600
+    volumes: ["appdata:/data"]
+  side:
+    image: alpine:3.20
+    command: sleep 600
+volumes:
+  appdata: {}
+YML
+docker compose -p "$compose_proj" --project-directory "$compose_dir" \
+  -f "${compose_dir}/compose.yml" up -d >/dev/null 2>&1
+docker exec "${compose_proj}-app-1" sh -c 'echo compose-data >/data/app.txt'
 include_list="$(
   IFS=,
-  echo "${all_names[*]}"
+  echo "${all_names[*]},${compose_proj}-app-1,${compose_proj}-side-1"
 )"
 (
   cd "$tmp"
@@ -217,6 +241,9 @@ grep -Fq "沿用原镜像" "$backup_log"
 
 # 模拟全新的目标服务器：删除容器、网络、卷、镜像与宿主机目录。
 docker rm -f "${all_names[@]}" >/dev/null
+docker compose -p "$compose_proj" --project-directory "$compose_dir" \
+  -f "${compose_dir}/compose.yml" down -v >/dev/null 2>&1
+rm -rf "$compose_dir"
 docker network rm "$net_a" "$net_b" >/dev/null
 docker volume rm "$volume_name" >/dev/null
 docker image rm "$health_image" >/dev/null
@@ -244,7 +271,7 @@ check_log="${tmp}/check.log"
 RESTORE_IGNORE_CONTAINERS="$ignore_container" RESTORE_BASE="${tmp}/restore-check" \
   bash "$ROOT_DIR/docker_migrate_perfect.sh" --check="$download_url" </dev/null >"$check_log" 2>&1
 grep -Fq '预检通过，没有下载或修改任何内容' "$check_log"
-grep -Eq '\[2/9\] 迁移前预检 ✓ 8 个容器' "$check_log"
+grep -Eq '\[2/9\] 迁移前预检 ✓ 10 个容器' "$check_log"
 [[ ! -d "${tmp}/restore-check" ]] || [[ -z "$(ls -A "${tmp}/restore-check")" ]]
 
 if ! RESTORE_IGNORE_CONTAINERS="$ignore_container" RESTORE_BASE="${tmp}/restore" \
@@ -296,6 +323,16 @@ check_data volume "$(docker exec "$full_name" cat /data/data.txt 2>&1)" volume-d
 check_data bind-ro "$(docker exec "$full_name" cat /cfg/config.txt 2>&1)" ro-data
 check_data bind-rw "$(docker exec "$full_name" cat /rw/state.txt 2>&1)" rw-data
 check_data symlink "$(docker exec "$symlink_name" cat /data/data.txt 2>&1)" symlink-data
+check_data compose-volume "$(docker exec "${compose_proj}-app-1" cat /data/app.txt 2>&1)" compose-data
+for service in app side; do
+  check_data "compose ${service} project" \
+    "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "${compose_proj}-${service}-1" 2>&1)" \
+    "$compose_proj"
+done
+if [[ -n "$(docker ps -aq --filter label=com.docker.compose.project=compose-dir)" ]]; then
+  echo "restore created a second Compose project named after the directory" >&2
+  failures=$((failures + 1))
+fi
 [[ -L "$symlink_path" ]] || {
   echo "symlinked bind path was not recreated as a symlink" >&2
   failures=$((failures + 1))

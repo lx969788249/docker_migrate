@@ -321,6 +321,9 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
         fi
       done < <(jq -r '.config_files[]?' <<<"$row")
     fi
+    # 项目名必须显式指定：源端常用 -p、COMPOSE_PROJECT_NAME 或面板自定义项目名，
+    # 与所在目录名不同；不指定时 Compose 会按目录名建出另一个项目。
+    COMPOSE_FILE_ARGS=(-p "$name" "${COMPOSE_FILE_ARGS[@]+"${COMPOSE_FILE_ARGS[@]}"}")
 
     if [[ "$USE_WDIR" == "1" ]]; then
       compose_dir="$wdir"

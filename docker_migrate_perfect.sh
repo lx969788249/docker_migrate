@@ -36,7 +36,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.5.1"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -6387,7 +6387,7 @@ compose_restore_rollback() {
   [[ -s "${rollback_dir}/config.yml" && -s "${rollback_dir}/images.yml" ]] || return 1
   (
     cd "$rollback_dir"
-    compose_run -p "$project" -f config.yml -f images.yml up --no-start
+    compose_run -p "$project" -f config.yml -f images.yml up --no-start >>"${DM_LOG_FILE:-/dev/null}" 2>&1
     while IFS=$'\t' read -r service state _recorded_id; do
       case "$state" in
         running | restarting) start_services+=("$service") ;;
@@ -6399,12 +6399,13 @@ compose_restore_rollback() {
     done <states.tsv
     if [[ "$restore_running" == "1" ]]; then
       ((${#start_services[@]} == 0)) ||
-        compose_run -p "$project" -f config.yml -f images.yml start "${start_services[@]}"
+        compose_run -p "$project" -f config.yml -f images.yml start "${start_services[@]}" \
+          >>"${DM_LOG_FILE:-/dev/null}" 2>&1
       for service in "${pause_services[@]}"; do
         while IFS= read -r id; do
           [[ -n "$id" ]] || continue
           dm_quiet docker pause "$id"
-        done < <(compose_run -p "$project" -f config.yml -f images.yml ps -q "$service")
+        done < <(compose_run -p "$project" -f config.yml -f images.yml ps -q "$service" 2>>"${DM_LOG_FILE:-/dev/null}")
       done
     fi
   )
@@ -6472,7 +6473,7 @@ compose_wait_services() {
             [[ -n "$first_pending" ]] || first_pending="$service（${status:-未知}）"
             ;;
         esac
-      done < <(compose_run "${compose_args[@]}" ps -q "$service")
+      done < <(compose_run "${compose_args[@]}" ps -q "$service" 2>>"${DM_LOG_FILE:-/dev/null}")
       if ((service_found == 0)); then
         all_ready=0
         pending=$((pending + 1))
@@ -8390,6 +8391,9 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
         fi
       done < <(jq -r '.config_files[]?' <<<"$row")
     fi
+    # 项目名必须显式指定：源端常用 -p、COMPOSE_PROJECT_NAME 或面板自定义项目名，
+    # 与所在目录名不同；不指定时 Compose 会按目录名建出另一个项目。
+    COMPOSE_FILE_ARGS=(-p "$name" "${COMPOSE_FILE_ARGS[@]+"${COMPOSE_FILE_ARGS[@]}"}")
 
     if [[ "$USE_WDIR" == "1" ]]; then
       compose_dir="$wdir"
@@ -9752,8 +9756,8 @@ metadata_total=${#IDS[@]}
 metadata_index=0
 for id in "${IDS[@]}"; do
   metadata_index=$((metadata_index + 1))
-  progress_count "分析容器" "$metadata_index" "$metadata_total" "$id"
   jtmp="$(docker inspect "$id")"
+  progress_count "分析容器" "$metadata_index" "$metadata_total" "$(jq -r '.[0].Name | ltrimstr("/")' <<<"$jtmp")"
   SELECTED_INSPECT_JSON["$id"]="$jtmp"
   projtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$jtmp")
   wdirtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$jtmp")
@@ -9905,11 +9909,11 @@ if ((${#COMPOSE_GROUP[@]})); then
       detail "解析 Compose 配置：$proj"
       compose_log="${DM_LOG_FILE:-/dev/null}"
       if docker compose version >/dev/null 2>&1 &&
-        { docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>>"$compose_log" ||
-          docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>>"$compose_log"; }; then
+        { docker compose -p "$proj" --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>>"$compose_log" ||
+          docker compose -p "$proj" --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>>"$compose_log"; }; then
         mv "$resolved_tmp" "${dest}/_resolved_config.yml"
       elif command -v docker-compose >/dev/null 2>&1 &&
-        (cd "$wdir" && docker-compose "${CFG_SOURCE_ARGS[@]}" config) >"$resolved_tmp" 2>>"$compose_log"; then
+        (cd "$wdir" && docker-compose -p "$proj" "${CFG_SOURCE_ARGS[@]}" config) >"$resolved_tmp" 2>>"$compose_log"; then
         mv "$resolved_tmp" "${dest}/_resolved_config.yml"
       else
         rm -f "$resolved_tmp"

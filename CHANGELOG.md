@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.5.1
+
+### Fixes found in a real two-server migration
+
+- Restore Compose projects under their original project name. Projects started with `-p`, `COMPOSE_PROJECT_NAME` or a panel-chosen name used to be recreated under the directory name, so the restore waited for containers that never appeared, rolled back, and left the wrongly named containers behind.
+- Generate the resolved Compose configuration with the original project name on the source as well.
+- Keep Compose warnings (such as the obsolete `version` attribute) in the log instead of breaking the progress line.
+- Show container names instead of IDs while analysing the selected containers.
+
 ## 2.5.0
 
 ### Pre-flight check

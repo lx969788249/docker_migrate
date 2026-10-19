@@ -17,8 +17,8 @@ metadata_total=${#IDS[@]}
 metadata_index=0
 for id in "${IDS[@]}"; do
   metadata_index=$((metadata_index + 1))
-  progress_count "分析容器" "$metadata_index" "$metadata_total" "$id"
   jtmp="$(docker inspect "$id")"
+  progress_count "分析容器" "$metadata_index" "$metadata_total" "$(jq -r '.[0].Name | ltrimstr("/")' <<<"$jtmp")"
   SELECTED_INSPECT_JSON["$id"]="$jtmp"
   projtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' <<<"$jtmp")
   wdirtmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project.working_dir"] // empty' <<<"$jtmp")
@@ -170,11 +170,11 @@ if ((${#COMPOSE_GROUP[@]})); then
       detail "解析 Compose 配置：$proj"
       compose_log="${DM_LOG_FILE:-/dev/null}"
       if docker compose version >/dev/null 2>&1 &&
-        { docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>>"$compose_log" ||
-          docker compose --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>>"$compose_log"; }; then
+        { docker compose -p "$proj" --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config --no-path-resolution >"$resolved_tmp" 2>>"$compose_log" ||
+          docker compose -p "$proj" --project-directory "$wdir" "${CFG_SOURCE_ARGS[@]}" config >"$resolved_tmp" 2>>"$compose_log"; }; then
         mv "$resolved_tmp" "${dest}/_resolved_config.yml"
       elif command -v docker-compose >/dev/null 2>&1 &&
-        (cd "$wdir" && docker-compose "${CFG_SOURCE_ARGS[@]}" config) >"$resolved_tmp" 2>>"$compose_log"; then
+        (cd "$wdir" && docker-compose -p "$proj" "${CFG_SOURCE_ARGS[@]}" config) >"$resolved_tmp" 2>>"$compose_log"; then
         mv "$resolved_tmp" "${dest}/_resolved_config.yml"
       else
         rm -f "$resolved_tmp"

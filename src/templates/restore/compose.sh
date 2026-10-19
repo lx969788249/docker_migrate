@@ -136,7 +136,7 @@ compose_restore_rollback() {
   [[ -s "${rollback_dir}/config.yml" && -s "${rollback_dir}/images.yml" ]] || return 1
   (
     cd "$rollback_dir"
-    compose_run -p "$project" -f config.yml -f images.yml up --no-start
+    compose_run -p "$project" -f config.yml -f images.yml up --no-start >>"${DM_LOG_FILE:-/dev/null}" 2>&1
     while IFS=$'\t' read -r service state _recorded_id; do
       case "$state" in
         running | restarting) start_services+=("$service") ;;
@@ -148,12 +148,13 @@ compose_restore_rollback() {
     done <states.tsv
     if [[ "$restore_running" == "1" ]]; then
       ((${#start_services[@]} == 0)) ||
-        compose_run -p "$project" -f config.yml -f images.yml start "${start_services[@]}"
+        compose_run -p "$project" -f config.yml -f images.yml start "${start_services[@]}" \
+          >>"${DM_LOG_FILE:-/dev/null}" 2>&1
       for service in "${pause_services[@]}"; do
         while IFS= read -r id; do
           [[ -n "$id" ]] || continue
           dm_quiet docker pause "$id"
-        done < <(compose_run -p "$project" -f config.yml -f images.yml ps -q "$service")
+        done < <(compose_run -p "$project" -f config.yml -f images.yml ps -q "$service" 2>>"${DM_LOG_FILE:-/dev/null}")
       done
     fi
   )
@@ -221,7 +222,7 @@ compose_wait_services() {
             [[ -n "$first_pending" ]] || first_pending="$service（${status:-未知}）"
             ;;
         esac
-      done < <(compose_run "${compose_args[@]}" ps -q "$service")
+      done < <(compose_run "${compose_args[@]}" ps -q "$service" 2>>"${DM_LOG_FILE:-/dev/null}")
       if ((service_found == 0)); then
         all_ready=0
         pending=$((pending + 1))
