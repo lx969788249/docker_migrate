@@ -22,9 +22,6 @@ services:
       - --spring.r2dbc.password=halo-db-secret
       - --spring.sql.init.platform=postgresql
       - --halo.external-url=http://localhost:8090/
-      - --halo.security.initializer.superadminusername=dmadmin
-      - --halo.security.initializer.superadminpassword=Dm-Test-Pass-123
-      - --halo.security.basic-auth.disabled=false
   halodb:
     image: postgres:15-alpine
     restart: on-failure:3

@@ -10,6 +10,11 @@
 
 - Keep the image's own entrypoint and command when the container did not change them. Images whose entrypoint has several parts (for example Uptime Kuma's `dumb-init -- extra/entrypoint.sh`) used to come back with part of the entrypoint moved into the command, which also pinned the command across image updates. Found by the new application tests.
 
+- Back up Compose projects started with several `-f` files. Compose joins the file names with commas, but the backup split them on colons, so it could not find the files and refused to continue after stopping the containers.
+- Check for configuration problems before stopping any container, and give each problem its own hint instead of always talking about replicas.
+- Wait long enough for health checks that run rarely. Vaultwarden checks its health once a minute, so the fixed 60-second wait ran out before the first result and the restore rolled back. The wait now covers each container's own start period, interval and timeout.
+- Keep the data in anonymous volumes (volumes without a name, such as the `/data` volume an image declares) for Compose services. Compose created a new empty volume on the new server, so this data was lost; it is now copied into the new volume.
+
 ### Tests
 
 - Add `tests/apps/`: each run starts two independent simulated servers (Docker-in-Docker) and migrates a real application from one to the other: WordPress, Nextcloud, Gitea, Vaultwarden, Uptime Kuma, Halo, Memos, plus an unusual Compose setup (three `-f` files, a locally built image, profiles, an external network with a fixed range, and a standalone container). Each test writes data in the app on the old server, checks it on the new one, compares container settings on both servers, and checks that the old server is back to its original state.

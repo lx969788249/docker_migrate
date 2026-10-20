@@ -1472,13 +1472,36 @@ test_probe_source_explains_unreachable_server() {
 
   # 旧版本没有迁移计划时返回 404，也说明旧服务器是通的。
   open_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-  python3 -m http.server "$open_port" --bind 127.0.0.1 --directory "$tmp" >/dev/null 2>&1 &
+  (cd "$tmp" && exec python3 -m http.server "$open_port" --bind 127.0.0.1) >/dev/null 2>&1 &
   server_pid=$!
   for _ in $(seq 1 50); do
     curl -s -o /dev/null "http://127.0.0.1:${open_port}/" && break
     sleep 0.1
   done
   DM_LOG_FILE="${tmp}/run.log" restore_probe_source "http://127.0.0.1:${open_port}/token/missing.plan"
+}
+
+test_compose_config_files_split() {
+  local -a files=()
+  mapfile -t files < <(compose_config_files_split "/a/compose.yml,/a/compose.override.yml,/a/extra.yml")
+  [[ "${#files[@]}" -eq 3 && "${files[1]}" == "/a/compose.override.yml" ]]
+  mapfile -t files < <(compose_config_files_split "a.yml:b.yml")
+  [[ "${#files[@]}" -eq 2 && "${files[1]}" == "b.yml" ]]
+  mapfile -t files < <(compose_config_files_split "/srv/app/docker-compose.yml")
+  [[ "${#files[@]}" -eq 1 ]]
+  [[ -z "$(compose_config_files_split "")" ]]
+}
+
+test_health_wait_covers_the_first_check() {
+  docker() {
+    # 一个每 60 秒检查一次、超时 10 秒的容器（Vaultwarden 镜像的设置），一个没有健康检查。
+    printf '%s' '[{"Config":{"Healthcheck":{"Test":["CMD","/healthcheck.sh"],"Interval":60000000000,"Timeout":10000000000}}},{"Config":{}}]'
+  }
+  [[ "$(health_wait_seconds 60 a b)" == "100" ]]
+  [[ "$(health_wait_seconds 300 a b)" == "300" ]]
+  [[ "$(health_wait_seconds 60)" == "60" ]]
+  docker() { printf '%s' '[{"Config":{"Healthcheck":{"Test":["NONE"]}}}]'; }
+  [[ "$(health_wait_seconds 60 a)" == "60" ]]
 }
 
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
@@ -1536,6 +1559,8 @@ run_test "pre-flight check classifies problems by impact" test_preflight_classif
 run_test "pre-flight without a terminal stops or auto-resolves safely" test_preflight_run_without_terminal
 run_test "restore follows the pre-flight decisions" test_restore_follows_decisions
 run_test "unreachable old server is explained before downloading" test_probe_source_explains_unreachable_server
+run_test "Compose config file labels split on commas" test_compose_config_files_split
+run_test "health-check wait covers the first check of slow images" test_health_wait_covers_the_first_check
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

@@ -38,3 +38,35 @@ restore_container_networks() {
     dm_quiet docker network connect "${connect_args[@]}" "$network" "$container" || return 1
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
+
+# Compose 在 com.docker.compose.project.config_files 标签里用逗号连接多个配置
+# 文件（-f a.yml -f b.yml）。没有逗号时兼容按冒号分隔的旧写法（COMPOSE_FILE）。
+compose_config_files_split() {
+  local raw="$1" sep=","
+  [[ -n "$raw" ]] || return 0
+  [[ "$raw" == *,* ]] || sep=":"
+  local -a parts=()
+  IFS="$sep" read -r -a parts <<<"$raw"
+  printf '%s\n' "${parts[@]}" | awk 'NF'
+}
+
+# 等待健康检查的最长时间：至少是 RESTORE_HEALTH_TIMEOUT（默认 60 秒），并且要
+# 够容器自己的健康检查跑完第一次。有的镜像每 60 秒才检查一次（如 Vaultwarden），
+# 固定等 60 秒会在第一次检查出结果之前就判定超时。
+health_wait_seconds() {
+  local base="${1:-60}" needed
+  shift
+  (($# > 0)) || {
+    printf '%s\n' "$base"
+    return 0
+  }
+  needed="$(docker inspect "$@" 2>/dev/null | jq '[.[] | .Config.Healthcheck // empty |
+    select((.Test[0] // "") != "NONE") |
+    ((.StartPeriod // 0) + (if (.Interval // 0) > 0 then .Interval else 30000000000 end) +
+      (if (.Timeout // 0) > 0 then .Timeout else 30000000000 end)) / 1000000000 + 30 | floor] |
+    max // 0' 2>/dev/null || echo 0)"
+  [[ "$needed" =~ ^[0-9]+$ ]] || needed=0
+  ((needed > base)) || needed="$base"
+  ((needed <= 3600)) || needed=3600
+  printf '%s\n' "$needed"
+}

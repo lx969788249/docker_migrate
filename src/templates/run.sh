@@ -611,6 +611,7 @@ if [[ "$original_running" == "true" &&
     error_user "RESTORE_HEALTH_TIMEOUT 的值无效：$health_timeout" "请设置为 1 到 3600 之间的秒数"
     exit 1
   fi
+  health_timeout="$(health_wait_seconds "$health_timeout" "$name")"
   health_deadline=$((SECONDS + health_timeout))
   health_started=$SECONDS
   health_next_report=0

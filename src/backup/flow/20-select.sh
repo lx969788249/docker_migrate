@@ -87,7 +87,7 @@ else
     if [[ -z "$wdir" && -n "$proj" ]]; then
       cfgs_raw=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$j")
       if [[ -n "$cfgs_raw" ]]; then
-        IFS=':' read -r -a cfgs_arr <<<"$cfgs_raw"
+        mapfile -t cfgs_arr < <(compose_config_files_split "$cfgs_raw")
         for cfg in "${cfgs_arr[@]}"; do
           cfg="${cfg#./}"
           if [[ -n "$cfg" ]]; then

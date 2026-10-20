@@ -26,7 +26,7 @@ for id in "${IDS[@]}"; do
   if [[ -z "$wdirtmp" && -n "$projtmp" ]]; then
     cfgstmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$jtmp")
     if [[ -n "$cfgstmp" ]]; then
-      IFS=':' read -r -a cfgs_tmp <<<"$cfgstmp"
+      mapfile -t cfgs_tmp < <(compose_config_files_split "$cfgstmp")
       for ct in "${cfgs_tmp[@]}"; do
         ct="${ct#./}"
         if [[ -n "$ct" ]]; then
@@ -58,7 +58,7 @@ for id in "${IDS[@]}"; do
   # 兼容 v1：缺少 working_dir 时从 config_files 推断
   if [[ -z "$wdir" && -n "$proj" ]]; then
     if [[ -n "$cfgs" ]]; then
-      IFS=':' read -r -a cfgs_arr <<<"$cfgs"
+      mapfile -t cfgs_arr < <(compose_config_files_split "$cfgs")
       for cg in "${cfgs_arr[@]}"; do
         cg="${cg#./}"
         if [[ -n "$cg" ]]; then
@@ -137,7 +137,7 @@ if ((${#COMPOSE_GROUP[@]})); then
     declare -a CFG_SOURCE_ARGS=()
 
     if [[ -n "$cfgs" ]]; then
-      IFS=':' read -r -a CFG_ARR <<<"$cfgs"
+      mapfile -t CFG_ARR < <(compose_config_files_split "$cfgs")
       for cfg in "${CFG_ARR[@]}"; do
         cfg="${cfg#./}"
         [[ -z "$cfg" ]] && continue

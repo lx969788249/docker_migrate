@@ -292,3 +292,26 @@ compose_wait_project_health() {
   done
   return 1
 }
+
+# 匿名卷（没写名字、只有一串随机编号的卷）在新服务器上按原编号恢复了数据，但
+# Compose 不认识它，会给新容器另建一个空的匿名卷。把数据搬进新卷，再删掉按原
+# 编号恢复的卷；否则这些数据（例如镜像声明的数据库目录）在新服务器上就丢了。
+compose_transplant_anonymous_volumes() {
+  local project="$1" meta cname src dest dst
+  for meta in "${BUNDLE_DIR}"/meta/*.inspect.json; do
+    [[ -f "$meta" ]] || continue
+    [[ "$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' "$meta")" == "$project" ]] || continue
+    cname="$(jq -r '.[0].Name | ltrimstr("/")' "$meta")"
+    while IFS=$'\t' read -r src dest; do
+      [[ "$src" =~ ^[0-9a-f]{64}$ ]] || continue
+      docker volume inspect "$src" >/dev/null 2>&1 || continue
+      dst="$(docker inspect "$cname" 2>/dev/null | jq -r --arg d "$dest" \
+        '.[0].Mounts[]? | select(.Type == "volume" and .Destination == $d) | .Name' | head -n1)"
+      [[ -n "$dst" && "$dst" != "$src" ]] || continue
+      log_line "匿名卷：${cname} 的 ${dest} 沿用迁移过来的数据"
+      dm_quiet docker run --rm --network none -v "${src}:/from:ro" -v "${dst}:/to" alpine:3.20 \
+        sh -eu -c 'find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; cp -a /from/. /to/' || return 1
+      dm_quiet docker volume rm "$src" || true
+    done < <(jq -r '.[0].Mounts[]? | select(.Type == "volume") | [.Name, .Destination] | @tsv' "$meta")
+  done
+}

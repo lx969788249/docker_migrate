@@ -1,4 +1,6 @@
 wait_http http://localhost:8090/actuator/health/readiness
-expect_contains "数据库里的标签" \
-  "$(curl -fsS -u dmadmin:Dm-Test-Pass-123 http://localhost:8090/apis/content.halo.run/v1alpha1/tags/dm-tag)" \
-  "halo-migrated"
+for _ in $(seq 1 60); do
+  curl -fsS http://localhost:8090/ 2>/dev/null | grep -q 'Halo Migrated Site' && break
+  sleep 3
+done
+expect_contains "首页显示数据库里的站点标题" "$(curl -fsS http://localhost:8090/)" "Halo Migrated Site"

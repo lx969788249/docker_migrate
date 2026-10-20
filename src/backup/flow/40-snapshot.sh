@@ -1,3 +1,20 @@
+# 读取配置时发现的问题在停机之前就报告，避免为一个配置错误让旧服务器白白停机。
+for service_key in "${!COMPOSE_SERVICE_COUNT[@]}"; do
+  if ((${COMPOSE_SERVICE_COUNT[$service_key]} > 1)); then
+    BACKUP_FAILURES+=("Compose 服务存在多个副本，无法逐容器保留可写层：${service_key##*|}")
+  fi
+done
+if ((${#BACKUP_FAILURES[@]} > 0)); then
+  case "${BACKUP_FAILURES[0]}" in
+    "Compose 服务存在多个副本"*) failure_hint="请只迁移单副本的 Compose 服务，或先把副本数缩减为 1" ;;
+    "Compose 配置文件缺失"*) failure_hint="确认 Compose 项目的配置文件还在启动时的位置；移动过目录的话，请在新位置重新执行 docker compose up -d 后再备份" ;;
+    *"依附的容器"*) failure_hint="先启动它依附的容器，或把两个容器一起迁移" ;;
+    *) failure_hint="运行 --diagnose 生成诊断包并反馈问题" ;;
+  esac
+  error_user "${BACKUP_FAILURES[0]}" "$failure_hint"
+  exit 1
+fi
+
 #####################################
 # 预拉取卷操作镜像，避免把下载时间计入后面的停机快照窗口
 #####################################
@@ -113,15 +130,6 @@ fi
 # 捕获容器 writable layer
 #####################################
 detail "检查容器可写层"
-for service_key in "${!COMPOSE_SERVICE_COUNT[@]}"; do
-  if ((${COMPOSE_SERVICE_COUNT[$service_key]} > 1)); then
-    BACKUP_FAILURES+=("Compose 服务存在多个副本，无法逐容器保留可写层：${service_key##*|}")
-  fi
-done
-if ((${#BACKUP_FAILURES[@]} > 0)); then
-  error_user "${BACKUP_FAILURES[0]}" "请只迁移单副本的 Compose 服务，或先把副本数缩减为 1"
-  exit 1
-fi
 
 # 后续只需保存临时快照镜像；其父镜像层会由 docker image save 自动包含。
 IMGSET=()

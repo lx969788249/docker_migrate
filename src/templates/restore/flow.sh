@@ -215,7 +215,7 @@ compose_start_project() {
     COMPOSE_IMPL="$compose_impl"
     compose_run "${COMPOSE_FILE_ARGS[@]}" config >/dev/null 2>>"$compose_log" || exit 1
     compose_prepare_networks "$name" "${COMPOSE_FILE_ARGS[@]}" >>"$compose_log" 2>&1 || exit 1
-    declare -a source_state_records=() start_services=() pause_services=()
+    declare -a source_state_records=() start_services=() pause_services=() project_ids=()
     mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
     say "Compose 项目 ${name}：读取到 ${#source_state_records[@]} 条源端服务状态"
     if ((${#source_state_records[@]} == 0)); then
@@ -224,6 +224,10 @@ compose_start_project() {
     fi
     log_line "\$ compose up --no-start（${name}）"
     compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start >>"$compose_log" 2>&1 || exit 1
+    compose_transplant_anonymous_volumes "$name" >>"$compose_log" 2>&1 || {
+      fail_reason "Compose 项目 ${name} 的匿名卷数据没能放进新容器" "执行 df -h 检查磁盘空间后重试"
+      exit 1
+    }
     for state_record in "${source_state_records[@]}"; do
       service="${state_record%%$'\t'*}"
       state="${state_record#*$'\t'}"
@@ -235,13 +239,16 @@ compose_start_project() {
           ;;
       esac
     done
+    mapfile -t project_ids < <(docker ps -aq --filter "label=com.docker.compose.project=${name}")
+    health_timeout="$(health_wait_seconds "${RESTORE_HEALTH_TIMEOUT:-60}" \
+      "${project_ids[@]+"${project_ids[@]}"}")"
     if ((${#start_services[@]} > 0)); then
       log_line "\$ compose start ${start_services[*]}（${name}）"
       compose_run "${COMPOSE_FILE_ARGS[@]}" start "${start_services[@]}" >>"$compose_log" 2>&1 || exit 1
-      compose_wait_services "${RESTORE_HEALTH_TIMEOUT:-60}" \
+      compose_wait_services "$health_timeout" \
         "${COMPOSE_FILE_ARGS[@]}" -- "${start_services[@]}" || exit 1
     fi
-    compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
+    compose_wait_project_health "$name" "$health_timeout" || exit 1
     for service in "${pause_services[@]}"; do
       while IFS= read -r id; do
         [[ -n "$id" ]] || continue
@@ -362,7 +369,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       compose_dir="${COMPOSE_RESTORE_ROOT}/${name}"
     fi
     compose_rc=0
-    DM_PROGRESS_HINT="正在等待服务启动与健康检查（最长 ${RESTORE_HEALTH_TIMEOUT:-60} 秒）" \
+    DM_PROGRESS_HINT="正在等待服务启动与健康检查" \
       run_with_activity "Compose 项目 ${name}" \
       compose_start_project "$compose_dir" "$name" "$compose_impl" || compose_rc=$?
 

@@ -64,7 +64,7 @@ generate_manifest_and_restore() {
         cfgs_json='["_resolved_config.yml"]'
       fi
     elif [[ -n "$cfs" ]]; then
-      IFS=':' read -r -a CFS_ARR <<<"$cfs"
+      mapfile -t CFS_ARR < <(compose_config_files_split "$cfs")
       declare -a cfgs_abs
       cfgs_abs=()
       for c in "${CFS_ARR[@]}"; do

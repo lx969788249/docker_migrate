@@ -5,3 +5,4 @@ services:
     restart: unless-stopped
     volumes:
       - state:/srv/state
+      - /srv/anon

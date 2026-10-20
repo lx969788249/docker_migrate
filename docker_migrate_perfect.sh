@@ -1174,6 +1174,38 @@ restore_container_networks() {
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
+# Compose 在 com.docker.compose.project.config_files 标签里用逗号连接多个配置
+# 文件（-f a.yml -f b.yml）。没有逗号时兼容按冒号分隔的旧写法（COMPOSE_FILE）。
+compose_config_files_split() {
+  local raw="$1" sep=","
+  [[ -n "$raw" ]] || return 0
+  [[ "$raw" == *,* ]] || sep=":"
+  local -a parts=()
+  IFS="$sep" read -r -a parts <<<"$raw"
+  printf '%s\n' "${parts[@]}" | awk 'NF'
+}
+
+# 等待健康检查的最长时间：至少是 RESTORE_HEALTH_TIMEOUT（默认 60 秒），并且要
+# 够容器自己的健康检查跑完第一次。有的镜像每 60 秒才检查一次（如 Vaultwarden），
+# 固定等 60 秒会在第一次检查出结果之前就判定超时。
+health_wait_seconds() {
+  local base="${1:-60}" needed
+  shift
+  (($# > 0)) || {
+    printf '%s\n' "$base"
+    return 0
+  }
+  needed="$(docker inspect "$@" 2>/dev/null | jq '[.[] | .Config.Healthcheck // empty |
+    select((.Test[0] // "") != "NONE") |
+    ((.StartPeriod // 0) + (if (.Interval // 0) > 0 then .Interval else 30000000000 end) +
+      (if (.Timeout // 0) > 0 then .Timeout else 30000000000 end)) / 1000000000 + 30 | floor] |
+    max // 0' 2>/dev/null || echo 0)"
+  [[ "$needed" =~ ^[0-9]+$ ]] || needed=0
+  ((needed > base)) || needed="$base"
+  ((needed <= 3600)) || needed=3600
+  printf '%s\n' "$needed"
+}
+
 # 迁移包摘要、加密与解密。
 
 bundle_download_url() {
@@ -3627,6 +3659,38 @@ restore_container_networks() {
   done < <(jq -c 'to_entries[]?' "$metadata_file")
 }
 
+# Compose 在 com.docker.compose.project.config_files 标签里用逗号连接多个配置
+# 文件（-f a.yml -f b.yml）。没有逗号时兼容按冒号分隔的旧写法（COMPOSE_FILE）。
+compose_config_files_split() {
+  local raw="$1" sep=","
+  [[ -n "$raw" ]] || return 0
+  [[ "$raw" == *,* ]] || sep=":"
+  local -a parts=()
+  IFS="$sep" read -r -a parts <<<"$raw"
+  printf '%s\n' "${parts[@]}" | awk 'NF'
+}
+
+# 等待健康检查的最长时间：至少是 RESTORE_HEALTH_TIMEOUT（默认 60 秒），并且要
+# 够容器自己的健康检查跑完第一次。有的镜像每 60 秒才检查一次（如 Vaultwarden），
+# 固定等 60 秒会在第一次检查出结果之前就判定超时。
+health_wait_seconds() {
+  local base="${1:-60}" needed
+  shift
+  (($# > 0)) || {
+    printf '%s\n' "$base"
+    return 0
+  }
+  needed="$(docker inspect "$@" 2>/dev/null | jq '[.[] | .Config.Healthcheck // empty |
+    select((.Test[0] // "") != "NONE") |
+    ((.StartPeriod // 0) + (if (.Interval // 0) > 0 then .Interval else 30000000000 end) +
+      (if (.Timeout // 0) > 0 then .Timeout else 30000000000 end)) / 1000000000 + 30 | floor] |
+    max // 0' 2>/dev/null || echo 0)"
+  [[ "$needed" =~ ^[0-9]+$ ]] || needed=0
+  ((needed > base)) || needed="$base"
+  ((needed <= 3600)) || needed=3600
+  printf '%s\n' "$needed"
+}
+
 # 恢复决定：迁移前预检中用户（或 RESTORE_AUTO_RESOLVE）做出的选择，由
 # DM_RESTORE_DECISIONS 指向的 JSON 文件传给恢复脚本与单容器恢复脚本。
 # 没有这个文件时所有查询都返回“没有特别决定”，恢复按原配置进行。
@@ -4263,6 +4327,7 @@ if [[ "$original_running" == "true" &&
     error_user "RESTORE_HEALTH_TIMEOUT 的值无效：$health_timeout" "请设置为 1 到 3600 之间的秒数"
     exit 1
   fi
+  health_timeout="$(health_wait_seconds "$health_timeout" "$name")"
   health_deadline=$((SECONDS + health_timeout))
   health_started=$SECONDS
   health_next_report=0
@@ -5365,6 +5430,38 @@ restore_container_networks() {
     done < <(jq -r '.value.Aliases[]? // empty' <<<"$entry")
     dm_quiet docker network connect "${connect_args[@]}" "$network" "$container" || return 1
   done < <(jq -c 'to_entries[]?' "$metadata_file")
+}
+
+# Compose 在 com.docker.compose.project.config_files 标签里用逗号连接多个配置
+# 文件（-f a.yml -f b.yml）。没有逗号时兼容按冒号分隔的旧写法（COMPOSE_FILE）。
+compose_config_files_split() {
+  local raw="$1" sep=","
+  [[ -n "$raw" ]] || return 0
+  [[ "$raw" == *,* ]] || sep=":"
+  local -a parts=()
+  IFS="$sep" read -r -a parts <<<"$raw"
+  printf '%s\n' "${parts[@]}" | awk 'NF'
+}
+
+# 等待健康检查的最长时间：至少是 RESTORE_HEALTH_TIMEOUT（默认 60 秒），并且要
+# 够容器自己的健康检查跑完第一次。有的镜像每 60 秒才检查一次（如 Vaultwarden），
+# 固定等 60 秒会在第一次检查出结果之前就判定超时。
+health_wait_seconds() {
+  local base="${1:-60}" needed
+  shift
+  (($# > 0)) || {
+    printf '%s\n' "$base"
+    return 0
+  }
+  needed="$(docker inspect "$@" 2>/dev/null | jq '[.[] | .Config.Healthcheck // empty |
+    select((.Test[0] // "") != "NONE") |
+    ((.StartPeriod // 0) + (if (.Interval // 0) > 0 then .Interval else 30000000000 end) +
+      (if (.Timeout // 0) > 0 then .Timeout else 30000000000 end)) / 1000000000 + 30 | floor] |
+    max // 0' 2>/dev/null || echo 0)"
+  [[ "$needed" =~ ^[0-9]+$ ]] || needed=0
+  ((needed > base)) || needed="$base"
+  ((needed <= 3600)) || needed=3600
+  printf '%s\n' "$needed"
 }
 
 # 迁移前预检：在下载迁移包、改动新服务器之前，根据迁移计划找出会让迁移失败的问题。
@@ -6556,6 +6653,29 @@ compose_wait_project_health() {
   done
   return 1
 }
+
+# 匿名卷（没写名字、只有一串随机编号的卷）在新服务器上按原编号恢复了数据，但
+# Compose 不认识它，会给新容器另建一个空的匿名卷。把数据搬进新卷，再删掉按原
+# 编号恢复的卷；否则这些数据（例如镜像声明的数据库目录）在新服务器上就丢了。
+compose_transplant_anonymous_volumes() {
+  local project="$1" meta cname src dest dst
+  for meta in "${BUNDLE_DIR}"/meta/*.inspect.json; do
+    [[ -f "$meta" ]] || continue
+    [[ "$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' "$meta")" == "$project" ]] || continue
+    cname="$(jq -r '.[0].Name | ltrimstr("/")' "$meta")"
+    while IFS=$'\t' read -r src dest; do
+      [[ "$src" =~ ^[0-9a-f]{64}$ ]] || continue
+      docker volume inspect "$src" >/dev/null 2>&1 || continue
+      dst="$(docker inspect "$cname" 2>/dev/null | jq -r --arg d "$dest" \
+        '.[0].Mounts[]? | select(.Type == "volume" and .Destination == $d) | .Name' | head -n1)"
+      [[ -n "$dst" && "$dst" != "$src" ]] || continue
+      log_line "匿名卷：${cname} 的 ${dest} 沿用迁移过来的数据"
+      dm_quiet docker run --rm --network none -v "${src}:/from:ro" -v "${dst}:/to" alpine:3.20 \
+        sh -eu -c 'find /to -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; cp -a /from/. /to/' || return 1
+      dm_quiet docker volume rm "$src" || true
+    done < <(jq -r '.[0].Mounts[]? | select(.Type == "volume") | [.Name, .Destination] | @tsv' "$meta")
+  done
+}
 archive_members_safe() {
   # 只解析元数据，不访问软链接目标。完整建表后检查，避免归档通过成员顺序
   # 或路径重名，让解压程序沿链接写出目标树。gzip 只解压扫描一次。
@@ -7525,7 +7645,7 @@ transaction_restore_volumes() {
         warn " · 数据卷 ${volume} 没能还原"
         rc=1
       fi
-    elif ! dm_quiet docker volume rm "$volume"; then
+    elif docker volume inspect "$volume" >/dev/null 2>&1 && ! dm_quiet docker volume rm "$volume"; then
       warn " · 本次新建的数据卷 ${volume} 没能删除"
       rc=1
     fi
@@ -8298,7 +8418,7 @@ compose_start_project() {
     COMPOSE_IMPL="$compose_impl"
     compose_run "${COMPOSE_FILE_ARGS[@]}" config >/dev/null 2>>"$compose_log" || exit 1
     compose_prepare_networks "$name" "${COMPOSE_FILE_ARGS[@]}" >>"$compose_log" 2>&1 || exit 1
-    declare -a source_state_records=() start_services=() pause_services=()
+    declare -a source_state_records=() start_services=() pause_services=() project_ids=()
     mapfile -t source_state_records < <(compose_source_state_records "$name" || true)
     say "Compose 项目 ${name}：读取到 ${#source_state_records[@]} 条源端服务状态"
     if ((${#source_state_records[@]} == 0)); then
@@ -8307,6 +8427,10 @@ compose_start_project() {
     fi
     log_line "\$ compose up --no-start（${name}）"
     compose_run "${COMPOSE_FILE_ARGS[@]}" up --no-start >>"$compose_log" 2>&1 || exit 1
+    compose_transplant_anonymous_volumes "$name" >>"$compose_log" 2>&1 || {
+      fail_reason "Compose 项目 ${name} 的匿名卷数据没能放进新容器" "执行 df -h 检查磁盘空间后重试"
+      exit 1
+    }
     for state_record in "${source_state_records[@]}"; do
       service="${state_record%%$'\t'*}"
       state="${state_record#*$'\t'}"
@@ -8318,13 +8442,16 @@ compose_start_project() {
           ;;
       esac
     done
+    mapfile -t project_ids < <(docker ps -aq --filter "label=com.docker.compose.project=${name}")
+    health_timeout="$(health_wait_seconds "${RESTORE_HEALTH_TIMEOUT:-60}" \
+      "${project_ids[@]+"${project_ids[@]}"}")"
     if ((${#start_services[@]} > 0)); then
       log_line "\$ compose start ${start_services[*]}（${name}）"
       compose_run "${COMPOSE_FILE_ARGS[@]}" start "${start_services[@]}" >>"$compose_log" 2>&1 || exit 1
-      compose_wait_services "${RESTORE_HEALTH_TIMEOUT:-60}" \
+      compose_wait_services "$health_timeout" \
         "${COMPOSE_FILE_ARGS[@]}" -- "${start_services[@]}" || exit 1
     fi
-    compose_wait_project_health "$name" "${RESTORE_HEALTH_TIMEOUT:-60}" || exit 1
+    compose_wait_project_health "$name" "$health_timeout" || exit 1
     for service in "${pause_services[@]}"; do
       while IFS= read -r id; do
         [[ -n "$id" ]] || continue
@@ -8445,7 +8572,7 @@ if jq -e '.projects|length>0' manifest.json >/dev/null 2>&1; then
       compose_dir="${COMPOSE_RESTORE_ROOT}/${name}"
     fi
     compose_rc=0
-    DM_PROGRESS_HINT="正在等待服务启动与健康检查（最长 ${RESTORE_HEALTH_TIMEOUT:-60} 秒）" \
+    DM_PROGRESS_HINT="正在等待服务启动与健康检查" \
       run_with_activity "Compose 项目 ${name}" \
       compose_start_project "$compose_dir" "$name" "$compose_impl" || compose_rc=$?
 
@@ -9621,7 +9748,7 @@ else
     if [[ -z "$wdir" && -n "$proj" ]]; then
       cfgs_raw=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$j")
       if [[ -n "$cfgs_raw" ]]; then
-        IFS=':' read -r -a cfgs_arr <<<"$cfgs_raw"
+        mapfile -t cfgs_arr < <(compose_config_files_split "$cfgs_raw")
         for cfg in "${cfgs_arr[@]}"; do
           cfg="${cfg#./}"
           if [[ -n "$cfg" ]]; then
@@ -9822,7 +9949,7 @@ for id in "${IDS[@]}"; do
   if [[ -z "$wdirtmp" && -n "$projtmp" ]]; then
     cfgstmp=$(jq -r '.[0].Config.Labels["com.docker.compose.project.config_files"] // empty' <<<"$jtmp")
     if [[ -n "$cfgstmp" ]]; then
-      IFS=':' read -r -a cfgs_tmp <<<"$cfgstmp"
+      mapfile -t cfgs_tmp < <(compose_config_files_split "$cfgstmp")
       for ct in "${cfgs_tmp[@]}"; do
         ct="${ct#./}"
         if [[ -n "$ct" ]]; then
@@ -9854,7 +9981,7 @@ for id in "${IDS[@]}"; do
   # 兼容 v1：缺少 working_dir 时从 config_files 推断
   if [[ -z "$wdir" && -n "$proj" ]]; then
     if [[ -n "$cfgs" ]]; then
-      IFS=':' read -r -a cfgs_arr <<<"$cfgs"
+      mapfile -t cfgs_arr < <(compose_config_files_split "$cfgs")
       for cg in "${cfgs_arr[@]}"; do
         cg="${cg#./}"
         if [[ -n "$cg" ]]; then
@@ -9933,7 +10060,7 @@ if ((${#COMPOSE_GROUP[@]})); then
     declare -a CFG_SOURCE_ARGS=()
 
     if [[ -n "$cfgs" ]]; then
-      IFS=':' read -r -a CFG_ARR <<<"$cfgs"
+      mapfile -t CFG_ARR < <(compose_config_files_split "$cfgs")
       for cfg in "${CFG_ARR[@]}"; do
         cfg="${cfg#./}"
         [[ -z "$cfg" ]] && continue
@@ -10000,6 +10127,23 @@ if ((${#COMPOSE_GROUP[@]})); then
       done < <(compose_env_file_refs "$cfg" || true)
     done
   done
+fi
+
+# 读取配置时发现的问题在停机之前就报告，避免为一个配置错误让旧服务器白白停机。
+for service_key in "${!COMPOSE_SERVICE_COUNT[@]}"; do
+  if ((${COMPOSE_SERVICE_COUNT[$service_key]} > 1)); then
+    BACKUP_FAILURES+=("Compose 服务存在多个副本，无法逐容器保留可写层：${service_key##*|}")
+  fi
+done
+if ((${#BACKUP_FAILURES[@]} > 0)); then
+  case "${BACKUP_FAILURES[0]}" in
+    "Compose 服务存在多个副本"*) failure_hint="请只迁移单副本的 Compose 服务，或先把副本数缩减为 1" ;;
+    "Compose 配置文件缺失"*) failure_hint="确认 Compose 项目的配置文件还在启动时的位置；移动过目录的话，请在新位置重新执行 docker compose up -d 后再备份" ;;
+    *"依附的容器"*) failure_hint="先启动它依附的容器，或把两个容器一起迁移" ;;
+    *) failure_hint="运行 --diagnose 生成诊断包并反馈问题" ;;
+  esac
+  error_user "${BACKUP_FAILURES[0]}" "$failure_hint"
+  exit 1
 fi
 
 #####################################
@@ -10117,15 +10261,6 @@ fi
 # 捕获容器 writable layer
 #####################################
 detail "检查容器可写层"
-for service_key in "${!COMPOSE_SERVICE_COUNT[@]}"; do
-  if ((${COMPOSE_SERVICE_COUNT[$service_key]} > 1)); then
-    BACKUP_FAILURES+=("Compose 服务存在多个副本，无法逐容器保留可写层：${service_key##*|}")
-  fi
-done
-if ((${#BACKUP_FAILURES[@]} > 0)); then
-  error_user "${BACKUP_FAILURES[0]}" "请只迁移单副本的 Compose 服务，或先把副本数缩减为 1"
-  exit 1
-fi
 
 # 后续只需保存临时快照镜像；其父镜像层会由 docker image save 自动包含。
 IMGSET=()
@@ -10364,7 +10499,7 @@ generate_manifest_and_restore() {
         cfgs_json='["_resolved_config.yml"]'
       fi
     elif [[ -n "$cfs" ]]; then
-      IFS=':' read -r -a CFS_ARR <<<"$cfs"
+      mapfile -t CFS_ARR < <(compose_config_files_split "$cfs")
       declare -a cfgs_abs
       cfgs_abs=()
       for c in "${CFS_ARR[@]}"; do

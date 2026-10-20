@@ -63,7 +63,7 @@ transaction_restore_volumes() {
         warn " · 数据卷 ${volume} 没能还原"
         rc=1
       fi
-    elif ! dm_quiet docker volume rm "$volume"; then
+    elif docker volume inspect "$volume" >/dev/null 2>&1 && ! dm_quiet docker volume rm "$volume"; then
       warn " · 本次新建的数据卷 ${volume} 没能删除"
       rc=1
     fi
