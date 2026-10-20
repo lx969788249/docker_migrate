@@ -1457,6 +1457,30 @@ test_restore_follows_decisions() {
   )
 }
 
+test_probe_source_explains_unreachable_server() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local tmp out closed open_port server_pid rc
+  tmp="$(mktemp -d)"
+  trap 'kill "${server_pid:-}" 2>/dev/null || true; rm -rf "$tmp"' RETURN
+  closed="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  rc=0
+  out="$(DM_LOG_FILE="${tmp}/run.log" restore_probe_source \
+    "http://127.0.0.1:${closed}/token/bundle.tar.gz.enc" 2>&1)" || rc=$?
+  [[ "$rc" -eq 1 ]]
+  grep -Fq "旧服务器 127.0.0.1 的端口 ${closed} 拒绝连接" <<<"$out"
+  grep -Fq "ufw allow ${closed}/tcp" <<<"$out"
+
+  # 旧版本没有迁移计划时返回 404，也说明旧服务器是通的。
+  open_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  python3 -m http.server "$open_port" --bind 127.0.0.1 --directory "$tmp" >/dev/null 2>&1 &
+  server_pid=$!
+  for _ in $(seq 1 50); do
+    curl -s -o /dev/null "http://127.0.0.1:${open_port}/" && break
+    sleep 0.1
+  done
+  DM_LOG_FILE="${tmp}/run.log" restore_probe_source "http://127.0.0.1:${open_port}/token/missing.plan"
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
@@ -1511,6 +1535,7 @@ run_test "migration plan URL is derived and the plan is encrypted and signed" te
 run_test "pre-flight check classifies problems by impact" test_preflight_classifies_problems
 run_test "pre-flight without a terminal stops or auto-resolves safely" test_preflight_run_without_terminal
 run_test "restore follows the pre-flight decisions" test_restore_follows_decisions
+run_test "unreachable old server is explained before downloading" test_probe_source_explains_unreachable_server
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

@@ -8710,6 +8710,43 @@ restore_extract() {
   progress_meter "$count_file" <"$archive" | tar -xzf - -C "$outdir"
 }
 
+# 先试连一次旧服务器：连不上时立即说清楚原因，而不是让下载重试好几分钟后
+# 才报错。只要旧服务器有任何 HTTP 响应（包括旧版本没有迁移计划时的 404）
+# 就算连通；其他少见的错误交给后面的下载步骤处理。
+restore_probe_source() {
+  local url="$1" rc=0 host port
+  host="${url#*://}"
+  host="${host%%/*}"
+  if [[ "$host" =~ ^\[([^]]+)\](:([0-9]+))?$ ]]; then
+    port="${BASH_REMATCH[3]}"
+    host="${BASH_REMATCH[1]}"
+  elif [[ "$host" == *:* ]]; then
+    port="${host##*:}"
+    host="${host%:*}"
+  fi
+  [[ -n "${port:-}" ]] || port=80
+  curl -sS --globoff -o /dev/null --connect-timeout "${RESTORE_CONNECT_TIMEOUT:-10}" \
+    --max-time $((${RESTORE_CONNECT_TIMEOUT:-10} + 10)) --url "$url" \
+    2>>"${DM_LOG_FILE:-/dev/null}" || rc=$?
+  case "$rc" in
+    6)
+      error_user "找不到旧服务器 ${host}" "检查链接是否完整复制，以及新服务器能否正常解析域名"
+      return 1
+      ;;
+    7)
+      error_user "旧服务器 ${host} 的端口 ${port} 拒绝连接" \
+        "确认旧服务器上的脚本还在运行（没有按回车结束）；如果还在运行，请在旧服务器放行这个端口：ufw allow ${port}/tcp，或 firewall-cmd --add-port=${port}/tcp"
+      return 1
+      ;;
+    28)
+      error_user "连接旧服务器 ${host} 的端口 ${port} 超时" \
+        "通常是端口没有放行：请在云厂商控制台的安全组（防火墙）里放行 TCP ${port}，并在旧服务器执行 ufw allow ${port}/tcp，或 firewall-cmd --add-port=${port}/tcp"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
 # 迁移前预检：从同一个链接推算迁移计划的地址，下载、验证后检查新服务器。
 # 旧版源端没有迁移计划时静默跳过。返回 1 表示发现了无法继续的问题。
 restore_preflight() {
@@ -8795,6 +8832,10 @@ restore_main() {
   RESTORE_BASE_DIR="${RESTORE_BASE:-$HOME/docker_migrate_restore}"
   decisions="$(mktemp "${TMPDIR:-/tmp}/docker-migrate-decisions.XXXXXX")"
   printf '{}\n' >"$decisions"
+  if ! restore_probe_source "$DOWNLOAD_URL"; then
+    rm -f "$decisions"
+    exit 1
+  fi
   if [[ "${RESTORE_SKIP_PREFLIGHT:-0}" == "1" ]]; then
     stage_end "已按 RESTORE_SKIP_PREFLIGHT=1 跳过"
   elif ! restore_preflight "$DOWNLOAD_URL" "$(bundle_secret_encryption_key "$ENCRYPTION_SECRET")" \

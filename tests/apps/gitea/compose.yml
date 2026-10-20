@@ -1,0 +1,38 @@
+# PostgreSQL + .env 里的密码；数据库目录是 Compose 目录下的相对路径挂载。
+services:
+  server:
+    image: gitea/gitea:1.22.6
+    restart: always
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__database__DB_TYPE=postgres
+      - GITEA__database__HOST=db:5432
+      - GITEA__database__NAME=gitea
+      - GITEA__database__USER=gitea
+      - GITEA__database__PASSWD=${DB_PASSWORD}
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__server__ROOT_URL=http://localhost:3000/
+    volumes:
+      - gitea_data:/data
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=gitea
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=gitea
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "gitea"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+volumes:
+  gitea_data:

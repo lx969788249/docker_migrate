@@ -1,0 +1,44 @@
+name: apps
+
+# 两台模拟服务器之间迁移真实应用（tests/apps/）。每个应用单独一个任务、同时运行；
+# 每周再跑一次，及早发现上游镜像更新带来的问题。
+on:
+  push:
+    branches: [master, "ci/**"]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 只跑某一个应用（留空 = 全部）
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [uptime-kuma, wordpress, gitea, unreachable]
+    name: ${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+        if: inputs.app == '' || inputs.app == matrix.app
+      - name: Migrate ${{ matrix.app }} between two simulated servers
+        if: inputs.app == '' || inputs.app == matrix.app
+        run: tests/apps/run.sh "${{ matrix.app }}"
+        env:
+          DM_APPS_ARTIFACTS: ${{ runner.temp }}/apps-logs
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.app }}
+          path: ${{ runner.temp }}/apps-logs
+          if-no-files-found: ignore

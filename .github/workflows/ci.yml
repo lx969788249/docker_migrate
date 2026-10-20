@@ -21,13 +21,13 @@ jobs:
       - name: Release script matches src/
         run: ./build.sh --check
       - name: Bash syntax
-        run: bash -n docker_migrate_perfect.sh build.sh tests/*.sh
+        run: bash -n docker_migrate_perfect.sh build.sh tests/*.sh tests/apps/*.sh
       - name: ShellCheck tracked scripts
-        run: shellcheck -S warning docker_migrate_perfect.sh build.sh tests/*.sh
+        run: shellcheck -S warning docker_migrate_perfect.sh build.sh tests/*.sh tests/apps/*.sh
       - name: ShellCheck generated scripts
         run: tests/lint-generated.sh
       - name: Formatting
-        run: shfmt -d -i 2 -ci docker_migrate_perfect.sh build.sh tests/*.sh src
+        run: shfmt -d -i 2 -ci docker_migrate_perfect.sh build.sh tests/*.sh tests/apps/*.sh src
       - name: Unit tests
         run: tests/run.sh
 

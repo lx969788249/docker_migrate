@@ -1,0 +1,11 @@
+# 单容器 + SQLite，数据在命名卷里，镜像自带健康检查。
+services:
+  uptime-kuma:
+    image: louislam/uptime-kuma:1.23.16
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - kuma_data:/app/data
+volumes:
+  kuma_data:
