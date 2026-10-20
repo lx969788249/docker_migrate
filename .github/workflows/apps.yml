@@ -4,7 +4,7 @@ name: apps
 # 每周再跑一次，及早发现上游镜像更新带来的问题。
 on:
   push:
-    branches: [master, "ci/**"]
+    branches: [master]
   pull_request:
   schedule:
     - cron: "0 3 * * 1"
