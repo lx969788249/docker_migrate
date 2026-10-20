@@ -15,7 +15,7 @@ code="$(curl -sS -o /tmp/halo-setup.html -w '%{http_code}' -c "$jar" -b "$jar" \
   --data-urlencode 'language=zh-CN' \
   --data-urlencode 'externalUrl=http://localhost:8090/' \
   http://localhost:8090/system/setup)"
-[[ "$code" =~ ^(200|302|303)$ ]] || {
+[[ "$code" =~ ^[23][0-9][0-9]$ ]] || {
   echo "初始化失败：HTTP ${code}" >&2
   head -c 2000 /tmp/halo-setup.html >&2
   exit 1
