@@ -1,0 +1,45 @@
+# 三个服务：Nextcloud + MariaDB + Redis，首次启动会自动安装。
+services:
+  db:
+    image: mariadb:11.4
+    restart: always
+    command: --transaction-isolation=READ-COMMITTED
+    environment:
+      MARIADB_ROOT_PASSWORD: nc-root-secret
+      MARIADB_DATABASE: nextcloud
+      MARIADB_USER: nextcloud
+      MARIADB_PASSWORD: nc-db-secret
+    volumes:
+      - db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+  redis:
+    image: redis:7-alpine
+    restart: always
+  app:
+    image: nextcloud:29-apache
+    restart: always
+    ports:
+      - "8083:80"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      MYSQL_HOST: db
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: nc-db-secret
+      REDIS_HOST: redis
+      NEXTCLOUD_ADMIN_USER: dmadmin
+      NEXTCLOUD_ADMIN_PASSWORD: Dm-Test-Pass-123
+      NEXTCLOUD_TRUSTED_DOMAINS: localhost
+    volumes:
+      - nextcloud:/var/www/html
+volumes:
+  db:
+  nextcloud:

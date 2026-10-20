@@ -1,0 +1,11 @@
+# 很轻的单容器应用，作为基准。
+services:
+  memos:
+    image: neosmemo/memos:0.22.4
+    restart: unless-stopped
+    ports:
+      - "5230:5230"
+    volumes:
+      - memos_data:/var/opt/memos
+volumes:
+  memos_data:

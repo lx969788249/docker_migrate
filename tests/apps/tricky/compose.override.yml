@@ -1,0 +1,4 @@
+services:
+  web:
+    environment:
+      APP_LAYER: override

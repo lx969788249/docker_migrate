@@ -8,6 +8,7 @@
 全程加密传输、完整性校验，恢复失败自动回滚。
 
 [![CI](https://github.com/lx969788249/docker_migrate/actions/workflows/ci.yml/badge.svg)](https://github.com/lx969788249/docker_migrate/actions/workflows/ci.yml)
+[![Apps](https://github.com/lx969788249/docker_migrate/actions/workflows/apps.yml/badge.svg)](https://github.com/lx969788249/docker_migrate/actions/workflows/apps.yml)
 [![Stars](https://img.shields.io/github/stars/lx969788249/docker_migrate?style=flat&logo=github)](https://github.com/lx969788249/docker_migrate/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/lx969788249/docker_migrate)](https://github.com/lx969788249/docker_migrate/commits/master)
 ![Bash 4.0+](https://img.shields.io/badge/bash-4.0%2B-4EAA25?logo=gnubash&logoColor=white)
@@ -282,6 +283,11 @@ bash docker_migrate_perfect.sh --diagnose
 <details>
 <summary><b>新服务器下载失败 / 连接超时</b></summary>
 
+新服务器会先试连一次旧服务器，连不上时第一步就会停下并说明是哪种情况：
+
+- **连接超时**：几乎都是端口没有放行，先检查云厂商安全组，再检查旧服务器防火墙。
+- **拒绝连接**：旧服务器上的脚本可能已经结束（按过回车），或者防火墙拒绝了这个端口。
+
 1. 确认旧服务器的防火墙放行了下载端口，例如 `ufw allow 8080/tcp` 或 `firewall-cmd --add-port=8080/tcp`。
 2. 确认云厂商控制台的安全组也放行了该端口。
 3. 如果链接中的 IP 不对（NAT、内网或多网卡），用 `ADVERTISE_HOST=你的公网IP` 重新运行备份。
@@ -349,6 +355,7 @@ bash docker_migrate_perfect.sh --diagnose
 ```bash
 ./build.sh         # 修改 src/ 后重新生成发布脚本
 tests/run.sh       # 运行单元测试（需要 bash 4+、jq、python3、openssl）
+tests/apps/run.sh wordpress   # 在两台模拟服务器之间迁移一个真实应用（需要 Docker）
 ```
 
 | 目录 | 内容 |
@@ -358,9 +365,12 @@ tests/run.sh       # 运行单元测试（需要 bash 4+、jq、python3、openss
 | `src/restore/` | 新服务器下载、校验与解密 |
 | `src/templates/` | 写入迁移包的 `restore.sh` 与单容器恢复脚本，通过 `# @include` 复用 `src/lib/` |
 | `tests/` | 单元测试、Docker 集成测试、真实配置保真度测试与端到端迁移测试 |
+| `tests/apps/` | 两台模拟服务器之间迁移真实应用：每个应用一个目录，放官方 Compose 文件、写入数据和检查数据的脚本 |
 | `docs/` | [两台服务器的手动验收清单](docs/manual-vps-test.md) |
 
 每次提交都会在 CI 中运行 ShellCheck、格式检查、单元测试、Docker 集成测试与端到端迁移测试，并在 bash 4.0 / 4.2 / 4.4、Alpine、Debian、Rocky Linux 上验证兼容性。
+
+另外，[apps 工作流](.github/workflows/apps.yml)会起两台互相独立的模拟服务器（各自运行 Docker，只能通过网络互相访问），把 WordPress、Nextcloud、Gitea、Vaultwarden、Uptime Kuma、Halo、Memos 和一组刁钻的 Compose 写法逐个从旧服务器迁到新服务器，检查业务数据、容器配置以及旧服务器是否恢复原状；它还会模拟防火墙拦截，检查连不上时的提示。合并到 master、提交 PR 时会自动运行，每周也会再跑一次。
 
 ## 💬 反馈
 

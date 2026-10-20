@@ -1,0 +1,40 @@
+# 各种不常见但真实存在的写法放在一起：
+#   - 用 -p 指定与目录名不同的项目名，启动时同时用三个 -f 配置文件
+#   - 需要现场构建的镜像（build:），新服务器上拉不到，只能靠迁移包
+#   - .env 里的变量、env_file、profiles（debug 服务不应该被启动）
+#   - 依赖健康检查的启动顺序、命名卷、相对路径挂载
+#   - 外部网络（固定网段）和一个不属于 Compose 的独立容器
+services:
+  web:
+    build: ./web
+    ports:
+      - "${WEB_PORT}:80"
+    env_file:
+      - ./config/web.env
+    volumes:
+      - ./data:/usr/share/nginx/html/data:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [backend]
+  api:
+    image: alpine:3.20
+    command: ["sh", "-c", "mkdir -p /srv/state && touch /srv/state/ready && exec sleep infinity"]
+    volumes:
+      - state:/srv/state
+    healthcheck:
+      test: ["CMD", "test", "-f", "/srv/state/ready"]
+      interval: 2s
+      retries: 30
+    networks: [backend, shared]
+  debug:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    profiles: [debug]
+networks:
+  backend: {}
+  shared:
+    external: true
+    name: dm_shared
+volumes:
+  state: {}

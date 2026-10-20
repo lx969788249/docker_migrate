@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Clearer errors when the old server cannot be reached
+
+- Before the pre-flight check, the new server makes one quick connection to the old server. If the connection times out or is refused, it stops right away and says which port to open in the cloud security group or firewall (`ufw` / `firewall-cmd`), instead of retrying the download for several minutes.
+
+### Fixes
+
+- Keep the image's own entrypoint and command when the container did not change them. Images whose entrypoint has several parts (for example Uptime Kuma's `dumb-init -- extra/entrypoint.sh`) used to come back with part of the entrypoint moved into the command, which also pinned the command across image updates. Found by the new application tests.
+
+### Tests
+
+- Add `tests/apps/`: each run starts two independent simulated servers (Docker-in-Docker) and migrates a real application from one to the other: WordPress, Nextcloud, Gitea, Vaultwarden, Uptime Kuma, Halo, Memos, plus an unusual Compose setup (three `-f` files, a locally built image, profiles, an external network with a fixed range, and a standalone container). Each test writes data in the app on the old server, checks it on the new one, compares container settings on both servers, and checks that the old server is back to its original state.
+- Test the new connection messages by blocking the port with a firewall rule on the simulated old server.
+- Run these tests in a separate `apps` workflow on master, on pull requests, and once a week.
+
 ## 2.5.1
 
 ### Fixes found in a real two-server migration

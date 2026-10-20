@@ -219,6 +219,19 @@ cmd_args=()
 
 mapfile -t entrypoint < <(jq -r '.[0].Config.Entrypoint[]?' "$META")
 mapfile -t cmd < <(jq -r '.[0].Config.Cmd[]?' "$META")
+# docker run --entrypoint 只能写一段：多段的入口（如 dumb-init -- entrypoint.sh）
+# 会被拆进命令里，配置就和原来不一样了，镜像更新后命令也会被固定住。
+# 和镜像默认值相同的部分不传，由镜像自己提供。
+image_entry_cmd="$(docker image inspect "$image" 2>/dev/null |
+  jq -c '.[0].Config | [.Entrypoint // [], .Cmd // []]' 2>/dev/null || echo null)"
+container_entry_cmd="$(jq -c '.[0].Config | [.Entrypoint // [], .Cmd // []]' "$META")"
+if [[ "$image_entry_cmd" != "null" ]] &&
+  [[ "$(jq -c '.[0]' <<<"$image_entry_cmd")" == "$(jq -c '.[0]' <<<"$container_entry_cmd")" ]]; then
+  entrypoint=()
+  if [[ "$(jq -c '.[1]' <<<"$image_entry_cmd")" == "$(jq -c '.[1]' <<<"$container_entry_cmd")" ]]; then
+    cmd=()
+  fi
+fi
 if ((${#entrypoint[@]})); then
   args+=(--entrypoint "${entrypoint[0]}")
   if ((${#entrypoint[@]} > 1)); then

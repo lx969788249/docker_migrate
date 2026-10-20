@@ -1,0 +1,41 @@
+# 国内常用的建站程序：Java 应用启动较慢，用来测“等服务就绪”。
+services:
+  halo:
+    image: halohub/halo:2.20
+    restart: on-failure:3
+    depends_on:
+      halodb:
+        condition: service_healthy
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./halo2:/root/.halo2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    command:
+      - --spring.r2dbc.url=r2dbc:pool:postgresql://halodb/halo
+      - --spring.r2dbc.username=halo
+      - --spring.r2dbc.password=halo-db-secret
+      - --spring.sql.init.platform=postgresql
+      - --halo.external-url=http://localhost:8090/
+      - --halo.security.initializer.superadminusername=dmadmin
+      - --halo.security.initializer.superadminpassword=Dm-Test-Pass-123
+      - --halo.security.basic-auth.disabled=false
+  halodb:
+    image: postgres:15-alpine
+    restart: on-failure:3
+    volumes:
+      - ./db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "halo"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    environment:
+      - POSTGRES_PASSWORD=halo-db-secret
+      - POSTGRES_USER=halo
+      - POSTGRES_DB=halo

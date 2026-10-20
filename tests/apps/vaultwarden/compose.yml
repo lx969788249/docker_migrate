@@ -1,0 +1,12 @@
+# 单容器 + SQLite，数据在 Compose 目录下的相对路径挂载里。
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.32.7
+    restart: unless-stopped
+    environment:
+      ADMIN_TOKEN: dm-admin-token-for-tests
+      DOMAIN: http://localhost:8082
+    ports:
+      - "8082:80"
+    volumes:
+      - ./vw-data:/data

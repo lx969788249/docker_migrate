@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app: [uptime-kuma, wordpress, gitea, unreachable]
+        app: [wordpress, nextcloud, gitea, vaultwarden, uptime-kuma, halo, memos, tricky, unreachable]
     name: ${{ matrix.app }}
     steps:
       - uses: actions/checkout@v4
